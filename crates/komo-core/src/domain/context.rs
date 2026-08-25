@@ -225,6 +225,12 @@ pub struct RunContext {
     /// Monotonic step counter, shared across clones so steps within a run get a
     /// stable order even when tool calls run concurrently.
     seq: Arc<AtomicI64>,
+    /// Where a mutating tool leaves the bytes a file held before this run
+    /// touched it, so `komo run rollback` can put them back. Rides here rather
+    /// than being injected into each file tool because this is already the
+    /// thing that knows *which run* a mutation belongs to. `None` = no
+    /// checkpointing (aux runtimes, tests).
+    checkpoint: Option<Arc<dyn super::checkpoint::CheckpointStore>>,
 }
 
 impl RunContext {
@@ -233,7 +239,22 @@ impl RunContext {
             run_id,
             repo,
             seq: Arc::new(AtomicI64::new(0)),
+            checkpoint: None,
         }
+    }
+
+    /// Attach the checkpoint store, making this run's file changes undoable.
+    pub fn with_checkpoint(
+        mut self,
+        store: Option<Arc<dyn super::checkpoint::CheckpointStore>>,
+    ) -> Self {
+        self.checkpoint = store;
+        self
+    }
+
+    /// The checkpoint store, if this run is being checkpointed.
+    pub fn checkpoint(&self) -> Option<&Arc<dyn super::checkpoint::CheckpointStore>> {
+        self.checkpoint.as_ref()
     }
 
     /// Claim the next step's sequence number.

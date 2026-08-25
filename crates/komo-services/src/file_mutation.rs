@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
+use komo_core::domain::context::RunContext;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 /// Per-path write locks.
@@ -82,6 +83,13 @@ impl Snapshot {
         String::from_utf8(body.to_vec()).ok()
     }
 
+    /// The raw bytes, or `None` when the file did not exist — what a checkpoint
+    /// keeps, verbatim, since a pre-image has to restore a binary file as
+    /// faithfully as a text one.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        self.0.as_deref()
+    }
+
     /// Whether the snapshot starts with a UTF-8 BOM.
     fn had_bom(&self) -> bool {
         self.0
@@ -128,6 +136,7 @@ pub async fn write_if_unchanged(
     path: &Path,
     expected: &Snapshot,
     content: &str,
+    run: Option<&RunContext>,
 ) -> anyhow::Result<()> {
     // Held across compare+write: without it two concurrent callers can both
     // pass the compare and both write (see [`WRITE_LOCKS`]).
@@ -156,21 +165,50 @@ pub async fn write_if_unchanged(
     tokio::fs::write(path, payload.as_bytes())
         .await
         .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+    // Still under the per-path lock, so the pre-image recorded is exactly the
+    // bytes this write replaced — not something an interleaved writer left.
+    checkpoint(run, path, expected.bytes(), Some(payload.as_bytes())).await;
     Ok(())
+}
+
+/// Record a mutation for `komo run rollback`, if this run is checkpointed.
+///
+/// Best-effort by design, and deliberately *after* the mutation: a write the
+/// user asked for must not fail because a pre-image could not be filed. The
+/// cost is a rollback that reports the file as unrecoverable, which is honest —
+/// unlike refusing the edit, which is not what anyone asked for.
+async fn checkpoint(
+    run: Option<&RunContext>,
+    path: &Path,
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+) {
+    let Some(store) = run.and_then(|r| r.checkpoint()) else {
+        return;
+    };
+    let run_id = run.map(|r| r.run_id.as_str()).unwrap_or_default();
+    if let Err(error) = store.record(run_id, path, before, after).await {
+        tracing::warn!(%error, path = %path.display(), "failed to checkpoint a file change");
+    }
 }
 
 /// Delete `path`, erroring if it is already gone (the caller named a specific
 /// file). Takes the same per-path lock a write does, so a delete can never land
 /// between a concurrent write's compare and its write — otherwise that write
 /// would recreate the file the model just asked to remove.
-pub async fn delete_existing(path: &Path) -> anyhow::Result<()> {
+pub async fn delete_existing(path: &Path, run: Option<&RunContext>) -> anyhow::Result<()> {
     let _guard = lock_path(path).await;
     if !tokio::fs::try_exists(path).await.unwrap_or(false) {
         anyhow::bail!("{} does not exist, so it cannot be deleted", path.display());
     }
+    // Read before removing: a deletion's pre-image is the whole file, and once
+    // the unlink lands there is nothing left to read.
+    let before = snapshot(path).await.ok();
     tokio::fs::remove_file(path)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to delete {}: {e}", path.display()))
+        .map_err(|e| anyhow::anyhow!("failed to delete {}: {e}", path.display()))?;
+    checkpoint(run, path, before.as_ref().and_then(|s| s.bytes()), None).await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -188,7 +226,7 @@ mod tests {
         let p = temp("unchanged");
         std::fs::write(&p, "old").unwrap();
         let snap = snapshot(&p).await.unwrap();
-        write_if_unchanged(&p, &snap, "new").await.unwrap();
+        write_if_unchanged(&p, &snap, "new", None).await.unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "new");
     }
 
@@ -204,11 +242,11 @@ mod tests {
 
         let first = {
             let (p, snap) = (p.clone(), snap.clone());
-            tokio::spawn(async move { write_if_unchanged(&p, &snap, "from A").await })
+            tokio::spawn(async move { write_if_unchanged(&p, &snap, "from A", None).await })
         };
         let second = {
             let (p, snap) = (p.clone(), snap.clone());
-            tokio::spawn(async move { write_if_unchanged(&p, &snap, "from B").await })
+            tokio::spawn(async move { write_if_unchanged(&p, &snap, "from B", None).await })
         };
         let (first, second) = (first.await.unwrap(), second.await.unwrap());
 
@@ -238,8 +276,8 @@ mod tests {
         let empty = snapshot(&a).await.unwrap();
 
         let (ra, rb) = tokio::join!(
-            write_if_unchanged(&a, &empty, "a"),
-            write_if_unchanged(&b, &empty, "b"),
+            write_if_unchanged(&a, &empty, "a", None),
+            write_if_unchanged(&b, &empty, "b", None),
         );
         ra.unwrap();
         rb.unwrap();
@@ -250,7 +288,7 @@ mod tests {
     #[tokio::test]
     async fn deleting_a_missing_file_is_an_error() {
         let p = temp("delete_missing");
-        let err = delete_existing(&p).await.unwrap_err();
+        let err = delete_existing(&p, None).await.unwrap_err();
         assert!(err.to_string().contains("does not exist"));
     }
 
@@ -262,7 +300,9 @@ mod tests {
         // Someone else saves the file while the approval prompt is up.
         std::fs::write(&p, "theirs").unwrap();
 
-        let err = write_if_unchanged(&p, &snap, "mine").await.unwrap_err();
+        let err = write_if_unchanged(&p, &snap, "mine", None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("changed after the approval"));
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
@@ -276,7 +316,7 @@ mod tests {
         let p = temp("create");
         let snap = snapshot(&p).await.unwrap();
         assert!(!snap.existed());
-        write_if_unchanged(&p, &snap, "fresh").await.unwrap();
+        write_if_unchanged(&p, &snap, "fresh", None).await.unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "fresh");
         let _ = std::fs::remove_file(&p);
     }
@@ -288,7 +328,7 @@ mod tests {
         let p = temp("appeared");
         let snap = snapshot(&p).await.unwrap();
         std::fs::write(&p, "someone else got here first").unwrap();
-        assert!(write_if_unchanged(&p, &snap, "mine").await.is_err());
+        assert!(write_if_unchanged(&p, &snap, "mine", None).await.is_err());
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "someone else got here first"
@@ -300,7 +340,7 @@ mod tests {
         let p = temp("bom");
         std::fs::write(&p, "\u{feff}old").unwrap();
         let snap = snapshot(&p).await.unwrap();
-        write_if_unchanged(&p, &snap, "new").await.unwrap();
+        write_if_unchanged(&p, &snap, "new", None).await.unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "\u{feff}new");
     }
 }

@@ -28,7 +28,7 @@ komo memory used <id>              # which turns this memory shaped (run ledger;
 komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`; index is incremental)
 komo dream [--apply]               # evidence-driven candidate consolidation (preview by default)
 komo cron list|add|add-agent [--workspace DIR] [--grant c:m:v]|run|enable|disable|remove
-komo run list|inspect|resume|prune # run ledger (⟲ = recoverable)
+komo run list|inspect|resume|rollback|prune   # run ledger (⟲ = recoverable)
 komo skills list|install|inspect|promote|reject|protect|unprotect|enable|disable
 komo skills archive|restore            # retire an active skill / bring it back
 komo skills audit [name]               # one skill's loads, or all ranked coldest-first
@@ -61,6 +61,7 @@ process's own log mid-conversation.
 | `~/.komo/memory.db` | long-term memories | durable |
 | `~/.komo/cron.db` | scheduled cron jobs | durable |
 | `~/.komo/permissions.json` | saved approval grants | durable |
+| `~/.komo/checkpoints/` | pre-images of files a run changed (7-day retention) | disposable |
 | `~/.komo/session-index/` | episodic search index over transcripts | disposable — rebuilt on search |
 | `~/.komo/tool-output/` | over-limit tool results + per-session `index.jsonl` (7-day retention) | disposable |
 | `~/.komo/skills/` | skill files (filesystem is the source of truth) | durable |
@@ -517,6 +518,23 @@ call the same functions, which is what keeps validation from forking.
   `reset()`s the store before refilling it and outlives any `max_duration`, so
   running it inside the call would let a timeout abort it with the store already
   emptied. Its outcome is read back with `status`.
+- `domain/checkpoint.rs` + `komo-services`' `checkpoint_store` — undoing a
+  turn's **file** changes, the one thing a turn did that used to be final.
+  Every other effect is already recoverable: a memory is a candidate, a skill is
+  a candidate, a cron job can be removed, an ambiguous call is `Uncertain` so the
+  model checks rather than repeats. `write`/`edit`/`apply_patch` produced final
+  state. Now `file_mutation` keeps the bytes each file held **before the run
+  first touched it** — inside the same per-path lock as the write, so the
+  pre-image is exactly what that write replaced — and `komo run rollback <id>`
+  puts them back. Recording is best-effort and happens *after* the mutation: a
+  write the user asked for must never fail because a pre-image could not be
+  filed. **A file whose content is not what the run left is skipped and named,
+  never restored** — undoing one turn is the promise, and quietly undoing a
+  later fix along with it is the failure mode. Operator CLI only, never a model
+  tool: an agent that can undo its own turn can undo the turn that corrected it.
+  Not a sandbox and not a workspace snapshot — the pre-image of exactly what
+  changed, which is what a personal agent needs far more often than container
+  isolation.
 - `domain/run.rs` — run ledger: one `Run` per turn, one `RunStep` per call.
   `Run.memories` records **which stored memories reached that turn's prompt**
   (pinned and recall kept apart), carried out of prompt assembly on

@@ -1,6 +1,7 @@
 use crate::learning_coordinator::{LearningCoordinator, LearningTrigger};
 use komo_core::domain::{
     cancel::{CANCELLED_ERROR, CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
+    checkpoint::CheckpointStore,
     events::{ToolEventSink, TurnEvent},
     hooks::{StepDecision, StepHook, TurnHook},
     llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolOutcome},
@@ -68,6 +69,10 @@ pub struct AgentRuntime {
     /// Post-run learning goes through the shared coordinator (also driven by the
     /// gateway's scheduled sweep); `None` = this runtime never learns.
     pub learning: Option<Arc<LearningCoordinator>>,
+    /// Where a mutating tool leaves the bytes a file held before this turn
+    /// touched it, so `komo run rollback` can put them back. `None` = this
+    /// runtime's file changes are final.
+    pub checkpoint: Option<Arc<dyn CheckpointStore>>,
     /// Turn-journal store: each turn's provider-level state, persisted so an
     /// interrupted turn can be continued (`resume_interrupted`) instead of
     /// re-run. `None` — aux runtimes (delegate/cron/briefing) — journals
@@ -213,7 +218,8 @@ impl AgentRuntime {
         }
 
         let span = info_span!("run", run_id = %run.id, session = %session_id);
-        let ctx = RunContext::new(run.id.clone(), self.runs.clone());
+        let ctx = RunContext::new(run.id.clone(), self.runs.clone())
+            .with_checkpoint(self.checkpoint.clone());
         // Keep a handle to read the tool-step count after the turn (the seq
         // counter is shared via `Arc`, so this clone sees the final value).
         let probe = ctx.clone();
@@ -984,6 +990,7 @@ mod tests {
             max_turns,
             history_window: 0,
             learning: None,
+            checkpoint: None,
             journal: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
@@ -1399,6 +1406,7 @@ mod tests {
             max_turns: 30,
             history_window: 0,
             learning: None,
+            checkpoint: None,
             journal: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
@@ -1977,6 +1985,7 @@ mod tests {
             max_turns: 30,
             history_window: 0,
             learning: None,
+            checkpoint: None,
             journal: Some(db.clone()),
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),

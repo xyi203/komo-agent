@@ -19,6 +19,8 @@ time = { workspace = true }
 # Local-time rendering for a session chunk's date, matching every other
 # operator-facing timestamp in komo.
 chrono = { workspace = true }
+# Content digests for checkpointed files — "changed since the run left it?"
+sha2 = { workspace = true }
 tracing = { workspace = true }
 tokio = { version = "1.53.1", features = ["full"] }
 # `join_all` — a round's independent tool calls run concurrently.
@@ -34,3 +36,5 @@ similar = "3.1.1"
 [dev-dependencies]
 # Builds throwaway vaults for the indexing tests.
 tempfile = "3"
+# Ages a manifest to test the retention sweep.
+filetime = "0.2"

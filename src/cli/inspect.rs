@@ -3,6 +3,8 @@
 //! These query the database directly and print to stdout — no LLM, no agent
 //! runtime. They are the operator's view into what the gateway will act on.
 
+use komo_core::domain::checkpoint::CheckpointStore;
+
 use crate::{
     domain::cron::{CronAction, CronJob, CronJobSpec, CronJobStatus},
     domain::task::TaskStatus,
@@ -339,6 +341,25 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
     }
     if !run.plan.is_empty() {
         println!("plan    {}", run.plan);
+    }
+    // Read straight off the checkpoint directory rather than from a ledger
+    // column: the store already knows what this run changed, and a second copy
+    // in the ledger could only ever disagree with it.
+    let checkpoints = komo_services::checkpoint_store::FsCheckpointStore::new(
+        komo_config::komo_home().join("checkpoints"),
+    );
+    if let Ok(changed) = CheckpointStore::changed(&checkpoints, &run.id).await
+        && !changed.is_empty()
+    {
+        println!(
+            "files   {} changed (`komo run rollback {}`)",
+            changed.len(),
+            run.id
+        );
+        for file in &changed {
+            let mark = if file.existed_before { "M" } else { "A" };
+            println!("        {mark} {}", file.path);
+        }
     }
     // 0/0 means the provider reported no usage (or the row predates the columns),
     // so say nothing rather than claim a free turn.

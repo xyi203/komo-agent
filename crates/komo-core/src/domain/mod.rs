@@ -2,6 +2,7 @@ pub mod approval;
 pub mod briefing;
 pub mod cancel;
 pub mod catalog;
+pub mod checkpoint;
 pub mod chunk_index;
 pub mod context;
 pub mod cron;

@@ -10,6 +10,7 @@
 //! `operator_control` stayed in the binary: it reaches up into `agent::daemon`
 //! and out to the gateway client, so it is wiring rather than a service.
 
+pub mod checkpoint_store;
 pub mod clarify;
 pub mod cron_actions;
 pub mod diff;

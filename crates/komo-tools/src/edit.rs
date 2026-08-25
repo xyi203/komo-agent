@@ -187,7 +187,7 @@ impl Tool for EditTool {
             return Ok(ToolOutput::text(refusal));
         }
 
-        file_mutation::write_if_unchanged(&path, &before, &replaced).await?;
+        file_mutation::write_if_unchanged(&path, &before, &replaced, ctx.run.as_ref()).await?;
 
         let stats = diff::unified(&path.display().to_string(), &source, &replaced);
         let mut text = format!(

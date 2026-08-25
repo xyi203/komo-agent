@@ -326,6 +326,16 @@ enum RunAction {
         /// recoverable run
         id: Option<String>,
     },
+    /// Undo a run's file changes, restoring what each file held before the
+    /// turn touched it. A file that changed after the run left it is reported
+    /// and skipped, never overwritten.
+    Rollback {
+        /// Run id (as shown by `run list`)
+        id: String,
+        /// Show what would be restored, without touching anything
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Prune old runs (and their tool steps) from the ledger. Pass exactly one
     /// of --before or --keep.
     Prune {
@@ -652,6 +662,7 @@ pub async fn run() -> anyhow::Result<()> {
             RunAction::List { limit } => inspect::run_list(&operator(&config).await?, limit).await,
             RunAction::Inspect { id } => inspect::run_inspect(&operator(&config).await?, &id).await,
             RunAction::Resume { id } => resume::run(&config, &operator(&config).await?, id).await,
+            RunAction::Rollback { id, dry_run } => crate::cli::rollback::run(&id, dry_run).await,
             RunAction::Prune { before, keep } => {
                 run_prune(&operator(&config).await?, before, keep).await
             }
