@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod context;
 pub mod cron;
 pub mod embedding;
+pub mod episode;
 pub mod events;
 pub mod gateway;
 pub mod home;

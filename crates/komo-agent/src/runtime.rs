@@ -1,4 +1,4 @@
-use crate::review_coordinator::{ReviewCoordinator, ReviewTrigger};
+use crate::learning_coordinator::{LearningCoordinator, LearningTrigger};
 use komo_core::domain::{
     cancel::{CANCELLED_ERROR, CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
     events::{ToolEventSink, TurnEvent},
@@ -65,9 +65,9 @@ pub struct AgentRuntime {
     /// per-turn hot path off a full-transcript read for long-lived chat
     /// sessions — the LLM windows again to the same bound, so this is loss-free.
     pub history_window: usize,
-    /// Post-turn reviews go through the shared coordinator (also driven by the
-    /// gateway's scheduled sweep); `None` = no reflective reviewing.
-    pub review: Option<Arc<ReviewCoordinator>>,
+    /// Post-run learning goes through the shared coordinator (also driven by the
+    /// gateway's scheduled sweep); `None` = this runtime never learns.
+    pub review: Option<Arc<LearningCoordinator>>,
     /// Turn-journal store: each turn's provider-level state, persisted so an
     /// interrupted turn can be continued (`resume_interrupted`) instead of
     /// re-run. `None` — aux runtimes (delegate/cron/briefing) — journals
@@ -263,6 +263,26 @@ impl AgentRuntime {
             warn!(%error, "failed to finalize run ledger entry (non-fatal)");
         }
 
+        // Learning, detached from the reply path and dispatched **after** the
+        // ledger closed. It reads this run back as an episode — status, steps
+        // and all — so starting it from inside the turn would have it assemble a
+        // run whose outcome had not been written yet. Whether the interval is
+        // due, which episodes the extractor sees, and the watermark are all the
+        // coordinator's knowledge; the runtime only reports that a run ended.
+        if let Some(learning) = &self.review {
+            let learning = learning.clone();
+            let run_id = run.id.clone();
+            tokio::spawn(async move {
+                match learning.run(LearningTrigger::AfterRun { run_id }).await {
+                    Ok(report) if !report.is_empty() => {
+                        info!(?report, "self-improvement learning")
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "learning failed (non-fatal)"),
+                }
+            });
+        }
+
         // Journal lifecycle: a delivered or deliberately-stopped turn has
         // nothing left to resume, so its rows go; a *failed* turn keeps them
         // (they are the debugging record of what the model actually saw, and
@@ -445,24 +465,6 @@ impl AgentRuntime {
         // reach here — they surface through the run ledger instead.
         for hook in &self.turn_hooks {
             hook.turn_finished(session_id, &reply).await;
-        }
-
-        // Post-turn review, detached from the reply path. Whether this turn is
-        // due (cadence), which snapshot the reviewer sees, and the watermark
-        // are all the coordinator's knowledge — the runtime only reports that
-        // a turn finished.
-        if let Some(review) = &self.review {
-            let review = review.clone();
-            let session_id = session_id.to_string();
-            tokio::spawn(async move {
-                match review.run(ReviewTrigger::AfterTurn { session_id }).await {
-                    Ok(report) if !report.is_empty() => {
-                        info!(?report, "self-improvement review")
-                    }
-                    Ok(_) => {}
-                    Err(error) => warn!(%error, "review failed (non-fatal)"),
-                }
-            });
         }
 
         Ok((reply, usage, memories))
@@ -2085,5 +2087,71 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(session.messages.len(), 1, "transcript untouched");
+    }
+
+    /// The ordering fix, asserted end to end: learning is dispatched **after**
+    /// `runs.finish`, so the episode it assembles is a finished one.
+    ///
+    /// The failure this guards against is silent, not loud. Dispatched from
+    /// inside the turn — where the post-turn review used to live — the run is
+    /// still `Running`, so it is not offered as an episode and the turn is
+    /// simply never learned from. Nothing errors; komo just stops learning.
+    #[tokio::test]
+    async fn learning_sees_a_finished_run_because_it_is_dispatched_after_the_ledger_closes() {
+        /// Records the status each episode carried when the extractor saw it.
+        struct StatusSpy(Arc<Mutex<Vec<(String, RunStatus)>>>);
+        #[async_trait]
+        impl komo_core::domain::reviewer::Reviewer for StatusSpy {
+            async fn review(
+                &self,
+                _session: &Session,
+                episodes: &[komo_core::domain::episode::AssessedEpisode],
+            ) -> anyhow::Result<komo_core::domain::reviewer::ReviewOutcome> {
+                self.0.lock().unwrap().extend(
+                    episodes
+                        .iter()
+                        .map(|e| (e.view.id().to_string(), e.view.run.status)),
+                );
+                Ok(Default::default())
+            }
+        }
+
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_learning_order.db"))
+                .await
+                .unwrap(),
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (mut rt, _) =
+            scripted_runtime(db.clone(), vec![Step::Final("done".into())], Vec::new(), 30);
+        rt.review = Some(Arc::new(
+            crate::learning_coordinator::LearningCoordinator::new(
+                db.clone(),
+                db.clone(),
+                Arc::new(StatusSpy(seen.clone())),
+                1,
+            ),
+        ));
+
+        rt.handle_input("cli:s1", "hi".into()).await.unwrap();
+
+        // Learning runs detached, so wait for it rather than racing it.
+        for _ in 0..200 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let runs = RunRepository::list(&*db, 10).await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the finished turn must reach the extractor — an empty list here \
+             means learning ran while the run was still open"
+        );
+        assert_eq!(seen[0].0, runs[0].id);
+        assert_eq!(seen[0].1, RunStatus::Done, "and it was already terminal");
     }
 }

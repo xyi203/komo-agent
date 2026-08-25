@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use super::session::Session;
+use super::{episode::AssessedEpisode, session::Session};
 
 pub const SELF_REVIEW_PROMPT: &str = r#"Review the completed session for durable self-improvement.
 
@@ -42,5 +42,20 @@ pub struct ReviewOutcome {
 
 #[async_trait]
 pub trait Reviewer: Send + Sync {
-    async fn review(&self, session: &Session) -> anyhow::Result<ReviewOutcome>;
+    /// Extract durable learning from one session's finished, not-yet-learned
+    /// turns.
+    ///
+    /// `episodes` — not the transcript — is the input, because a transcript
+    /// holds only user and assistant *text*: it cannot say whether a command
+    /// actually ran, what it returned, or whether the turn ended by delivering
+    /// or by failing. An extractor reading text alone infers all of that from
+    /// the agent's own claims about itself.
+    ///
+    /// `session` supplies identity and workspace for the aux call; its
+    /// transcript is not read, so callers need not load one.
+    async fn review(
+        &self,
+        session: &Session,
+        episodes: &[AssessedEpisode],
+    ) -> anyhow::Result<ReviewOutcome>;
 }

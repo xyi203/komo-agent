@@ -1,8 +1,26 @@
 # Episode 学习闭环设计
 
-> 状态：设计提案，尚未实现。
+> 状态：Phase 1 已实现（2026-08-25）；Phase 2、3 仍是设计提案。
 >
 > 范围：在现有 run ledger、reflective reviewer、Memory consolidation 和 Skill governance 之上，建立基于任务结果证据的学习闭环。
+>
+> Phase 1 落地位置与相对本文的偏差：
+>
+> - `komo-core` `domain/episode.rs` — `EpisodeView` / `OutcomeVerdict` /
+>   `OutcomeEvidence` / `OutcomeAssessment` / `AssessedEpisode`。
+> - `komo-services` `episode.rs` — `assemble`（§5.2 的 EpisodeAssembler，落成一个自由函数
+>   而非结构体：第一版只有一个纯读取操作，没有需要持有的状态）。
+> - `OutcomeEvaluator` 同样没有独立模块，实现为 `OutcomeAssessment::deterministic`
+>   —— 它是 `EpisodeView` 上的纯函数，放在类型旁边比新开一个只含单个函数的模块更直接。
+> - `komo-agent` `learning_coordinator.rs` — `LearningCoordinator`（替换
+>   `ReviewCoordinator`，旧的 session cadence 路径连同 `reviewed_through` /
+>   `review_candidates` / `mark_reviewed` / `count_user_turns` 一并删除，不做并存兼容层）。
+> - watermark 落在 `Run.learned`（state.db 追加列，`DEFAULT true` 只回填历史行，
+>   避免升级当天把整个既有 ledger 一次性喂给抽取）。
+> - 触发保留了「攒够 interval 再学」的节流，但计数单位从 session 的 user turn 数
+>   换成该 session 未学习的 run 数；sweep 不受 interval 约束。
+> - 第 8 节的 `OutcomeAssessment` 持久化属于 Phase 2（需要被后续反馈修订时才需要），
+>   Phase 1 只在内存中传给抽取器。
 
 ## 1. 结论
 
@@ -382,24 +400,28 @@ Outcome evidence 应保存引用和摘要，而不是复制完整工具输出。
 
 ## 10. 增量实施
 
-### Phase 1：闭合单个 Episode
+### Phase 1：闭合单个 Episode ✅ 已实现
 
 实现：
 
 - `EpisodeAssembler`；
 - 在 `runs.finish` 之后触发学习；
 - Outcome 先只使用确定性规则；
-- extractor 消费单个 EpisodeView；
+- extractor 消费一批未学习的 EpisodeView（同一 session 内按时间正序）；
 - Fact、Skill、Commitment 继续走现有治理路径。
-- 验证新路径后删除旧的 session cadence review 路径。
+- 旧的 session cadence review 路径已删除。
 
-验证：
+验证（均有测试）：
 
 - reviewer 能看到本轮已脱敏的 RunStep；
-- 触发时 Run 一定是 terminal；
+- 触发时 Run 一定是 terminal —— `learning_sees_a_finished_run_because_it_is_dispatched_after_the_ledger_closes`
+  这条回归测试在把触发点挪回 `finish` 之前会失败；
 - tool success 不会自动把 Goal Outcome 判为 Success；
 - failed/cancelled/uncertain 的分类符合第 7 节；
-- 学习失败不影响 turn reply。
+- 学习失败不影响 turn reply（detached task，且失败不推进 watermark）。
+
+Golden cases 覆盖情况：第 11 节的 1、4、11、12 已有对应测试；2、3 依赖 Phase 2 的
+用户反馈证据与 aux 判定；5–10 由既有 consolidator / skill governance 测试覆盖。
 
 ### Phase 2：接收延迟反馈
 

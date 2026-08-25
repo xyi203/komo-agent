@@ -346,17 +346,6 @@ impl MessageLog {
         Ok(Some(messages))
     }
 
-    /// How many user messages the session holds — the turn count the reviewer's
-    /// cadence is sized against.
-    pub async fn count_user_turns(&self, session_id: &str) -> anyhow::Result<usize> {
-        Ok(self
-            .list(session_id)
-            .await?
-            .iter()
-            .filter(|m| m.role == Role::User)
-            .count())
-    }
-
     /// Append one message.
     pub async fn append(&self, session_id: &str, message: &Message) -> anyhow::Result<()> {
         let line = serde_json::to_string(&MessageLine {
@@ -709,13 +698,15 @@ mod tests {
         assert_eq!(log.window("api:s", 0).await.unwrap().len(), 4);
     }
 
-    #[tokio::test]
-    async fn user_turns_are_counted_without_the_transcript_shape_mattering() {
-        let (log, _home) = log("count");
-        log.append("api:s", &Message::user("hi")).await.unwrap();
-        log.append("api:s", &assistant("hello")).await.unwrap();
-        log.append("api:s", &Message::user("again")).await.unwrap();
-        assert_eq!(log.count_user_turns("api:s").await.unwrap(), 2);
+    /// User messages a reader sees, counted off the projection — the shape
+    /// assertions below are about what `fold` resolves to, not about the file.
+    async fn user_turns(log: &MessageLog, session_id: &str) -> usize {
+        log.list(session_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count()
     }
 
     #[tokio::test]
@@ -737,7 +728,7 @@ mod tests {
         assert_eq!(left, ["first", "answered"]);
         // What a reader sees never ends on a user message with no reply — that
         // is the shape providers reject on replay.
-        assert_eq!(log.count_user_turns("api:s").await.unwrap(), 1);
+        assert_eq!(user_turns(&log, "api:s").await, 1);
 
         // The line is still in the file: the projection hides the turn, the log
         // does not lose it.
@@ -854,7 +845,7 @@ mod tests {
         assert_eq!(ran, ["shell", "read"], "and the work is still on file");
 
         // The user-turn count the review cadence rides on must not see them.
-        assert_eq!(log.count_user_turns("api:s").await.unwrap(), 1);
+        assert_eq!(user_turns(&log, "api:s").await, 1);
     }
 
     /// A window of N messages is N *messages*, however many tool lines sit

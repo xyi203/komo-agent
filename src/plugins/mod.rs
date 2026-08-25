@@ -39,7 +39,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use komo_agent::daemon::Schedule;
 use komo_agent::gateway::{Channel, MaintenanceService};
-use komo_agent::review_coordinator::ReviewCoordinator;
+use komo_agent::learning_coordinator::LearningCoordinator;
 use komo_agent::runtime::AgentRuntime;
 use komo_config::ConfigSnapshot;
 use komo_core::domain::catalog::ToolCatalog;
@@ -502,7 +502,7 @@ pub struct SweepCx<'a> {
     pub kanban: Arc<KanbanDb>,
     pub cron_jobs: Arc<dyn CronJobRepository>,
     pub notifier: Arc<dyn Notifier>,
-    pub review: Arc<ReviewCoordinator>,
+    pub review: Arc<LearningCoordinator>,
     pub memories: Arc<dyn MemoryRepository>,
     pub aux_llm: Arc<dyn LlmClient>,
     pub briefing_runtime: Arc<AgentRuntime>,

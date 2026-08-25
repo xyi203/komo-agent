@@ -274,7 +274,7 @@ fn truncate(text: &str, cap: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komo_core::domain::repository::{MessageRepository, ReviewCandidate};
+    use komo_core::domain::repository::MessageRepository;
     use komo_services::tool_execution::{SessionContext, SessionOrigin, with_session};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -351,12 +351,6 @@ mod tests {
         async fn rotate(&self, _session_id: &str) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
-        async fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
-            Ok(Vec::new())
-        }
-        async fn mark_reviewed(&self, _session_id: &str, _through: usize) -> anyhow::Result<()> {
-            Ok(())
-        }
     }
 
     #[async_trait]
@@ -366,9 +360,6 @@ mod tests {
         }
         async fn save(&self, _session_id: &str, _message: &Message) -> anyhow::Result<()> {
             Ok(())
-        }
-        async fn count_user_turns(&self, _session_id: &str) -> anyhow::Result<usize> {
-            Ok(1)
         }
         async fn cancel_last_turn(&self, _session_id: &str) -> anyhow::Result<()> {
             Ok(())

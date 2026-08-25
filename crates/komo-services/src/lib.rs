@@ -13,6 +13,7 @@
 pub mod clarify;
 pub mod cron_actions;
 pub mod diff;
+pub mod episode;
 pub mod file_mutation;
 pub mod memory_consolidation;
 pub mod memory_enrichment;

@@ -12,8 +12,8 @@
 //! registry — so a runtime's tool set can never drift from the roster.
 
 use komo_agent::delegate::DelegateTool;
+use komo_agent::learning_coordinator::LearningCoordinator;
 use komo_agent::llm::{PreambleFn, build_llm};
-use komo_agent::review_coordinator::ReviewCoordinator;
 use komo_agent::reviewer::ReflectiveReviewer;
 use komo_agent::runtime::AgentRuntime;
 use komo_agent::system_prompt::SystemPromptBuilder;
@@ -44,7 +44,7 @@ pub struct Wiring {
     pub runtime: AgentRuntime,
     /// The shared review coordinator (post-turn + scheduled), for the
     /// gateway's `ReviewSweep`.
-    pub review: Arc<ReviewCoordinator>,
+    pub review: Arc<LearningCoordinator>,
     /// The auxiliary (cheaper) LLM, reused by the daily briefing sweep.
     pub aux_llm: Arc<dyn LlmClient>,
     /// The markdown memory store, also read by the briefing sweep.
@@ -504,10 +504,10 @@ pub async fn build(
         skill_repo,
         kanban.clone(),
     ));
-    // One coordinator instance shared by the runtime's post-turn trigger and
+    // One coordinator instance shared by the runtime's post-run trigger and
     // the gateway's scheduled sweep — that sharing is what makes its
     // per-session in-flight guard effective across the two paths.
-    let review = Arc::new(ReviewCoordinator::new(
+    let review = Arc::new(LearningCoordinator::new(
         db.clone(),
         db.clone(),
         reviewer,

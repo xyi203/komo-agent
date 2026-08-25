@@ -68,7 +68,7 @@ Transcripts are **files, not rows** (`persistence/message_log.rs`), because they
 are the one thing here that is purely appended — so they pay no schema cost: a
 field added later reads as its default on every line written before it existed,
 and a change deeper than that dispatches on the line's `v`. Session *metadata*
-stays a row because it is *updated* (title, status, model, review watermark).
+stays a row because it is *updated* (title, status, model).
 `MessageRepository` is the log; `SessionRepository` reads the two together.
 Rows left in the old `message_records` table move out on connect, once. Anything
 that used to count messages in SQL must now go through the log — the review
@@ -315,20 +315,45 @@ call the same functions, which is what keeps validation from forking.
   deny-only file-read gate as `read`), `wiki_read` (vault-confined by
   canonicalized prefix, `Risk::Safe` deny-only; reads the markdown, not the
   index, so a note edited since the last index run is served current).
-- `komo-agent`'s `reviewer` — the post-turn extraction pass. Memory extractions
-  leave here as `Observation`s and are applied by `MemoryConsolidator`, never
-  written directly — the reviewer holds no memory store. It sees the
-  transcript only: `runtime` persists user and assistant messages, never tool
-  results, so the reviewer has **not** read any skill it proposes to change.
-  A proposal naming an existing active skill therefore goes through a second
-  aux call (`grounded_rewrite`) that is handed the real body and returns the
-  complete replacement; failing to ground drops the proposal rather than writing
-  the blind one. New skills need no second pass.
-  **Sweep sessions (`briefing:*`, `cron:*`) are exempt from review** — a sweep
-  restates facts the agent already knows, and each run's session counts as a
-  fresh "independent occasion" to the consolidator, so extracting there floods
-  the memory pipeline with duplicate candidates. The guard lives in
-  `ReviewCoordinator` (`exempt_from_review`), covering both triggers.
+- `komo-agent`'s `reviewer` + `learning_coordinator`, `komo-core`'s
+  `domain::episode`, `komo-services`' `episode` — the post-run extraction pass
+  (docs/episode-learning-framework.md). Its unit is an **episode**: one finished
+  `Run` plus its `RunStep`s, assembled on demand (`episode::assemble`) and never
+  stored — the ledger is already the authority on both. A transcript alone could
+  not say whether a command ran or what it returned (tool results are never
+  persisted as messages), so an extractor reading one learns from the agent's
+  own account of itself.
+  **`Done` is not `Success`.** Execution status and goal outcome are separate
+  axes (`OutcomeVerdict`); the deterministic assessment never reports success,
+  because nothing observable at the end of a turn distinguishes "the goal was
+  met" from "the agent stopped talking". Evidence carries its own strength and
+  only the strongest kind present decides — a disagreement among peers resolves
+  to `Unknown`, never a majority.
+  Memory extractions leave here as `Observation`s and are applied by
+  `MemoryConsolidator`, never written directly — the reviewer holds no memory
+  store. It has **not** read any skill it proposes to change, so a proposal
+  naming an existing active skill goes through a second aux call
+  (`grounded_rewrite`) that is handed the real body and returns the complete
+  replacement; failing to ground drops the proposal rather than writing the
+  blind one. New skills need no second pass.
+  **The watermark is `Run.learned`, per run** — not a per-session turn count: a
+  count says how many turns there were, never which ones were new. A run the
+  pass deliberately skips (cancelled turns, sweep sessions) is marked too, since
+  "considered and declined" and "not yet considered" have to be different states
+  or every sweep re-examines it forever. A *failed* pass marks nothing, so the
+  next sweep retries it.
+  **Learning is dispatched after `runs.finish`, never from inside the turn** —
+  an episode assembled while its run is still open has no decided status, and
+  `unlearned` would not offer it at all, so the turn would silently never be
+  learned from. There is a regression test for exactly that.
+  **Cancelled turns are audit, not lessons**: the work stopped part-way by the
+  user's choice, so its silence is not evidence and its half-done steps are not
+  a procedure worth keeping.
+  **Sweep sessions (`briefing:*`, `cron:*`) are exempt** — a sweep restates
+  facts the agent already knows, and each run's session counts as a fresh
+  "independent occasion" to the consolidator, so extracting there would let the
+  memory library corroborate itself on a timer. The guard lives in
+  `LearningCoordinator` (`exempt_from_learning`), covering both triggers.
 - `komo-agent`'s `delegate` — sub-agent as a real agent turn on a `delegate:<uuid>`
   session; inherits the parent's ambient session context (approvals prompt the
   real conversation, cancel propagates); recursion blocked structurally
@@ -514,9 +539,9 @@ call the same functions, which is what keeps validation from forking.
   after 5 failures). Sweep cron expressions are matched against **local time**
   via the same `next_occurrence_local` cron jobs use — never `Utc::now()`
   straight into croner, which silently shifts every schedule by the UTC offset.
-  Sweeps: `ReviewSweep` (via the shared `ReviewCoordinator`, which
-  also serves the post-turn trigger — watermark + in-flight guard prevent
-  duplicate reviews), `ReminderSweep`, `CronJobSweep` (claim-before-run: a
+  Sweeps: `ReviewSweep` (via the shared `LearningCoordinator`, which
+  also serves the post-run trigger — the per-run watermark + in-flight guard
+  prevent duplicate extraction), `ReminderSweep`, `CronJobSweep` (claim-before-run: a
   crash never re-fires a slot; a slot missed by more than the job's **own
   interval** is abandoned rather than fired at the wrong hour — `is_due` has no
   upper bound on lateness, and the host is a laptop. `--skip-missed` opts a job

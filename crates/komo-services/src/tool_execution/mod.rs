@@ -990,6 +990,16 @@ mod tests {
         ) -> anyhow::Result<Vec<RunStep>> {
             Ok(Vec::new())
         }
+        async fn unlearned(
+            &self,
+            _session_id: Option<&str>,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<Run>> {
+            Ok(Vec::new())
+        }
+        async fn mark_learned(&self, _run_ids: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     struct EchoTool;

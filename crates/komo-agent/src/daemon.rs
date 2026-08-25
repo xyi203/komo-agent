@@ -116,13 +116,13 @@ pub struct MaintenanceSummary {
     pub jobs_run: usize,
 }
 
-/// The fixed maintenance action: review every stored session that has at least
-/// one user turn, letting the reviewer distill durable memories/skills.
+/// The fixed maintenance action: learn from every finished turn the interval
+/// left behind, letting the extractor distill durable memories/skills.
 pub struct ReviewSweep {
-    /// The shared coordinator (same instance as the runtime's post-turn
-    /// trigger, so the per-session in-flight guard spans both paths). Cadence,
-    /// candidate scanning, full-loads, and the watermark all live there.
-    pub review: Arc<crate::review_coordinator::ReviewCoordinator>,
+    /// The shared coordinator (same instance as the runtime's post-run trigger,
+    /// so the per-session in-flight guard spans both paths). The interval, the
+    /// backlog scan, and the watermark all live there.
+    pub review: Arc<crate::learning_coordinator::LearningCoordinator>,
 }
 
 #[async_trait]
@@ -130,10 +130,10 @@ impl Maintenance for ReviewSweep {
     async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
         let report = self
             .review
-            .run(crate::review_coordinator::ReviewTrigger::Scheduled)
+            .run(crate::learning_coordinator::LearningTrigger::Scheduled)
             .await?;
         Ok(MaintenanceSummary {
-            sessions_reviewed: report.sessions_reviewed,
+            sessions_reviewed: report.sessions_learned,
             memories_written: report.memories_written,
             skills_written: report.skills_written,
             tasks_captured: report.tasks_captured,

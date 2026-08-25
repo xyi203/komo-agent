@@ -6,18 +6,6 @@ use super::{
     skill::Skill,
 };
 
-/// A session's identity + review watermark without its transcript — the cheap
-/// projection the review sweep scans to decide which sessions have new activity,
-/// so it needn't materialize every session's messages every cycle.
-pub struct ReviewCandidate {
-    pub id: String,
-    /// Live user-turn count (matches [`Session::user_turns`]).
-    pub user_turns: usize,
-    /// User-turn count already reviewed (0 = never). A session is skipped when
-    /// `user_turns <= reviewed_through`.
-    pub reviewed_through: usize,
-}
-
 #[async_trait]
 pub trait SessionRepository: Send + Sync {
     /// Find a session by id. Returns None if it does not exist.
@@ -79,34 +67,12 @@ pub trait SessionRepository: Send + Sync {
     async fn delete_session(&self, _session_id: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
-
-    /// Lightweight scan for the review sweep: each session's id, live user-turn
-    /// count, and review watermark, with no transcript loaded. Default returns
-    /// nothing — a store without a watermark opts out of incremental review.
-    async fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
-        Ok(Vec::new())
-    }
-
-    /// Record that `session_id` has been reviewed through `through` user turns,
-    /// so the next sweep skips it until new turns arrive. Stores may run on a
-    /// detached task whose write lands out of order, so an implementation must
-    /// tolerate stale marks: clamp `through` to the session's live user-turn
-    /// count (a `/new` rotate empties the transcript — a stale high watermark
-    /// would silently suppress the sweep on the fresh conversation) and never
-    /// regress an already-higher stored value. Default is a no-op.
-    async fn mark_reviewed(&self, _session_id: &str, _through: usize) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 #[async_trait]
 pub trait MessageRepository: Send + Sync {
     /// Return all messages for a session, ordered by timestamp.
     async fn list_by_session(&self, session_id: &str) -> anyhow::Result<Vec<Message>>;
-    /// Count the user-role messages in a session (i.e. the number of user
-    /// turns), without materializing the transcript. Used to drive the periodic
-    /// reviewer cadence cheaply now that the turn loads only a windowed session.
-    async fn count_user_turns(&self, session_id: &str) -> anyhow::Result<usize>;
     /// Append a message to a session.
     async fn save(&self, session_id: &str, message: &Message) -> anyhow::Result<()>;
     /// Record that the turn in flight was cancelled before it did anything.

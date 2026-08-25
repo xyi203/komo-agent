@@ -20,7 +20,7 @@ use komo_core::domain::{
         PairingRepository, PairingRequest, PairingStatus, parse_pairing_status, verify_code,
     },
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
-    repository::{MessageRepository, ReviewCandidate, SessionRepository},
+    repository::{MessageRepository, SessionRepository},
     run::{INTERRUPTED_ERROR, MemoryUse, Run, RunRepository, RunStatus, RunStep, parse_run_status},
     session::Session,
     skill::Skill,
@@ -37,12 +37,6 @@ struct SessionRecord {
     created_at: i64,
     /// Immutable workspace identity chosen when the session is created.
     workspace: String,
-
-    /// User-turn count already covered by the reflective reviewer (0 = never
-    /// reviewed). The review sweep compares this against the live user-turn
-    /// count and skips a session with no new turns, so it no longer re-reviews
-    /// every session on every cycle. Reset to 0 when the transcript rotates.
-    reviewed_through: i64,
 
     /// Operator-set display name (empty = untitled). Added additively via
     /// `SESSION_COLUMNS`; set through `SessionRepository::set_title`.
@@ -190,6 +184,11 @@ struct RunRecord {
     /// Run id this run continued from (journal resume). Additive column;
     /// empty = none, same convention as `structured`.
     resumed_from: String,
+
+    /// The learning pass has consumed this run. Additive column; a pre-column
+    /// row reads as `false`, which offers it to the pass once — the extractor's
+    /// own dedup makes a re-read harmless.
+    learned: bool,
 }
 
 /// One tool invocation within a run. `run_id` indexes back to [`RunRecord`];
@@ -365,10 +364,6 @@ impl Db {
         // *table* still needs the delete-to-reset.
         if !is_new && let Some(p) = &path {
             const SESSION_COLUMNS: &[(&str, &str)] = &[
-                (
-                    "reviewed_through",
-                    "\"reviewed_through\" integer NOT NULL DEFAULT 0",
-                ),
                 ("title", "\"title\" text NOT NULL DEFAULT ''"),
                 ("status", "\"status\" text NOT NULL DEFAULT 'active'"),
                 (
@@ -395,6 +390,14 @@ impl Db {
                 ),
                 ("resumed_from", "\"resumed_from\" text NOT NULL DEFAULT ''"),
                 ("memories", "\"memories\" text NOT NULL DEFAULT ''"),
+                // `DEFAULT true` backfills history, and only history: every run
+                // the learning pass could act on is inserted with an explicit
+                // `learned: false`, so this default is reached exactly once per
+                // row that predates the column. Defaulting to `false` instead
+                // would offer the entire existing ledger to the pass on the
+                // upgrade that adds it — thousands of old turns re-extracted at
+                // once, each an "independent occasion" to the consolidator.
+                ("learned", "\"learned\" boolean NOT NULL DEFAULT true"),
             ];
             ensure_columns(p, "run_records", RUN_COLUMNS).await?;
             const STEP_COLUMNS: &[(&str, &str)] = &[
@@ -611,7 +614,6 @@ impl SessionRepository for Db {
                 id: session.id.clone(),
                 created_at: session.created_at,
                 workspace: session.workspace.clone(),
-                reviewed_through: 0,
                 title: session.title.clone(),
                 status: session.status.clone(),
                 model: session.model.clone(),
@@ -692,22 +694,19 @@ impl SessionRepository for Db {
             let archived_id = archived_id.clone();
             let mut conn = self.inner.connection().await?;
             let mut tx = conn.transaction().await?;
-            let Ok(mut live) = SessionRecord::get_by_id(&mut tx, session_id).await else {
+            let Ok(live) = SessionRecord::get_by_id(&mut tx, session_id).await else {
                 return Ok(None);
             };
 
             // Give the moved transcript a session row, preserving the original's
             // start time; the live row stays and is now empty for the next
-            // conversation. The archive inherits the live session's review
-            // watermark (its transcript, hence its user-turn count, is unchanged)
-            // so an already-reviewed conversation isn't re-reviewed under the
-            // archive id, while any unreviewed tail still is.
-            let prior_reviewed = live.reviewed_through;
+            // conversation. Rotation carries no learning state: the watermark is
+            // per-run and a run keeps the session id it was recorded under, so
+            // moving a transcript cannot make an episode look unlearned again.
             toasty::create!(SessionRecord {
                 id: archived_id.clone(),
                 created_at: live.created_at,
                 workspace: live.workspace.clone(),
-                reviewed_through: prior_reviewed,
                 title: live.title.clone(),
                 status: live.status.clone(),
                 model: live.model.clone(),
@@ -715,9 +714,6 @@ impl SessionRepository for Db {
             })
             .exec(&mut tx)
             .await?;
-            // The live row is now a fresh, empty conversation: reset its watermark
-            // so the first new turn isn't compared against the archived count.
-            live.update().reviewed_through(0).exec(&mut tx).await?;
             tx.commit().await?;
             Ok(Some(archived_id))
         })
@@ -800,53 +796,6 @@ impl SessionRepository for Db {
         })
         .await
     }
-
-    async fn review_candidates(&self) -> anyhow::Result<Vec<ReviewCandidate>> {
-        let mut conn = self.inner.connection().await?;
-        let sessions = toasty::query!(SessionRecord).exec(&mut conn).await?;
-        // One transcript read per session. This is the sweep that pays most for
-        // moving messages out of the table: the count used to push down to SQL
-        // through the `session_id` index, and now every session's file is read
-        // and parsed. Sessions accumulate (`/new` archives keep their
-        // transcripts), so this grows with the archive, not with what is active.
-        // Acceptable because the sweep runs on the order of half-hourly — but it
-        // is the first thing to reach for a per-file count cache if it ever
-        // stops being.
-        let mut candidates = Vec::with_capacity(sessions.len());
-        for s in sessions {
-            let user_turns = self.messages.count_user_turns(&s.id).await?;
-            candidates.push(ReviewCandidate {
-                user_turns,
-                reviewed_through: s.reviewed_through.max(0) as usize,
-                id: s.id,
-            });
-        }
-        Ok(candidates)
-    }
-
-    async fn mark_reviewed(&self, session_id: &str, through: usize) -> anyhow::Result<()> {
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            let mut record = SessionRecord::get_by_id(&mut conn, session_id).await?;
-            // The runtime's reviewer runs on a detached task, so its mark can
-            // land out of order — after a `/new` rotate reset the row to 0 (a
-            // stale high watermark would silently suppress the sweep on the
-            // fresh conversation), or after a later, larger mark. Clamp to the
-            // live user-turn count (a rotated transcript has fewer turns than
-            // the stale mark) and never regress the stored value.
-            let live = self.messages.count_user_turns(session_id).await? as i64;
-            let new = (through as i64).min(live).max(record.reviewed_through);
-            if new != record.reviewed_through {
-                record
-                    .update()
-                    .reviewed_through(new)
-                    .exec(&mut conn)
-                    .await?;
-            }
-            Ok(())
-        })
-        .await
-    }
 }
 
 // ── MessageRepository ─────────────────────────────────────────────────────────
@@ -858,10 +807,6 @@ impl MessageRepository for Db {
     // `super::message_log` for why that trade is worth making.
     async fn list_by_session(&self, session_id: &str) -> anyhow::Result<Vec<Message>> {
         self.messages.list(session_id).await
-    }
-
-    async fn count_user_turns(&self, session_id: &str) -> anyhow::Result<usize> {
-        self.messages.count_user_turns(session_id).await
     }
 
     async fn save(&self, session_id: &str, message: &Message) -> anyhow::Result<()> {
@@ -1246,6 +1191,9 @@ impl RunRepository for Db {
                 } else {
                     serde_json::to_string(&run.memories).unwrap_or_default()
                 },
+                // Explicit, so the column's backfill default never applies to a
+                // run the learning pass is meant to see.
+                learned: run.learned,
             })
             .exec(&mut conn)
             .await?;
@@ -1484,6 +1432,60 @@ impl RunRepository for Db {
         .await?;
         Ok(rows.into_iter().map(step_from_record).collect())
     }
+
+    async fn unlearned(&self, session_id: Option<&str>, limit: usize) -> anyhow::Result<Vec<Run>> {
+        let mut conn = self.inner.connection().await?;
+        // The `learned` filter and the cap are pushed to SQL: once the ledger
+        // is mostly learned, a scan that filtered in Rust would spend its whole
+        // limit on already-consumed rows and report an empty backlog that isn't.
+        // Oldest first — learning replays a conversation forwards, so a
+        // correction is extracted after the claim it corrects.
+        let rows = match session_id {
+            Some(session) => {
+                toasty::query!(
+                    RunRecord FILTER .learned == false AND .session_id == #session
+                    ORDER BY .started_at LIMIT #limit
+                )
+                .exec(&mut conn)
+                .await?
+            }
+            None => {
+                toasty::query!(
+                    RunRecord FILTER .learned == false ORDER BY .started_at LIMIT #limit
+                )
+                .exec(&mut conn)
+                .await?
+            }
+        };
+        rows.into_iter()
+            .map(run_from_record)
+            // A turn still in flight is not an episode. Filtered here rather
+            // than in the query because the crash residue it guards against is
+            // rare and short-lived (`reconcile_interrupted` clears it at every
+            // startup), so it never eats a meaningful share of the limit.
+            .filter(|run| !matches!(run, Ok(r) if matches!(r.status, RunStatus::Running)))
+            .collect()
+    }
+
+    async fn mark_learned(&self, run_ids: &[String]) -> anyhow::Result<()> {
+        if run_ids.is_empty() {
+            return Ok(());
+        }
+        // One transaction inside the retry: a conflicting commit rolls the whole
+        // batch back and re-runs it, so a partial mark can never make half a
+        // learning pass look complete.
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut tx = conn.transaction().await?;
+            for id in run_ids {
+                let mut record = RunRecord::get_by_id(&mut tx, id).await?;
+                record.update().learned(true).exec(&mut tx).await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 // ── InboxRepository ──────────────────────────────────────────────────────────
@@ -1637,6 +1639,7 @@ fn run_from_record(record: RunRecord) -> anyhow::Result<Run> {
         // A malformed cell reads as "none recorded": the ledger is an audit
         // record, and one bad row must not fail the read of a whole run.
         memories: serde_json::from_str(&record.memories).unwrap_or_default(),
+        learned: record.learned,
     })
 }
 
@@ -2228,6 +2231,7 @@ mod tests {
             tokens_cached: 0,
             resumed_from: None,
             memories: Default::default(),
+            learned: false,
         };
         for (id, t) in [("run-a", 100), ("run-b", 200), ("run-c", 300)] {
             let run = make(id, t);
@@ -2776,39 +2780,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn count_user_turns_counts_only_user_messages() {
-        let db = Db::connect(&sqlite_url("komo_count_user_turns_test.db"))
-            .await
-            .unwrap();
-        let sid = "cli:count";
-        SessionRepository::save(&db, &Session::new(sid))
-            .await
-            .unwrap();
-        assert_eq!(
-            MessageRepository::count_user_turns(&db, sid).await.unwrap(),
-            0
-        );
-
-        MessageRepository::save(&db, sid, &Message::user("q1"))
-            .await
-            .unwrap();
-        MessageRepository::save(&db, sid, &Message::assistant("a1"))
-            .await
-            .unwrap();
-        MessageRepository::save(&db, sid, &Message::user("q2"))
-            .await
-            .unwrap();
-
-        // Two user turns, regardless of the assistant reply in between.
-        assert_eq!(
-            MessageRepository::count_user_turns(&db, sid).await.unwrap(),
-            2
-        );
-    }
-
-    /// A state.db created before `reviewed_through` existed must gain the
-    /// column **in place** on connect (additive ALTER, like memory.db's
+    /// A state.db created before the session columns existed must gain them
+    /// **in place** on connect (additive ALTER, like memory.db's
     /// ensure_columns) — an upgraded gateway must not hard-fail every session
     /// query until the operator remembers the delete-to-reset convention.
     /// An upgrading komo keeps its conversations: rows in the old table are
@@ -2875,10 +2848,9 @@ mod tests {
             .collect();
         assert_eq!(moved, ["hello", "hi there", "again"], "in key order");
         assert_eq!(
-            MessageRepository::count_user_turns(&db, "cli:old")
-                .await
-                .unwrap(),
-            2
+            moved.iter().filter(|c| c.as_str() != "hi there").count(),
+            2,
+            "both user turns moved out of the table"
         );
         drop(db);
 
@@ -2905,7 +2877,7 @@ mod tests {
         let path = home.join("state.db");
 
         // 1. Seed a turso file with the OLD session_records shape (no
-        //    reviewed_through) plus its messages table, then drop the handle.
+        //    the added columns) plus its messages table, then drop the handle.
         //    (connect skips push_schema for an existing file, so every table a
         //    session query touches must pre-exist, as it would in a real old db.)
         {
@@ -2946,7 +2918,7 @@ mod tests {
         // Mark it turso-native so connect() does not stage it as a sqlite backup.
         std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
 
-        // 2. Connect via Db: ensure_columns adds reviewed_through in place.
+        // 2. Connect via Db: ensure_columns adds the session columns in place.
         let db = Db::connect(&format!("turso:{}", path.display()))
             .await
             .unwrap();
@@ -2954,17 +2926,17 @@ mod tests {
         let session = session.expect("pre-migration session survives");
         assert_eq!(session.messages.len(), 1, "transcript intact");
 
-        // 3. The added column is fully usable: watermark reads 0 and advances.
-        let candidates = SessionRepository::review_candidates(&db).await.unwrap();
-        let c = candidates.iter().find(|c| c.id == "cli:old").unwrap();
-        assert_eq!(c.reviewed_through, 0, "new column defaults to 0");
-        assert_eq!(c.user_turns, 1);
-        SessionRepository::mark_reviewed(&db, "cli:old", 1)
+        // 3. An added column is fully usable: it reads as its default and is
+        //    writable straight away.
+        assert!(session.title.is_empty(), "new column defaults to empty");
+        SessionRepository::set_title(&db, "cli:old", "old chat")
             .await
             .unwrap();
-        let candidates = SessionRepository::review_candidates(&db).await.unwrap();
-        let c = candidates.iter().find(|c| c.id == "cli:old").unwrap();
-        assert_eq!(c.reviewed_through, 1);
+        let retitled = SessionRepository::find(&db, "cli:old")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retitled.title, "old chat");
 
         // 4. Same contract for `message_records.tool_note`: a pre-migration row
         //    reads as "no note", and the column is writable straight away.
@@ -2992,7 +2964,7 @@ mod tests {
     }
 
     /// A state.db created before `recoverable` existed must gain the column
-    /// **in place** on connect, like `reviewed_through` above — otherwise an
+    /// **in place** on connect, like the session columns above — otherwise an
     /// upgraded gateway 500s every run-ledger read ("no such column:
     /// recoverable") until the operator remembers the delete-to-reset.
     #[tokio::test]
@@ -3068,60 +3040,65 @@ mod tests {
         );
     }
 
-    /// A stale watermark write (the runtime reviewer's detached task finishing
-    /// after a `/new` rotate) must not stamp the fresh, empty conversation with
-    /// the old transcript's turn count — that would silently suppress the sweep
-    /// for its first N turns. And a smaller out-of-order mark must not regress
-    /// an already-higher watermark.
+    /// The learning watermark: `unlearned` offers finished, not-yet-learned runs
+    /// oldest first, `mark_learned` retires them, and a turn still in flight is
+    /// never offered.
     #[tokio::test]
-    async fn mark_reviewed_clamps_stale_and_never_regresses() {
-        let db = Db::connect(&sqlite_url("komo_mark_reviewed_race.db"))
-            .await
-            .unwrap();
-        let sid = "telegram:42";
-        SessionRepository::save(&db, &Session::new(sid))
-            .await
-            .unwrap();
-        for i in 0..3 {
-            MessageRepository::save(&db, sid, &Message::user(format!("q{i}")))
-                .await
-                .unwrap();
-        }
+    async fn unlearned_offers_finished_runs_until_they_are_marked() {
+        let db = Db::connect(&sqlite_url("komo_unlearned.db")).await.unwrap();
 
-        // Normal mark: watermark reaches the live count.
-        SessionRepository::mark_reviewed(&db, sid, 3).await.unwrap();
-        let through = |cands: &[ReviewCandidate]| {
-            cands
-                .iter()
-                .find(|c| c.id == sid)
-                .map(|c| c.reviewed_through)
-                .unwrap()
+        let save = async |id: &str, session: &str, status: RunStatus, at: i64| {
+            let mut run = Run::start(session, "q");
+            run.id = id.to_string();
+            run.started_at = at;
+            RunRepository::start(&db, &run).await.unwrap();
+            run.status = status;
+            RunRepository::finish(&db, &run).await.unwrap();
         };
-        let cands = SessionRepository::review_candidates(&db).await.unwrap();
-        assert_eq!(through(&cands), 3);
+        // Inserted newest-first to prove the ordering is the query's, not the
+        // insertion order's.
+        save("run-c", "cli:a", RunStatus::Done, 300).await;
+        save("run-b", "cli:b", RunStatus::Failed, 200).await;
+        save("run-a", "cli:a", RunStatus::Done, 100).await;
 
-        // A smaller stale mark (out-of-order detached task) never regresses.
-        SessionRepository::mark_reviewed(&db, sid, 1).await.unwrap();
-        let cands = SessionRepository::review_candidates(&db).await.unwrap();
-        assert_eq!(through(&cands), 3, "watermark must not regress");
+        let ids = |runs: Vec<Run>| runs.into_iter().map(|r| r.id).collect::<Vec<_>>();
 
-        // /new rotates: transcript archived, live row reset to 0. A stale
-        // mark(3) landing afterwards is clamped to the live (empty) count.
-        SessionRepository::rotate(&db, sid).await.unwrap();
-        SessionRepository::mark_reviewed(&db, sid, 3).await.unwrap();
-        let cands = SessionRepository::review_candidates(&db).await.unwrap();
         assert_eq!(
-            through(&cands),
-            0,
-            "stale post-rotate mark must clamp to the fresh transcript"
+            ids(RunRepository::unlearned(&db, None, 10).await.unwrap()),
+            ["run-a", "run-b", "run-c"],
+            "oldest first, so a correction is learned after the claim it corrects"
+        );
+        assert_eq!(
+            ids(RunRepository::unlearned(&db, Some("cli:a"), 10)
+                .await
+                .unwrap()),
+            ["run-a", "run-c"],
+            "scoping to one conversation is the query's job, not the caller's"
         );
 
-        // The fresh conversation's first turn is sweep-visible again.
-        MessageRepository::save(&db, sid, &Message::user("fresh"))
+        RunRepository::mark_learned(&db, &["run-a".to_string(), "run-c".to_string()])
             .await
             .unwrap();
-        let cands = SessionRepository::review_candidates(&db).await.unwrap();
-        let c = cands.iter().find(|c| c.id == sid).unwrap();
-        assert!(c.user_turns > c.reviewed_through, "sweep must pick it up");
+        assert_eq!(
+            ids(RunRepository::unlearned(&db, None, 10).await.unwrap()),
+            ["run-b"],
+            "a retired run is never offered again"
+        );
+        assert!(
+            RunRepository::get(&db, "run-a")
+                .await
+                .unwrap()
+                .unwrap()
+                .learned
+        );
+
+        // A run still in flight has no decided outcome and no complete step
+        // list, so it is not an episode yet.
+        let running = Run::start("cli:a", "in flight");
+        RunRepository::start(&db, &running).await.unwrap();
+        assert_eq!(
+            ids(RunRepository::unlearned(&db, None, 10).await.unwrap()),
+            ["run-b"]
+        );
     }
 }

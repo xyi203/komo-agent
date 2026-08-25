@@ -347,9 +347,6 @@ mod tests {
                 .map(|(_, m)| m.clone())
                 .unwrap_or_default())
         }
-        async fn count_user_turns(&self, _session_id: &str) -> anyhow::Result<usize> {
-            Ok(0)
-        }
         async fn save(&self, _session_id: &str, _message: &Message) -> anyhow::Result<()> {
             Ok(())
         }

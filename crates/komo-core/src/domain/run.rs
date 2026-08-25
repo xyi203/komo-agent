@@ -117,6 +117,19 @@ pub struct Run {
     /// enricher, and for rows written before the column.
     #[serde(default)]
     pub memories: RecalledMemories,
+    /// The learning pass has consumed this run (extracted from it, or decided
+    /// there was nothing to extract). The watermark is per-run rather than a
+    /// per-session turn count because learning reads *episodes*: a count cannot
+    /// say which turns were the new ones, only how many, and a rotated or
+    /// repaired transcript makes the two disagree.
+    ///
+    /// Set only after a learning pass succeeds — a failed pass leaves it false
+    /// so the next sweep retries the run. Runs the pass deliberately skips
+    /// (cancelled turns, sweep sessions) are marked too: "considered and
+    /// declined" and "not yet considered" have to be different states, or every
+    /// sweep re-examines them forever.
+    #[serde(default)]
+    pub learned: bool,
 }
 
 impl Run {
@@ -138,6 +151,7 @@ impl Run {
             tokens_cached: 0,
             resumed_from: None,
             memories: RecalledMemories::default(),
+            learned: false,
         }
     }
 }
@@ -424,6 +438,19 @@ pub trait RunRepository: Send + Sync {
         memory_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<MemoryUse>>;
+
+    /// Finished runs the learning pass has not consumed yet ([`Run::learned`]),
+    /// **oldest first** — learning replays a session in the order it happened,
+    /// so a later correction lands after the claim it corrects.
+    ///
+    /// `session_id` scopes the query to one conversation (the after-turn
+    /// trigger); `None` scans every session (the sweep). Runs still `Running`
+    /// are never returned: an unfinished turn is not an episode.
+    async fn unlearned(&self, session_id: Option<&str>, limit: usize) -> anyhow::Result<Vec<Run>>;
+
+    /// Mark runs as consumed by the learning pass. Best-effort like every other
+    /// ledger write: a failure just means those runs are offered again.
+    async fn mark_learned(&self, run_ids: &[String]) -> anyhow::Result<()>;
 }
 
 /// Whether a ledger step is the `skill` tool loading `skill_name`'s
