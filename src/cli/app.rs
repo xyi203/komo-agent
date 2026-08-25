@@ -275,6 +275,10 @@ enum CronAction {
         /// Skill(s) to load before running the prompt (repeatable)
         #[arg(long = "skill")]
         skills: Vec<String>,
+        /// Directory the job's file and shell tools are confined to. Must
+        /// already exist; defaults to the gateway's own workspace.
+        #[arg(long)]
+        workspace: Option<String>,
         /// Action this job may take unattended, as `<category>:<match>:<value>`
         /// (e.g. `homeassistant:exact:climate.set_temperature`, `shell:prefix:git `,
         /// `file:prefix:/srv/backups/:write`). Repeatable; scoped to this job
@@ -598,6 +602,7 @@ pub async fn run() -> anyhow::Result<()> {
                 schedule,
                 prompt,
                 skills,
+                workspace,
                 grants,
                 skip_missed,
             } => {
@@ -610,7 +615,11 @@ pub async fn run() -> anyhow::Result<()> {
                     crate::domain::cron::CronJobSpec {
                         name,
                         schedule,
-                        action: crate::domain::cron::CronAction::Agent { prompt, skills },
+                        action: crate::domain::cron::CronAction::Agent {
+                            prompt,
+                            skills,
+                            workspace,
+                        },
                         grants,
                         catch_up: catch_up_of(skip_missed),
                     },

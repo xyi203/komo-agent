@@ -57,6 +57,10 @@ struct CronArgs {
     prompt: Option<String>,
     #[serde(default)]
     skills: Vec<String>,
+    /// Agent-mode: the directory the job's file and shell tools are confined
+    /// to. Validated (must exist) when the job is created.
+    #[serde(default)]
+    workspace: Option<String>,
     /// Agent-mode: the actions this job needs to be allowed to take when it
     /// runs with nobody watching. Approved as one list, together with the job.
     #[serde(default)]
@@ -195,6 +199,10 @@ impl Tool for CronTool {
                     "items": {"type": "string"},
                     "description": "Skills the agent job loads before acting (action=add, agent mode)."
                 },
+                "workspace": {
+                    "type": "string",
+                    "description": "Directory the agent job's file and shell tools are confined to (action=add, agent mode). Give it when the task is about a specific project or folder — without it the job works in the gateway's own workspace, which is usually not where the user's repo is. The path must already exist; it is checked when the job is created, not when it runs."
+                },
                 "grants": {
                     "type": "array",
                     "description": "Actions this agent job must be allowed to take when it runs with nobody watching (action=add, agent mode). Without a grant, every side-effecting call the job makes is refused at run time. Declare only what the task plainly needs — the user approves this list together with the job, and an unneeded entry is a permission they did not want to give. If you are unsure an action is needed, leave it out: a missing grant fails loudly at run time and the user is told, whereas an extra one is silent.",
@@ -293,10 +301,17 @@ impl Tool for CronTool {
                             args.grants.into_iter().map(RuleSpec::from).collect(),
                         )
                         .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-                        let summary = format!(
-                            "Schedule agent job `{name}` [{schedule}]: {}",
-                            oneline(&prompt, PROMPT_PREVIEW)
-                        );
+                        let workspace = args.workspace.clone();
+                        let summary = match &workspace {
+                            Some(dir) => format!(
+                                "Schedule agent job `{name}` [{schedule}] in {dir}: {}",
+                                oneline(&prompt, PROMPT_PREVIEW)
+                            ),
+                            None => format!(
+                                "Schedule agent job `{name}` [{schedule}]: {}",
+                                oneline(&prompt, PROMPT_PREVIEW)
+                            ),
+                        };
                         let request = if grants.is_empty() {
                             ApprovalRequest::normal(summary).with_scope_key("cron:add".to_string())
                         } else {
@@ -315,6 +330,7 @@ impl Tool for CronTool {
                             CronAction::Agent {
                                 prompt,
                                 skills: args.skills,
+                                workspace,
                             },
                             request,
                             grants,
@@ -508,13 +524,21 @@ fn describe_job(job: &CronJob) -> String {
     };
     let target = match &job.action {
         CronAction::Command { command, args, .. } => command_line(command, args),
-        CronAction::Agent { prompt, skills } => {
+        CronAction::Agent {
+            prompt,
+            skills,
+            workspace,
+        } => {
             let skills = if skills.is_empty() {
                 String::new()
             } else {
                 format!(" [skills: {}]", skills.join(", "))
             };
-            format!("{}{skills}", oneline(prompt, PROMPT_PREVIEW))
+            let workspace = match workspace {
+                Some(dir) => format!(" [in {dir}]"),
+                None => String::new(),
+            };
+            format!("{}{skills}{workspace}", oneline(prompt, PROMPT_PREVIEW))
         }
     };
     let mut line = format!(
@@ -694,7 +718,7 @@ mod tests {
         let stored = jobs.jobs.lock().unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].schedule, "0 8 * * *");
-        let CronAction::Agent { prompt, skills } = &stored[0].action else {
+        let CronAction::Agent { prompt, skills, .. } = &stored[0].action else {
             panic!("agent job");
         };
         assert_eq!(prompt, "总结我今天的日程");

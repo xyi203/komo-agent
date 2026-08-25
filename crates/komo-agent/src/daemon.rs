@@ -484,8 +484,13 @@ impl CronJobSweep {
                 .await;
                 (title, body, ok, None)
             }
-            CronAction::Agent { prompt, skills } => {
-                self.execute_cron_agent(job, prompt, skills, now).await
+            CronAction::Agent {
+                prompt,
+                skills,
+                workspace,
+            } => {
+                self.execute_cron_agent(job, prompt, skills, workspace.as_deref(), now)
+                    .await
             }
         }
     }
@@ -499,6 +504,7 @@ impl CronJobSweep {
         job: &CronJob,
         prompt: &str,
         skills: &[String],
+        workspace: Option<&str>,
         now: i64,
     ) -> (String, String, bool, Option<String>) {
         let name = &job.name;
@@ -517,7 +523,14 @@ impl CronJobSweep {
         // letting `handle_input` build a plain detached one: that default is
         // `SessionOrigin::User`, which would hand the policy engine a `cron`
         // channel and quietly skip its unattended branch.
-        let session = SessionContext::detached(&session_id).with_origin(SessionOrigin::Cron);
+        let mut session = SessionContext::detached(&session_id).with_origin(SessionOrigin::Cron);
+        // The job's own directory, when it named one: the same root the file
+        // tools confine to and `shell` runs in. Already canonicalized and proven
+        // to exist when the job was created — the sweep resolves nothing, so a
+        // path cannot change meaning between approval and 03:00.
+        if let Some(root) = workspace {
+            session = session.with_workspace(std::path::PathBuf::from(root));
+        }
         // …and this job's own approved actions, scoped to exactly this turn.
         // Installed around the whole turn (not per tool call) so the grants are
         // in scope wherever the approver is consulted, and out of scope the
@@ -1620,6 +1633,57 @@ mod tests {
         }
     }
 
+    /// Reads the workspace root the sweep installed on the ambient session —
+    /// the same field `fs_common` and `shell` confine against.
+    #[derive(Default)]
+    struct WorkspaceProbe {
+        seen: Mutex<Option<Option<std::path::PathBuf>>>,
+    }
+
+    #[async_trait]
+    impl MessageHandler for WorkspaceProbe {
+        async fn handle(&self, _session_id: &str, _message: String) -> anyhow::Result<String> {
+            *self.seen.lock().unwrap() = Some(
+                komo_services::tool_execution::current_session()
+                    .and_then(|c| c.workspace_root.clone()),
+            );
+            Ok("done".to_string())
+        }
+    }
+
+    /// A job that named a directory must run confined to it. The turn reads the
+    /// root off its ambient session, so installing it anywhere else — or not at
+    /// all — leaves the job working in the gateway's own directory while
+    /// `cron list` says otherwise.
+    #[tokio::test]
+    async fn an_agent_job_with_a_workspace_runs_confined_to_it() {
+        let probe = Arc::new(WorkspaceProbe::default());
+        let (sweep, _repo, _notifier) = cron_sweep_full(
+            vec![agent_job_in("tidy", "do it", vec![], Some("/srv/notes"))],
+            false,
+            Some(probe.clone()),
+        );
+        sweep.run().await.unwrap();
+        assert_eq!(
+            *probe.seen.lock().unwrap(),
+            Some(Some(std::path::PathBuf::from("/srv/notes")))
+        );
+    }
+
+    /// And a job that named none keeps the wired default, rather than being
+    /// pinned to some incidental directory.
+    #[tokio::test]
+    async fn an_agent_job_without_a_workspace_leaves_the_root_unset() {
+        let probe = Arc::new(WorkspaceProbe::default());
+        let (sweep, _repo, _notifier) = cron_sweep_full(
+            vec![agent_job("tidy", "do it", vec![])],
+            false,
+            Some(probe.clone()),
+        );
+        sweep.run().await.unwrap();
+        assert_eq!(*probe.seen.lock().unwrap(), Some(None));
+    }
+
     /// A cron turn must reach the runtime already marked unattended. Left to
     /// `handle_input`'s fallback it would get a plain detached context, whose
     /// origin is `User` — and the policy engine would read `cron` as a channel.
@@ -1652,6 +1716,15 @@ mod tests {
     }
 
     fn agent_job(name: &str, prompt: &str, skills: Vec<String>) -> CronJob {
+        agent_job_in(name, prompt, skills, None)
+    }
+
+    fn agent_job_in(
+        name: &str,
+        prompt: &str,
+        skills: Vec<String>,
+        workspace: Option<&str>,
+    ) -> CronJob {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         CronJob::new(
             name,
@@ -1659,6 +1732,7 @@ mod tests {
             CronAction::Agent {
                 prompt: prompt.to_string(),
                 skills,
+                workspace: workspace.map(str::to_string),
             },
             now,
         )

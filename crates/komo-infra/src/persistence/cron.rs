@@ -295,10 +295,18 @@ impl ActionColumns {
                 prompt: String::new(),
                 skills: String::new(),
             },
-            CronAction::Agent { prompt, skills } => Self {
+            // An agent job's workspace rides in the `workdir` column: the two
+            // are the same question ("where does this job work?"), asked of a
+            // process and of a turn, and cron.db is durable — a second column
+            // for the same answer is a schema change nobody needs.
+            CronAction::Agent {
+                prompt,
+                skills,
+                workspace,
+            } => Self {
                 command: String::new(),
                 args: String::new(),
-                workdir: String::new(),
+                workdir: workspace.clone().unwrap_or_default(),
                 timeout_secs: 0,
                 prompt: prompt.clone(),
                 skills: serde_json::to_string(skills)?,
@@ -323,6 +331,7 @@ fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
         CronAction::Agent {
             prompt: record.prompt,
             skills: serde_json::from_str(&record.skills).unwrap_or_default(),
+            workspace: (!record.workdir.is_empty()).then_some(record.workdir),
         }
     } else {
         CronAction::Command {
@@ -507,6 +516,7 @@ mod tests {
             CronAction::Agent {
                 prompt: "hi".into(),
                 skills: vec!["s".into()],
+                workspace: None,
             },
             0,
         ))
@@ -527,17 +537,66 @@ mod tests {
             CronAction::Agent {
                 prompt: "总结我今天的日程".into(),
                 skills: vec!["calendar".into(), "weather".into()],
+                workspace: None,
             },
             42,
         );
         db.save(&job).await.unwrap();
         let found = db.find_by_name("brief").await.unwrap().unwrap();
-        let CronAction::Agent { prompt, skills } = &found.action else {
+        let CronAction::Agent { prompt, skills, .. } = &found.action else {
             panic!("agent job");
         };
         assert_eq!(prompt, "总结我今天的日程");
         assert_eq!(skills, &vec!["calendar".to_string(), "weather".to_string()]);
         assert_eq!(found.next_run_at, 42);
+    }
+
+    /// An agent job's workspace and a command job's workdir share one column,
+    /// discriminated by `kind`. Both are read back here, in one store, so a
+    /// mapping that crossed the two would surface as a job confined to another
+    /// job's directory rather than as a compile error.
+    #[tokio::test]
+    async fn an_agent_workspace_and_a_command_workdir_share_a_column_without_crossing() {
+        let db = CronDb::connect(&turso_url("komo_cron_workspace_test.db"))
+            .await
+            .unwrap();
+        db.save(&CronJob::new(
+            "tidy",
+            "0 8 * * *",
+            CronAction::Agent {
+                prompt: "tidy".into(),
+                skills: vec![],
+                workspace: Some("/srv/notes".into()),
+            },
+            42,
+        ))
+        .await
+        .unwrap();
+        db.save(&CronJob::new(
+            "backup",
+            "0 9 * * *",
+            CronAction::Command {
+                command: "/bin/true".into(),
+                args: vec![],
+                workdir: Some("/srv/backups".into()),
+                timeout_secs: 60,
+            },
+            42,
+        ))
+        .await
+        .unwrap();
+
+        let agent = db.find_by_name("tidy").await.unwrap().unwrap();
+        let CronAction::Agent { workspace, .. } = &agent.action else {
+            panic!("agent job");
+        };
+        assert_eq!(workspace.as_deref(), Some("/srv/notes"));
+
+        let command = db.find_by_name("backup").await.unwrap().unwrap();
+        let CronAction::Command { workdir, .. } = &command.action else {
+            panic!("command job");
+        };
+        assert_eq!(workdir.as_deref(), Some("/srv/backups"));
     }
 
     /// Grants survive save → read → update → read, field for field. An
@@ -564,6 +623,7 @@ mod tests {
             CronAction::Agent {
                 prompt: "设到 26 度".into(),
                 skills: vec![],
+                workspace: None,
             },
             0,
         )
@@ -609,6 +669,7 @@ mod tests {
             CronAction::Agent {
                 prompt: "设到 26 度".into(),
                 skills: vec![],
+                workspace: None,
             },
             0,
         )

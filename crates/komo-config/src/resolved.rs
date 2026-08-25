@@ -926,9 +926,10 @@ const DEFAULT_QDRANT_URL: &str = "http://127.0.0.1:6334";
 /// Default collection name, shared by both backends.
 const DEFAULT_WIKI_COLLECTION: &str = "komo_wiki";
 
-/// Expand a leading `~/` against the **real** home, not `KOMO_HOME`: a vault is
-/// the operator's own directory and does not move when komo's home is relocated.
-fn expand_home(path: &str) -> PathBuf {
+/// Expand a leading `~/` against the **real** home, not `KOMO_HOME`: an
+/// operator-typed path names their own directory and does not move when komo's
+/// home is relocated.
+pub fn expand_home(path: &str) -> PathBuf {
     match path.strip_prefix("~/") {
         Some(rest) => dirs::home_dir()
             .map(|h| h.join(rest))

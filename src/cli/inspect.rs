@@ -77,13 +77,21 @@ fn print_cron_job(job: &CronJob) {
             .chain(args.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" "),
-        CronAction::Agent { prompt, skills } => {
+        CronAction::Agent {
+            prompt,
+            skills,
+            workspace,
+        } => {
             let skills = if skills.is_empty() {
                 String::new()
             } else {
                 format!(" [skills: {}]", skills.join(", "))
             };
-            format!("agent: {}{skills}", oneline(prompt, 80))
+            let workspace = match workspace {
+                Some(dir) => format!(" [in {dir}]"),
+                None => String::new(),
+            };
+            format!("agent: {}{skills}{workspace}", oneline(prompt, 80))
         }
     };
     println!(

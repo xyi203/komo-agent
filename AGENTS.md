@@ -27,7 +27,7 @@ komo memory list|search|used|promote|reject|pin|triage|report|repair-scopes
 komo memory used <id>              # which turns this memory shaped (run ledger; pruned with it)
 komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`; index is incremental)
 komo dream [--apply]               # evidence-driven candidate consolidation (preview by default)
-komo cron list|add|add-agent [--grant c:m:v]|run|enable|disable|remove
+komo cron list|add|add-agent [--workspace DIR] [--grant c:m:v]|run|enable|disable|remove
 komo run list|inspect|resume|prune # run ledger (⟲ = recoverable)
 komo skills list|install|inspect|promote|reject|protect|unprotect|enable|disable
 komo skills archive|restore            # retire an active skill / bring it back
@@ -608,8 +608,17 @@ call the same functions, which is what keeps validation from forking.
   at claim time and keeps its row as the queryable record — `last_output` holds
   every run's delivered body and `last_run_session` links an agent run to its
   ledger transcript, so "what did that job do" outlives the notification.
-  `enable`/`run` refuse a `done` job. Recurring *work* = cron job, recurring
-  *message* = reminder, one-shot scheduled work = `@at` job.
+  `enable`/`run` refuse a `done` job. An agent job may also name a
+  **`workspace`** — the directory its file and shell tools are confined to,
+  installed on the turn's `SessionContext::workspace_root` by the sweep. It is
+  canonicalized and proven to exist **when the job is created**, while the
+  person who typed it is still there: resolved late it would fail at 03:00 as a
+  permission refusal on every file the turn touches, which reads like a policy
+  problem rather than a typo. It shares the `workdir` column with a command
+  job's cwd (same question of a process and of a turn, and cron.db is durable)
+  but is a different guarantee — a confinement boundary, not a convenience.
+  Recurring *work* = cron job, recurring *message* = reminder, one-shot
+  scheduled work = `@at` job.
 - `apps/` — bun workspace: `apps/app` (shared React renderer) mounted by
   `apps/desktop` (Electron) and `apps/web` (SPA served via `web_dir`). Talks
   to the gateway over HTTP only (`HttpKomoClient`); feature-first layout;

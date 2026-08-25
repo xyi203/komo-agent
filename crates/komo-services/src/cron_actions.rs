@@ -58,7 +58,11 @@ pub async fn add_cron_job(
                 },
             }
         }
-        CronAction::Agent { prompt, skills } => {
+        CronAction::Agent {
+            prompt,
+            skills,
+            workspace,
+        } => {
             if prompt.trim().is_empty() {
                 anyhow::bail!("an agent cron job needs a prompt");
             }
@@ -68,6 +72,7 @@ pub async fn add_cron_job(
                     .into_iter()
                     .filter(|s| !s.trim().is_empty())
                     .collect(),
+                workspace: resolve_workspace(workspace)?,
             }
         }
     };
@@ -81,6 +86,34 @@ pub async fn add_cron_job(
         .with_grants(normalize_grants(spec.grants)?);
     jobs.save(&job).await?;
     Ok(job)
+}
+
+/// Resolve an agent job's workspace to a canonical absolute directory.
+///
+/// Checked **now**, while whoever asked for the job is still here. The
+/// alternative is a job that looks fine in `cron list` and fails at 03:00
+/// against a path with a typo in it — and unlike a bad prompt, this one fails
+/// as a permission refusal on every file the turn touches, which reads like a
+/// policy problem rather than a spelling one.
+///
+/// Canonical because the workspace check is lexical: a root given as a symlink
+/// would never prefix-match the real paths the tools resolve, and the turn would
+/// be denied its own directory.
+fn resolve_workspace(workspace: Option<String>) -> anyhow::Result<Option<String>> {
+    let Some(raw) = workspace
+        .map(|w| w.trim().to_string())
+        .filter(|w| !w.is_empty())
+    else {
+        return Ok(None);
+    };
+    let path = komo_config::expand_home(&raw);
+    let resolved = path
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("workspace `{raw}` cannot be used: {e}"))?;
+    if !resolved.is_dir() {
+        anyhow::bail!("workspace `{raw}` is not a directory");
+    }
+    Ok(Some(resolved.to_string_lossy().into_owned()))
 }
 
 /// Validate and normalize the grants a job is created with.
@@ -379,5 +412,100 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("teleport"), "{err}");
+    }
+
+    fn agent_spec(name: &str, workspace: Option<&str>) -> CronJobSpec {
+        CronJobSpec {
+            catch_up: Default::default(),
+            name: name.into(),
+            schedule: "0 8 * * *".into(),
+            action: CronAction::Agent {
+                prompt: "tidy up".into(),
+                skills: vec![],
+                workspace: workspace.map(str::to_string),
+            },
+            grants: vec![],
+        }
+    }
+
+    fn workspace_of(job: &CronJob) -> Option<String> {
+        match &job.action {
+            CronAction::Agent { workspace, .. } => workspace.clone(),
+            _ => panic!("agent job"),
+        }
+    }
+
+    /// The stored root is the *resolved* one: the workspace check is lexical,
+    /// so a root that is a symlink would never prefix-match the real paths the
+    /// tools resolve, and the job would be denied its own directory.
+    #[tokio::test]
+    async fn an_agent_workspace_is_stored_canonicalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("project");
+        std::fs::create_dir(&nested).unwrap();
+        let scenic = nested.join("..").join("project");
+
+        let jobs = FakeJobs::default();
+        let job = add_cron_job(
+            &jobs,
+            agent_spec("tidy", Some(&scenic.to_string_lossy())),
+            1000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            workspace_of(&job).map(std::path::PathBuf::from),
+            Some(nested.canonicalize().unwrap())
+        );
+    }
+
+    /// A path with a typo in it is refused while the person who typed it is
+    /// still here — not at 03:00, where it surfaces as every file call being
+    /// denied and reads like a policy problem instead of a spelling one.
+    #[tokio::test]
+    async fn an_agent_workspace_that_does_not_exist_is_refused_at_creation() {
+        let jobs = FakeJobs::default();
+        let err = add_cron_job(&jobs, agent_spec("tidy", Some("/no/such/place")), 1000)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("/no/such/place"), "{err}");
+        assert!(
+            jobs.list().await.unwrap().is_empty(),
+            "a refused job must not be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_workspace_pointing_at_a_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.md");
+        std::fs::write(&file, b"x").unwrap();
+
+        let jobs = FakeJobs::default();
+        let err = add_cron_job(
+            &jobs,
+            agent_spec("tidy", Some(&file.to_string_lossy())),
+            1000,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_job_without_a_workspace_stores_none() {
+        let jobs = FakeJobs::default();
+        let job = add_cron_job(&jobs, agent_spec("tidy", None), 1000)
+            .await
+            .unwrap();
+        assert!(workspace_of(&job).is_none());
+
+        // Blank is the same as absent, not a root of "".
+        let job = add_cron_job(&jobs, agent_spec("tidy2", Some("   ")), 1000)
+            .await
+            .unwrap();
+        assert!(workspace_of(&job).is_none());
     }
 }

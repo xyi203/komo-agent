@@ -161,6 +161,17 @@ pub enum CronAction {
         /// the turn is told to `skill` view each one first).
         #[serde(default)]
         skills: Vec<String>,
+        /// Directory the turn's file and shell tools are confined to
+        /// (canonical absolute path, validated when the job is created).
+        /// `None` = the gateway's own workspace.
+        ///
+        /// Deliberately not the same thing as [`CronAction::Command`]'s
+        /// `workdir`, which only sets a child process's cwd: this is a
+        /// *confinement boundary*, so it is resolved to its real path — the
+        /// workspace check is lexical, and a symlinked root would fail to match
+        /// the paths the tools actually resolve.
+        #[serde(default)]
+        workspace: Option<String>,
     },
 }
 
@@ -484,17 +495,36 @@ mod tests {
         let action = CronAction::Agent {
             prompt: "summarize my day".into(),
             skills: vec!["calendar".into()],
+            workspace: Some("/srv/notes".into()),
         };
         let job = CronJob::new("brief", "0 8 * * *", action, 0);
         let json = serde_json::to_string(&job).unwrap();
         assert!(json.contains("\"kind\":\"agent\""));
         let back: CronJob = serde_json::from_str(&json).unwrap();
         assert_eq!(back.action.kind(), "agent");
-        let CronAction::Agent { prompt, skills } = &back.action else {
+        let CronAction::Agent {
+            prompt,
+            skills,
+            workspace,
+        } = &back.action
+        else {
             panic!("agent job");
         };
         assert_eq!(prompt, "summarize my day");
         assert_eq!(skills, &vec!["calendar".to_string()]);
+        assert_eq!(workspace.as_deref(), Some("/srv/notes"));
+    }
+
+    /// A job stored before agent jobs could name a workspace must still
+    /// deserialize — as one that names none.
+    #[test]
+    fn an_agent_job_written_without_a_workspace_reads_as_having_none() {
+        let stored = r#"{"kind":"agent","prompt":"p","skills":[]}"#;
+        let action: CronAction = serde_json::from_str(stored).unwrap();
+        let CronAction::Agent { workspace, .. } = &action else {
+            panic!("agent job");
+        };
+        assert!(workspace.is_none());
     }
 
     #[test]
