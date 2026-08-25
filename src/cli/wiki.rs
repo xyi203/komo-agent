@@ -27,11 +27,11 @@ pub async fn index(control: &OperatorControl, rebuild: bool) -> anyhow::Result<(
         println!("(rebuilding from scratch)");
     }
     let outcome = match control
-        .command(OperatorCommand::WikiIndex { rebuild })
+        .command(OperatorCommand::ChunkIndex { rebuild })
         .await?
     {
         OperatorCommandResult::WikiIndexed(outcome) => outcome,
-        _ => unreachable!("WikiIndex answers with WikiIndexed"),
+        _ => unreachable!("ChunkIndex answers with WikiIndexed"),
     };
 
     println!(

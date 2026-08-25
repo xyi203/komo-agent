@@ -107,11 +107,11 @@ pub enum OperatorCommand {
     MemoryRepairScopes,
     /// Embed every memory that still lacks a current vector, and wait for it.
     /// Minutes-long on a library that has never been embedded: the gateway
-    /// adapter gives this the same long timeout `WikiIndex` gets.
+    /// adapter gives this the same long timeout `ChunkIndex` gets.
     MemoryBackfill,
     /// Index the note vault. Minutes-long: the gateway adapter gives this
     /// command its own, far longer timeout than every other operator call.
-    WikiIndex { rebuild: bool },
+    ChunkIndex { rebuild: bool },
     /// Create a scheduled cron job (validated; duplicate names refused).
     CronAdd { spec: CronJobSpec },
     /// Delete a cron job by name.

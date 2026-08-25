@@ -461,11 +461,12 @@ call the same functions, which is what keeps validation from forking.
   (TUI/desktop/web all ride it), so channel-scoping there makes a memory
   unrecallable from the next turn — those writes go `Global`. Memories written
   before this are repaired by `komo memory repair-scopes`.
-- `domain/wiki.rs` + `komo-wiki` + `komo-services`' `wiki_indexing` +
+- `domain/chunk_index.rs` + `komo-wiki` + `komo-services`' `wiki_indexing` +
   `komo-tools`' `wiki_search` / `wiki_read` / `wiki_index` — semantic search over the note vault
   (`[wiki] vault`), **pulled on demand, never auto-injected** like memory recall:
   a vault dwarfs the memory store, so a turn that does not search pays nothing.
-  Two interchangeable backends behind `WikiIndex`, chosen by `[wiki] backend`:
+  Two interchangeable backends behind `ChunkIndex` (the corpus-neutral index
+  trait, shared with session search), chosen by `[wiki] backend`:
   `edge` (qdrant-edge, in-process, the default) and `server` (Qdrant over gRPC,
   for sharing one collection across processes). They speak the same data model,
   so an index built by one is readable by the other — but **nothing migrates**,

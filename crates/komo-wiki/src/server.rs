@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use komo_core::domain::wiki::{IndexedFile, WikiChunk, WikiHit, WikiIndex};
+use komo_core::domain::chunk_index::{ChunkHit, ChunkIndex, IndexedChunk, IndexedFile};
 use qdrant_client::Payload;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
@@ -116,8 +116,8 @@ impl ServerIndex {
 }
 
 #[async_trait]
-impl WikiIndex for ServerIndex {
-    async fn upsert(&self, chunks: &[WikiChunk]) -> anyhow::Result<()> {
+impl ChunkIndex for ServerIndex {
+    async fn upsert(&self, chunks: &[IndexedChunk]) -> anyhow::Result<()> {
         let Some(dim) = chunks.iter().map(|c| c.embedding.len()).find(|n| *n > 0) else {
             return Ok(());
         };
@@ -168,7 +168,7 @@ impl WikiIndex for ServerIndex {
         _query_text: &str,
         limit: usize,
         min_score: f32,
-    ) -> anyhow::Result<Vec<WikiHit>> {
+    ) -> anyhow::Result<Vec<ChunkHit>> {
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -190,7 +190,7 @@ impl WikiIndex for ServerIndex {
             .result
             .into_iter()
             .filter_map(|hit| {
-                Some(WikiHit {
+                Some(ChunkHit {
                     chunk: payload::from_payload(&to_json(hit.payload))?,
                     score: hit.score,
                 })

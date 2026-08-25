@@ -37,8 +37,10 @@ use super::request::{
     DreamItem, DreamReport, MemoryTransitionAction, PairingView, SessionSummary, SkillInvocation,
     SkillUsage, WikiHitView, WikiIndexView, WikiStatusView,
 };
+use komo_core::domain::chunk_index::{
+    ChunkIndex, DIVERSIFY_OVERFETCH, MAX_CHUNKS_PER_FILE, diversify,
+};
 use komo_core::domain::embedding::EmbeddingClient;
-use komo_core::domain::wiki::{DIVERSIFY_OVERFETCH, MAX_CHUNKS_PER_FILE, WikiIndex, diversify};
 use komo_services::wiki_indexing::WikiIndexRunner;
 
 /// Cosine floor for a wiki hit, kept equal to the `wiki_search` tool's own so
@@ -63,7 +65,7 @@ pub struct WikiOps {
 }
 
 impl WikiOps {
-    fn store(&self) -> &Arc<dyn WikiIndex> {
+    fn store(&self) -> &Arc<dyn ChunkIndex> {
         self.runner.index()
     }
 

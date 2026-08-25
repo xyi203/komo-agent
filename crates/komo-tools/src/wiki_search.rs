@@ -5,7 +5,7 @@
 //! it would spend context on notes the turn never asked about. A turn that does
 //! not search pays nothing.
 //!
-//! This tool holds only [`WikiIndex`] and [`EmbeddingClient`], never a concrete
+//! This tool holds only [`ChunkIndex`] and [`EmbeddingClient`], never a concrete
 //! backend — which backend is running (embedded or Qdrant server) is decided in
 //! config and invisible here.
 
@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use komo_core::domain::{
+    chunk_index::{ChunkIndex, DIVERSIFY_OVERFETCH, MAX_CHUNKS_PER_FILE, diversify},
     context::ToolContext,
     embedding::EmbeddingClient,
     tool::{Tool, ToolError, ToolOutput, parse_args},
-    wiki::{DIVERSIFY_OVERFETCH, MAX_CHUNKS_PER_FILE, WikiIndex, diversify},
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -42,12 +42,12 @@ struct Args {
 }
 
 pub struct WikiSearchTool {
-    index: Arc<dyn WikiIndex>,
+    index: Arc<dyn ChunkIndex>,
     embedder: Arc<dyn EmbeddingClient>,
 }
 
 impl WikiSearchTool {
-    pub fn new(index: Arc<dyn WikiIndex>, embedder: Arc<dyn EmbeddingClient>) -> Self {
+    pub fn new(index: Arc<dyn ChunkIndex>, embedder: Arc<dyn EmbeddingClient>) -> Self {
         Self { index, embedder }
     }
 }
@@ -148,14 +148,14 @@ impl Tool for WikiSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komo_core::domain::wiki::{IndexedFile, WikiChunk, WikiHit};
+    use komo_core::domain::chunk_index::{ChunkHit, IndexedChunk, IndexedFile};
     use std::collections::HashMap;
 
-    struct FixedIndex(Vec<WikiHit>);
+    struct FixedIndex(Vec<ChunkHit>);
 
     #[async_trait]
-    impl WikiIndex for FixedIndex {
-        async fn upsert(&self, _: &[WikiChunk]) -> anyhow::Result<()> {
+    impl ChunkIndex for FixedIndex {
+        async fn upsert(&self, _: &[IndexedChunk]) -> anyhow::Result<()> {
             Ok(())
         }
         async fn search(
@@ -164,7 +164,7 @@ mod tests {
             _: &str,
             limit: usize,
             _: f32,
-        ) -> anyhow::Result<Vec<WikiHit>> {
+        ) -> anyhow::Result<Vec<ChunkHit>> {
             Ok(self.0.iter().take(limit).cloned().collect())
         }
         async fn indexed(&self) -> anyhow::Result<HashMap<String, IndexedFile>> {
@@ -199,17 +199,17 @@ mod tests {
         }
     }
 
-    fn hit_at(path: &str, ordinal: usize, score: f32) -> WikiHit {
+    fn hit_at(path: &str, ordinal: usize, score: f32) -> ChunkHit {
         let mut h = hit(path, score);
         h.chunk.ordinal = ordinal;
-        h.chunk.id = WikiChunk::make_id(path, ordinal);
+        h.chunk.id = IndexedChunk::make_id(path, ordinal);
         h
     }
 
-    fn hit(path: &str, score: f32) -> WikiHit {
-        WikiHit {
-            chunk: WikiChunk {
-                id: WikiChunk::make_id(path, 0),
+    fn hit(path: &str, score: f32) -> ChunkHit {
+        ChunkHit {
+            chunk: IndexedChunk {
+                id: IndexedChunk::make_id(path, 0),
                 path: path.into(),
                 heading_path: format!("{path} > 设计"),
                 ordinal: 0,
@@ -222,7 +222,7 @@ mod tests {
         }
     }
 
-    fn tool(hits: Vec<WikiHit>, embedder_ok: bool) -> WikiSearchTool {
+    fn tool(hits: Vec<ChunkHit>, embedder_ok: bool) -> WikiSearchTool {
         WikiSearchTool::new(
             Arc::new(FixedIndex(hits)),
             Arc::new(FakeEmbedder(embedder_ok)),

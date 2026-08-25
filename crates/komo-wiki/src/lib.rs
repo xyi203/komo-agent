@@ -1,4 +1,4 @@
-//! Vector index backends for the note vault, behind [`WikiIndex`].
+//! Vector index backends for the note vault, behind [`ChunkIndex`].
 //!
 //! Two backends, chosen by config at startup:
 //!
@@ -21,7 +21,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use komo_core::domain::wiki::WikiIndex;
+use komo_core::domain::chunk_index::ChunkIndex;
 
 pub mod edge;
 pub mod lazy;
@@ -89,7 +89,7 @@ impl Default for WikiSettings {
 /// Mirrors `llm::build_llm`: one place where a config value becomes a concrete
 /// implementation, so every caller downstream holds the trait and nothing else
 /// in komo knows which backend is running.
-pub async fn build_index(settings: &WikiSettings) -> anyhow::Result<Arc<dyn WikiIndex>> {
+pub async fn build_index(settings: &WikiSettings) -> anyhow::Result<Arc<dyn ChunkIndex>> {
     match settings.backend {
         WikiBackend::Edge => {
             let index = edge::EdgeIndex::open(&settings.data_dir, &settings.collection)?;

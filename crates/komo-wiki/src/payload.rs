@@ -7,7 +7,7 @@
 //! written by one backend is therefore readable by the other, which is what
 //! makes the config switch reversible.
 
-use komo_core::domain::wiki::WikiChunk;
+use komo_core::domain::chunk_index::IndexedChunk;
 use uuid::Uuid;
 
 pub const F_PATH: &str = "path";
@@ -47,7 +47,7 @@ pub fn point_id(chunk_id: &str) -> Uuid {
 }
 
 /// Chunk → payload JSON. Both backends build their native payload from this.
-pub fn to_payload(chunk: &WikiChunk) -> serde_json::Value {
+pub fn to_payload(chunk: &IndexedChunk) -> serde_json::Value {
     serde_json::json!({
         "id": chunk.id,
         F_PATH: chunk.path,
@@ -65,15 +65,15 @@ pub fn to_payload(chunk: &WikiChunk) -> serde_json::Value {
 /// 4 KB per hit that no caller reads), so reconstructing one would be a lie.
 /// Returns `None` when a required field is missing or mistyped — a malformed
 /// point must drop out of the results, not fail the whole query.
-pub fn from_payload(payload: &serde_json::Value) -> Option<WikiChunk> {
+pub fn from_payload(payload: &serde_json::Value) -> Option<IndexedChunk> {
     let path = payload.get(F_PATH)?.as_str()?.to_string();
     let ordinal = payload.get(F_ORDINAL)?.as_u64()? as usize;
-    Some(WikiChunk {
+    Some(IndexedChunk {
         id: payload
             .get("id")
             .and_then(|v| v.as_str())
             .map(str::to_string)
-            .unwrap_or_else(|| WikiChunk::make_id(&path, ordinal)),
+            .unwrap_or_else(|| IndexedChunk::make_id(&path, ordinal)),
         path,
         heading_path: payload
             .get(F_HEADING)
@@ -96,8 +96,8 @@ pub fn from_payload(payload: &serde_json::Value) -> Option<WikiChunk> {
 mod tests {
     use super::*;
 
-    fn chunk() -> WikiChunk {
-        WikiChunk {
+    fn chunk() -> IndexedChunk {
+        IndexedChunk {
             id: "02-projects/note.md#3".into(),
             path: "02-projects/note.md".into(),
             heading_path: "note > 设计".into(),

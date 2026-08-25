@@ -1,11 +1,11 @@
-//! Index a note vault into a [`WikiIndex`].
+//! Index a note vault into a [`ChunkIndex`].
 //!
 //! Lives here rather than in the CLI because two callers need it and must not
 //! drift: `komo wiki index` when no gateway is running, and the gateway's own
 //! operator action when one is. That is the same rule the operator commands
 //! follow — one implementation, two transports.
 //!
-//! Depends only on the [`WikiIndex`] and [`EmbeddingClient`] traits, so it stays
+//! Depends only on the [`ChunkIndex`] and [`EmbeddingClient`] traits, so it stays
 //! inside `komo-services`' rule of never reaching into `komo-infra`: the caller
 //! supplies the concrete backend and embedder.
 //!
@@ -17,8 +17,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use komo_core::domain::chunk_index::{ChunkIndex, IndexedChunk};
 use komo_core::domain::embedding::EmbeddingClient;
-use komo_core::domain::wiki::{WikiChunk, WikiIndex};
 
 use crate::wiki_chunking::{ChunkSpec, chunk_markdown};
 
@@ -85,9 +85,9 @@ fn mtime_of(path: &Path) -> i64 {
 
 /// Embed one batch and write it.
 async fn flush(
-    index: &dyn WikiIndex,
+    index: &dyn ChunkIndex,
     embedder: &dyn EmbeddingClient,
-    mut batch: Vec<WikiChunk>,
+    mut batch: Vec<IndexedChunk>,
 ) -> anyhow::Result<usize> {
     let texts: Vec<String> = batch
         .iter()
@@ -121,7 +121,7 @@ async fn flush(
 /// `on_progress` is called after each embedded batch. A run over a large vault
 /// takes minutes, and this is the only signal a caller can surface.
 pub async fn index_vault(
-    index: &dyn WikiIndex,
+    index: &dyn ChunkIndex,
     embedder: &dyn EmbeddingClient,
     vault: &Path,
     embedding_model: &str,
@@ -186,7 +186,7 @@ pub async fn index_vault(
     }
 
     let spec = ChunkSpec::default();
-    let mut pending: Vec<WikiChunk> = Vec::new();
+    let mut pending: Vec<IndexedChunk> = Vec::new();
 
     for rel in &changed {
         let (path, mtime) = &on_disk[rel];
@@ -199,8 +199,8 @@ pub async fn index_vault(
         };
         let title = path.file_stem().unwrap_or_default().to_string_lossy();
         for raw in chunk_markdown(&title, &content, &spec) {
-            pending.push(WikiChunk {
-                id: WikiChunk::make_id(rel, raw.ordinal),
+            pending.push(IndexedChunk {
+                id: IndexedChunk::make_id(rel, raw.ordinal),
                 path: rel.clone(),
                 heading_path: raw.heading_path,
                 ordinal: raw.ordinal,
@@ -211,7 +211,7 @@ pub async fn index_vault(
             });
         }
         while pending.len() >= EMBED_BATCH {
-            let batch: Vec<WikiChunk> = pending.drain(..EMBED_BATCH).collect();
+            let batch: Vec<IndexedChunk> = pending.drain(..EMBED_BATCH).collect();
             outcome.chunks_written += flush(index, embedder, batch).await?;
             on_progress(IndexProgress {
                 chunks_written: outcome.chunks_written,
@@ -235,18 +235,18 @@ pub async fn index_vault(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use komo_core::domain::wiki::{IndexedFile, WikiHit};
+    use komo_core::domain::chunk_index::{ChunkHit, IndexedFile};
     use std::sync::Mutex;
 
     #[derive(Default)]
     struct FakeIndex {
-        chunks: Mutex<Vec<WikiChunk>>,
+        chunks: Mutex<Vec<IndexedChunk>>,
         resets: Mutex<usize>,
     }
 
     #[async_trait]
-    impl WikiIndex for FakeIndex {
-        async fn upsert(&self, chunks: &[WikiChunk]) -> anyhow::Result<()> {
+    impl ChunkIndex for FakeIndex {
+        async fn upsert(&self, chunks: &[IndexedChunk]) -> anyhow::Result<()> {
             let mut held = self.chunks.lock().unwrap();
             for chunk in chunks {
                 held.retain(|c| c.id != chunk.id);
@@ -260,7 +260,7 @@ mod tests {
             _: &str,
             _: usize,
             _: f32,
-        ) -> anyhow::Result<Vec<WikiHit>> {
+        ) -> anyhow::Result<Vec<ChunkHit>> {
             Ok(Vec::new())
         }
         async fn indexed(&self) -> anyhow::Result<HashMap<String, IndexedFile>> {
@@ -440,7 +440,7 @@ mod tests {
 /// The last outcome is kept because a background run has nowhere else to report:
 /// the tool call that started it has long returned by the time it finishes.
 pub struct WikiIndexRunner {
-    index: Arc<dyn WikiIndex>,
+    index: Arc<dyn ChunkIndex>,
     embedder: Arc<dyn EmbeddingClient>,
     vault: PathBuf,
     embedding_model: String,
@@ -549,7 +549,7 @@ impl Drop for RunClaim {
 
 impl WikiIndexRunner {
     pub fn new(
-        index: Arc<dyn WikiIndex>,
+        index: Arc<dyn ChunkIndex>,
         embedder: Arc<dyn EmbeddingClient>,
         vault: PathBuf,
         embedding_model: String,
@@ -571,7 +571,7 @@ impl WikiIndexRunner {
         &self.embedding_model
     }
 
-    pub fn index(&self) -> &Arc<dyn WikiIndex> {
+    pub fn index(&self) -> &Arc<dyn ChunkIndex> {
         &self.index
     }
 
@@ -673,8 +673,8 @@ mod runner_tests {
         // claiming does no I/O.
         struct NoIndex;
         #[async_trait::async_trait]
-        impl WikiIndex for NoIndex {
-            async fn upsert(&self, _chunks: &[WikiChunk]) -> anyhow::Result<()> {
+        impl ChunkIndex for NoIndex {
+            async fn upsert(&self, _chunks: &[IndexedChunk]) -> anyhow::Result<()> {
                 unreachable!()
             }
             async fn delete_paths(&self, _paths: &[String]) -> anyhow::Result<()> {
@@ -682,7 +682,8 @@ mod runner_tests {
             }
             async fn indexed(
                 &self,
-            ) -> anyhow::Result<HashMap<String, komo_core::domain::wiki::IndexedFile>> {
+            ) -> anyhow::Result<HashMap<String, komo_core::domain::chunk_index::IndexedFile>>
+            {
                 unreachable!()
             }
             async fn search(
@@ -691,7 +692,7 @@ mod runner_tests {
                 _query: &str,
                 _limit: usize,
                 _floor: f32,
-            ) -> anyhow::Result<Vec<komo_core::domain::wiki::WikiHit>> {
+            ) -> anyhow::Result<Vec<komo_core::domain::chunk_index::ChunkHit>> {
                 unreachable!()
             }
             async fn count(&self) -> anyhow::Result<usize> {

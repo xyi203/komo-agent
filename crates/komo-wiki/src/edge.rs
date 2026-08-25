@@ -19,8 +19,8 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
-use komo_core::domain::wiki::{
-    DIVERSIFY_OVERFETCH, IndexedFile, MAX_CHUNKS_PER_FILE, WikiChunk, WikiHit, WikiIndex,
+use komo_core::domain::chunk_index::{
+    ChunkHit, ChunkIndex, DIVERSIFY_OVERFETCH, IndexedChunk, IndexedFile, MAX_CHUNKS_PER_FILE,
     diversify, reciprocal_rank_fusion,
 };
 use qdrant_edge::bm25_embed::{EdgeBm25, EdgeBm25Config};
@@ -56,12 +56,12 @@ fn run_query(
 
 /// Scored points → hits, dropping any whose payload will not decode. A
 /// malformed point costs its own result, never the query.
-fn to_hits(points: Vec<qdrant_edge::ScoredPoint>) -> Vec<WikiHit> {
+fn to_hits(points: Vec<qdrant_edge::ScoredPoint>) -> Vec<ChunkHit> {
     points
         .into_iter()
         .filter_map(|point| {
             let value = serde_json::to_value(point.payload.as_ref()?).ok()?;
-            Some(WikiHit {
+            Some(ChunkHit {
                 chunk: payload::from_payload(&value)?,
                 score: point.score,
             })
@@ -243,8 +243,8 @@ impl EdgeIndex {
 }
 
 #[async_trait]
-impl WikiIndex for EdgeIndex {
-    async fn upsert(&self, chunks: &[WikiChunk]) -> anyhow::Result<()> {
+impl ChunkIndex for EdgeIndex {
+    async fn upsert(&self, chunks: &[IndexedChunk]) -> anyhow::Result<()> {
         let Some(dim) = chunks.iter().map(|c| c.embedding.len()).find(|n| *n > 0) else {
             return Ok(());
         };
@@ -309,7 +309,7 @@ impl WikiIndex for EdgeIndex {
         query_text: &str,
         limit: usize,
         min_score: f32,
-    ) -> anyhow::Result<Vec<WikiHit>> {
+    ) -> anyhow::Result<Vec<ChunkHit>> {
         let Some(shard) = self.snapshot() else {
             return Ok(Vec::new());
         };
@@ -486,9 +486,9 @@ mod tests {
 
     /// Unit vectors, as the `EmbeddingClient` contract guarantees — the shard is
     /// configured for dot-product distance on that basis.
-    fn chunk(path: &str, ordinal: usize, embedding: Vec<f32>) -> WikiChunk {
-        WikiChunk {
-            id: WikiChunk::make_id(path, ordinal),
+    fn chunk(path: &str, ordinal: usize, embedding: Vec<f32>) -> IndexedChunk {
+        IndexedChunk {
+            id: IndexedChunk::make_id(path, ordinal),
             path: path.to_string(),
             heading_path: format!("{path} > 节"),
             ordinal,
@@ -610,7 +610,7 @@ mod tests {
         assert!(index.indexed().await.unwrap().contains_key("b.md"));
     }
 
-    fn chunk_with_text(path: &str, text: &str, embedding: Vec<f32>) -> WikiChunk {
+    fn chunk_with_text(path: &str, text: &str, embedding: Vec<f32>) -> IndexedChunk {
         let mut c = chunk(path, 0, embedding);
         c.text = text.to_string();
         c.heading_path = path.to_string();
@@ -659,7 +659,7 @@ mod tests {
     async fn one_note_cannot_monopolize_an_arm_before_fusion() {
         let dir = tempfile::tempdir().unwrap();
         let index = index(&dir);
-        let mut chunks: Vec<WikiChunk> = (0..6)
+        let mut chunks: Vec<IndexedChunk> = (0..6)
             .map(|i| {
                 let mut c = chunk("hog.md", i, vec![1.0, 0.0]);
                 c.text = "结账 服务 编排".into();

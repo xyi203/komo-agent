@@ -230,7 +230,7 @@ impl DirectOperatorAdapter {
         command: OperatorCommand,
     ) -> anyhow::Result<OperatorCommandResult> {
         Ok(match command {
-            OperatorCommand::WikiIndex { rebuild } => {
+            OperatorCommand::ChunkIndex { rebuild } => {
                 OperatorCommandResult::WikiIndexed(self.wiki_ops().await?.index(rebuild).await?)
             }
             OperatorCommand::MemoryTransition { id, action } => {

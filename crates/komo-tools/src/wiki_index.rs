@@ -345,9 +345,9 @@ impl WikiIndexTool {
 mod tests {
     use super::*;
     use komo_core::domain::approval::{Approver, Risk};
+    use komo_core::domain::chunk_index::{ChunkHit, ChunkIndex, IndexedChunk, IndexedFile};
     use komo_core::domain::context::SessionContext;
     use komo_core::domain::embedding::EmbeddingClient;
-    use komo_core::domain::wiki::{IndexedFile, WikiChunk, WikiHit, WikiIndex};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -360,8 +360,8 @@ mod tests {
     }
 
     #[async_trait]
-    impl WikiIndex for FakeIndex {
-        async fn upsert(&self, _chunks: &[WikiChunk]) -> anyhow::Result<()> {
+    impl ChunkIndex for FakeIndex {
+        async fn upsert(&self, _chunks: &[IndexedChunk]) -> anyhow::Result<()> {
             Ok(())
         }
         async fn delete_paths(&self, _paths: &[String]) -> anyhow::Result<()> {
@@ -376,7 +376,7 @@ mod tests {
             _q: &str,
             _limit: usize,
             _floor: f32,
-        ) -> anyhow::Result<Vec<WikiHit>> {
+        ) -> anyhow::Result<Vec<ChunkHit>> {
             Ok(Vec::new())
         }
         async fn count(&self) -> anyhow::Result<usize> {

@@ -71,7 +71,7 @@ impl GatewayOperatorAdapter {
         command: OperatorCommand,
     ) -> anyhow::Result<OperatorCommandResult> {
         Ok(match command {
-            OperatorCommand::WikiIndex { rebuild } => {
+            OperatorCommand::ChunkIndex { rebuild } => {
                 OperatorCommandResult::WikiIndexed(self.client.wiki_index(rebuild).await?)
             }
             OperatorCommand::MemoryTransition { id, action } => {

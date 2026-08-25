@@ -1,4 +1,4 @@
-//! A [`WikiIndex`] that opens its backend on first use.
+//! A [`ChunkIndex`] that opens its backend on first use.
 //!
 //! Wiring is one-shot — the tool catalog is frozen once the agent is built — so
 //! an index that refuses to open at startup otherwise costs `wiki_search` for
@@ -16,14 +16,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use komo_core::domain::wiki::{IndexedFile, WikiChunk, WikiHit, WikiIndex};
+use komo_core::domain::chunk_index::{ChunkHit, ChunkIndex, IndexedChunk, IndexedFile};
 use tokio::sync::OnceCell;
 
 use crate::{WikiSettings, build_index};
 
 pub struct LazyWikiIndex {
     settings: WikiSettings,
-    inner: OnceCell<Arc<dyn WikiIndex>>,
+    inner: OnceCell<Arc<dyn ChunkIndex>>,
 }
 
 impl LazyWikiIndex {
@@ -36,7 +36,7 @@ impl LazyWikiIndex {
 
     /// The open index: opening it on the first call, and retrying on every call
     /// after one that failed.
-    pub async fn get(&self) -> anyhow::Result<&Arc<dyn WikiIndex>> {
+    pub async fn get(&self) -> anyhow::Result<&Arc<dyn ChunkIndex>> {
         self.inner
             .get_or_try_init(|| build_index(&self.settings))
             .await
@@ -44,8 +44,8 @@ impl LazyWikiIndex {
 }
 
 #[async_trait]
-impl WikiIndex for LazyWikiIndex {
-    async fn upsert(&self, chunks: &[WikiChunk]) -> anyhow::Result<()> {
+impl ChunkIndex for LazyWikiIndex {
+    async fn upsert(&self, chunks: &[IndexedChunk]) -> anyhow::Result<()> {
         self.get().await?.upsert(chunks).await
     }
 
@@ -55,7 +55,7 @@ impl WikiIndex for LazyWikiIndex {
         query_text: &str,
         limit: usize,
         min_score: f32,
-    ) -> anyhow::Result<Vec<WikiHit>> {
+    ) -> anyhow::Result<Vec<ChunkHit>> {
         self.get()
             .await?
             .search(query, query_text, limit, min_score)
