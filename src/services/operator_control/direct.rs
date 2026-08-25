@@ -186,10 +186,14 @@ impl DirectOperatorAdapter {
                     actions::AUDIT_SCAN_LIMIT,
                 )
                 .await?;
+                let runs =
+                    RunRepository::list(self.db().await?.as_ref(), actions::AUDIT_SCAN_LIMIT)
+                        .await?;
                 OperatorQueryResult::SkillAudit(actions::skill_invocations(
                     steps,
                     &name,
                     actions::AUDIT_RESULT_CAP,
+                    &actions::run_verdicts(runs),
                 ))
             }
             // The skill store is files, not a locked db, so the direct adapter
@@ -208,7 +212,14 @@ impl DirectOperatorAdapter {
                 .list_active()
                 .into_iter()
                 .map(|skill| skill.name);
-                OperatorQueryResult::SkillUsage(actions::skill_usage(names, steps))
+                let runs =
+                    RunRepository::list(self.db().await?.as_ref(), actions::AUDIT_SCAN_LIMIT)
+                        .await?;
+                OperatorQueryResult::SkillUsage(actions::skill_usage(
+                    names,
+                    steps,
+                    &actions::run_verdicts(runs),
+                ))
             }
             OperatorQuery::HomeOverride => OperatorQueryResult::HomeOverride(
                 HomeRepository::get(self.db().await?.as_ref()).await?,

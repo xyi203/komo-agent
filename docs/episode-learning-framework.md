@@ -1,6 +1,6 @@
 # Episode 学习闭环设计
 
-> 状态：Phase 1、2 已实现（2026-08-25）；Phase 3 仍是设计提案。
+> 状态：Phase 1、2、3 已实现（2026-08-25）。
 >
 > 范围：在现有 run ledger、reflective reviewer、Memory consolidation 和 Skill governance 之上，建立基于任务结果证据的学习闭环。
 >
@@ -446,20 +446,30 @@ Golden cases 覆盖情况：第 11 节的 1、4、11、12 已有对应测试；2
 重新计算确定性部分再追加，而不是从空列表开始。否则一个自身触发未曾跑过的 run
 （崩溃、重启）会在收到反馈的那一刻丢掉它的 uncertain step 和失败记录。
 
-### Phase 3：Procedure 效果证据
+### Phase 3：Procedure 效果证据 ✅ 已实现
 
-实现：
+实现（`operator_control/actions.rs` 的 `run_verdicts` + `skill_invocations` /
+`skill_usage`）：
 
-- 将 Skill invocation 与 run outcome 关联；
-- 在 `komo skills audit` 中展示 success/failure/unknown 分布和确定性证据；
-- 保留 operator promote，不做自动晋升。
+- Skill invocation 与 run outcome 关联；
+- `komo skills audit` 聚合视图显示 `N✓ N✗ N?`，单 skill 视图每行显示该 turn 的
+  结局，并单独列出失败反例的 run id；
+- 保留 operator promote，没有自动晋升。
 
-验证：
+验证（均有测试）：
 
-- 同一失败 run 不会重复计数；
-- Skill 被加载但没有采用时不算正向证据；
+- 同一 run 内多次 view 只计一次（视图数仍照实显示，但结局按 run 计）；
 - Unknown 不被当作 Success；
-- 失败反例对 operator 可见。
+- 窗口外的 run 读作 Unknown，不读作成功；
+- 失败反例在 `komo skills audit <name>` 末尾单独点名，不埋在计数里。
+
+关于「Skill 被加载但没有采用时不算正向证据」：ledger 看不到「是否真的照做」，
+所以这类情况落在 Unknown 桶里 —— 这是诚实的归类而不是检测。CLI 的说明文字里
+写明了这一点。
+
+尚未实现（来自 hermes 借鉴笔记，不属于本文 Phase 3）：`used >= N && 有失败`
+时自动触发 reviewer 生成 skill 修订候选。本阶段先把证据摆出来给 operator 看；
+自动提案建立在这份证据之上。
 
 ## 11. Golden cases
 

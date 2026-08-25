@@ -56,6 +56,10 @@ pub struct SkillInvocation {
     pub seq: i64,
     pub started_at: i64,
     pub ok: bool,
+    /// How the turn that loaded this skill turned out. `ok` above says the
+    /// *load* worked, which is a different and much weaker claim.
+    #[serde(default)]
+    pub verdict: crate::domain::episode::OutcomeVerdict,
 }
 
 /// One skill's usage across the ledger scan window (backs the aggregate
@@ -68,6 +72,20 @@ pub struct SkillUsage {
     pub views: usize,
     /// When it was last loaded; `None` = not once in the window.
     pub last_at: Option<i64>,
+    /// Distinct turns that loaded it, bucketed by how they turned out. Counted
+    /// per **run**, not per view: a skill loaded twice in one turn is one piece
+    /// of evidence about that turn, not two.
+    ///
+    /// `unknown` is the honest majority and is not a silent success: a turn
+    /// whose outcome nothing settled says nothing about whether the skill
+    /// helped — and a skill that was loaded but never actually followed lands
+    /// here too, since the ledger cannot see adoption.
+    #[serde(default)]
+    pub succeeded: usize,
+    #[serde(default)]
+    pub failed: usize,
+    #[serde(default)]
+    pub unknown: usize,
 }
 
 /// The result of resuming an interrupted run, consumed by `komo run resume`.

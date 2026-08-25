@@ -340,14 +340,34 @@ pub async fn audit(control: &OperatorControl, name: Option<&str>) -> anyhow::Res
     for i in &invocations {
         let mark = if i.ok { "ok " } else { "ERR" };
         println!(
-            "{}  {}  step #{}  {}",
+            "{}  load {}  turn {:<8}  step #{}  {}",
             local_time(i.started_at),
             mark,
+            i.verdict.as_str(),
             i.seq,
             i.run_id
         );
     }
-    println!("\n(`komo run inspect <id>` shows the full turn.)");
+    let failures: Vec<&str> = invocations
+        .iter()
+        .filter(|i| i.verdict == komo_core::domain::episode::OutcomeVerdict::Failure)
+        .map(|i| i.run_id.as_str())
+        .collect();
+    if !failures.is_empty() {
+        // The counter-examples, named. A skill that keeps being loaded into
+        // turns the user then rejects is the case this report exists for, and
+        // burying it in a count would make it invisible.
+        println!(
+            "\n{} turn(s) that loaded this skill ended in failure: {}",
+            failures.len(),
+            failures.join(", ")
+        );
+    }
+    println!(
+        "\n(`load ok` means the skill was read; `turn` is how that turn ended, \
+         which is what says whether it helped.)\n\
+         (`komo run inspect <id>` shows the full turn.)"
+    );
     Ok(())
 }
 
@@ -373,8 +393,15 @@ async fn usage(control: &OperatorControl) -> anyhow::Result<()> {
             Some(at) => local_time(at),
             None => "never".to_string(),
         };
+        let outcomes = if row.failed > 0 {
+            format!("  {}✓ {}✗ {}?", row.succeeded, row.failed, row.unknown)
+        } else if row.views > 0 {
+            format!("  {}✓ {}?", row.succeeded, row.unknown)
+        } else {
+            String::new()
+        };
         println!(
-            "  {:width$}  {:>4} view(s)  last {}",
+            "  {:width$}  {:>4} view(s){outcomes}  last {}",
             row.name,
             row.views,
             last,
@@ -384,6 +411,9 @@ async fn usage(control: &OperatorControl) -> anyhow::Result<()> {
     println!(
         "\n(Derived from the run ledger, not a stored counter — `never` means \
          \"not in the ledger's window\", not \"never in its life\".)\n\
+         (✓/✗/? are the turns that loaded it, by how they ended. `?` is the \
+         honest majority: nothing settled whether the turn worked, and a skill \
+         that was loaded but never followed lands there too.)\n\
          (`komo skills audit <name>` shows the individual turns.)"
     );
     Ok(())

@@ -573,7 +573,13 @@ call the same functions, which is what keeps validation from forking.
   a load gate; `skill` view/list and every `komo skills` command ignore it.
   Usage is **derived**, never counted: `komo skills audit` rolls `skill view`
   ledger steps up per skill (`domain/run.rs`'s `skill_viewed`), so it reaches
-  only as far back as the disposable `state.db` does.
+  only as far back as the disposable `state.db` does. Each load is attributed
+  to **how its turn ended** (`Run.outcome`), bucketed per *run* rather than per
+  view — a skill loaded twice in one turn is one piece of evidence about that
+  turn. `Unknown` is the honest majority and never counts as success: it is
+  also where a skill that was loaded but never actually followed lands, since
+  the ledger cannot see adoption. Failing turns are named individually, not
+  summed into a count nobody reads.
 - `komo-agent`'s `daemon` — `Maintenance` sweeps under `supervise` (circuit breaker
   after 5 failures). Sweep cron expressions are matched against **local time**
   via the same `next_occurrence_local` cron jobs use — never `Utc::now()`
