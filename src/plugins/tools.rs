@@ -59,7 +59,13 @@ impl Plugin for CoreToolsPlugin {
         reg.tool(Scope::AGENTIC, Arc::new(LogsTool));
         reg.tool(
             Scope::AGENTIC,
-            Arc::new(SessionTool::new(cx.db.clone(), cx.db.clone())),
+            Arc::new({
+                let tool = SessionTool::new(cx.db.clone(), cx.db.clone());
+                match &cx.episodic {
+                    Some(search) => tool.with_episodic_search(search.clone()),
+                    None => tool,
+                }
+            }),
         );
         reg.tool(Scope::AGENTIC, Arc::new(ReminderTool::new(cx.db.clone())));
         // Scheduled jobs from inside a conversation. Every mutation is gated

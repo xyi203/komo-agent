@@ -11,6 +11,7 @@ use komo_core::domain::{
     repository::{MessageRepository, SessionRepository},
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
+use komo_services::session_indexing::SessionSearch;
 
 /// Hits returned per `search` call. Small on purpose: a hit names its index so
 /// the model can `show` around whichever ones matter.
@@ -53,11 +54,80 @@ struct SessionArgs {
 pub struct SessionTool {
     sessions: Arc<dyn SessionRepository>,
     messages: Arc<dyn MessageRepository>,
+    /// Hybrid (dense ∪ lexical) search over every transcript. `None` when no
+    /// embedding backend is configured, which drops `search` back to the
+    /// substring scan over one session — worse, but never silent.
+    episodic: Option<Arc<SessionSearch>>,
 }
 
 impl SessionTool {
     pub fn new(sessions: Arc<dyn SessionRepository>, messages: Arc<dyn MessageRepository>) -> Self {
-        Self { sessions, messages }
+        Self {
+            sessions,
+            messages,
+            episodic: None,
+        }
+    }
+
+    /// Attach the episodic index, making `search` semantic and cross-session.
+    pub fn with_episodic_search(mut self, search: Arc<SessionSearch>) -> Self {
+        self.episodic = Some(search);
+        self
+    }
+
+    /// Hybrid search across stored transcripts, with the index caught up first.
+    ///
+    /// Catch-up is best-effort and its failure is not this call's failure: an
+    /// index that is one turn stale still answers the question that was asked,
+    /// whereas refusing to search because indexing hiccupped answers nothing.
+    async fn episodic_search(
+        &self,
+        episodic: &SessionSearch,
+        query: &str,
+        scope: &str,
+    ) -> Result<ToolOutput, ToolError> {
+        match self.sessions.list().await {
+            Ok(sessions) => {
+                if let Err(error) = episodic.refresh(&sessions).await {
+                    tracing::warn!(%error, "session index catch-up failed (searching anyway)");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not list sessions to index (searching anyway)")
+            }
+        }
+
+        let scope = (!scope.is_empty()).then_some(scope);
+        let hits = episodic
+            .search(query, scope, SEARCH_LIMIT)
+            .await
+            .map_err(ToolError::Failed)?;
+        let where_ = match scope {
+            Some(s) => format!("in {s}"),
+            None => "across all stored conversations".to_string(),
+        };
+        if hits.is_empty() {
+            return Ok(ToolOutput::text(format!(
+                "no matches for {query:?} {where_}. This searched meaning as well as \
+                 wording, so a rephrasing is unlikely to help — say you checked."
+            )));
+        }
+        let mut out = format!("{} match(es) for {query:?} {where_}:\n", hits.len());
+        for hit in &hits {
+            out.push_str(&format!(
+                "\n[{} @ {}] #{}\n{}\n",
+                hit.chunk.path,
+                hit.chunk.heading_path,
+                hit.chunk.ordinal,
+                oneline(&hit.chunk.text, SNIPPET_MAX)
+            ));
+        }
+        out.push_str(
+            "\nEach hit names its session and the `show` offset of the turn it \
+             came from — use action=\"show\" with that session and offset to read \
+             it in full before relying on it.",
+        );
+        Ok(ToolOutput::text(out).with_title(format!("{} match(es)", hits.len())))
     }
 
     /// The transcript `args` targets: the named session, else this
@@ -78,14 +148,20 @@ impl Tool for SessionTool {
     }
 
     fn description(&self) -> &'static str {
-        "Inspect Komo's own stored conversation sessions (this agent's chat \
-         history database, NOT system/tmux/login sessions). Only a recent \
-         window of this conversation is replayed to you each turn — the rest \
-         still exists here. action=\"search\" finds stored messages in this \
-         conversation by keyword (matches message text and tool-activity \
-         notes); action=\"show\" reads stored messages verbatim by position; \
-         action=\"count\"/\"list\" enumerate sessions. Use search when the \
-         user refers to something said earlier that you can no longer see."
+        "Search and read Komo's own stored conversations (this agent's chat \
+         history, NOT system/tmux/login sessions). Only a recent window of the \
+         current conversation is replayed to you each turn — everything older, \
+         and every other conversation, still exists here. \
+         action=\"search\" finds past turns by meaning as well as wording, \
+         across ALL stored conversations by default, and matches a question in \
+         one language against a conversation held in another; \
+         action=\"show\" reads stored messages verbatim by position; \
+         action=\"count\"/\"list\" enumerate sessions. \
+         Search whenever the user refers to earlier work, a past decision, or \
+         something they told you that you cannot see — including in other \
+         conversations. Search first, then `show` the turn to read it in full \
+         rather than answering from a snippet. If a search finds nothing, say \
+         you checked instead of guessing."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -99,11 +175,11 @@ impl Tool for SessionTool {
                 },
                 "query": {
                     "type": "string",
-                    "description": "search: case-insensitive substring to find (message text and tool notes)."
+                    "description": "search: what to look for. Matched by meaning and by wording, over message text and tool-activity notes — write it as the question you are actually asking, not as a keyword."
                 },
                 "session": {
                     "type": "string",
-                    "description": "search/show: a session id from action=list. Defaults to this conversation."
+                    "description": "search: a session id from action=list, to narrow to one conversation. Omit to search all of them, which is usually what you want. show: which conversation to read; defaults to this one."
                 },
                 "offset": {
                     "type": "integer",
@@ -159,6 +235,25 @@ impl Tool for SessionTool {
                     return Err(ToolError::InvalidInput(
                         "search needs a non-empty `query`".into(),
                     ));
+                }
+                // A named session narrows the search; unnamed searches every
+                // stored conversation. That default is the point of the
+                // episodic path — "when did we decide X" is a question about
+                // *some* past session, and requiring its id up front is
+                // requiring the answer as the input.
+                let scope = args.session.trim();
+                if let Some(episodic) = &self.episodic {
+                    match self.episodic_search(episodic, query, scope).await {
+                        Ok(out) => return Ok(out),
+                        // Degrade, never fail: an embedding backend that is
+                        // down must leave the model with the scan it had
+                        // before, not with "no matches" — which reads as *the
+                        // conversation never happened*.
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "episodic session search failed; falling back to the substring scan"
+                        ),
+                    }
                 }
                 let session = self.target_session(&args, ctx)?;
                 let messages = self.messages.list_by_session(&session).await?;
@@ -225,6 +320,16 @@ impl Tool for SessionTool {
             ))),
         }
     }
+}
+
+/// Flatten to one line and bound the length — a turn-chunk can be 2000 chars
+/// and eight of them would crowd out the answer they are supposed to support.
+fn oneline(text: &str, cap: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= cap {
+        return flat;
+    }
+    flat.chars().take(cap).collect::<String>() + "…"
 }
 
 fn rfc3339(unix: i64) -> String {
@@ -506,5 +611,183 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    // ── episodic search ────────────────────────────────────────────────────
+
+    /// An index that answers with canned hits, or refuses to.
+    struct FakeIndex {
+        hits: Vec<komo_core::domain::chunk_index::ChunkHit>,
+        fail_search: bool,
+    }
+
+    #[async_trait]
+    impl komo_core::domain::chunk_index::ChunkIndex for FakeIndex {
+        async fn upsert(
+            &self,
+            _chunks: &[komo_core::domain::chunk_index::IndexedChunk],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn search(
+            &self,
+            _q: &[f32],
+            _text: &str,
+            _limit: usize,
+            _min: f32,
+        ) -> anyhow::Result<Vec<komo_core::domain::chunk_index::ChunkHit>> {
+            if self.fail_search {
+                anyhow::bail!("index unavailable");
+            }
+            Ok(self.hits.clone())
+        }
+        async fn indexed(
+            &self,
+        ) -> anyhow::Result<
+            std::collections::HashMap<String, komo_core::domain::chunk_index::IndexedFile>,
+        > {
+            Ok(Default::default())
+        }
+        async fn delete_paths(&self, _paths: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn reset(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn vector_spec(&self) -> anyhow::Result<Option<(usize, String)>> {
+            Ok(None)
+        }
+    }
+
+    struct FakeEmbedder(bool);
+
+    #[async_trait]
+    impl komo_core::domain::embedding::EmbeddingClient for FakeEmbedder {
+        async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            if self.0 {
+                anyhow::bail!("embedding backend down");
+            }
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+        fn model_id(&self) -> &str {
+            "fake"
+        }
+    }
+
+    fn chunk_hit(
+        path: &str,
+        ordinal: usize,
+        text: &str,
+    ) -> komo_core::domain::chunk_index::ChunkHit {
+        komo_core::domain::chunk_index::ChunkHit {
+            chunk: komo_core::domain::chunk_index::IndexedChunk {
+                id: komo_core::domain::chunk_index::IndexedChunk::make_id(path, ordinal),
+                path: path.into(),
+                heading_path: "2026-08-01".into(),
+                ordinal,
+                text: text.into(),
+                mtime: 0,
+                embedding: Vec::new(),
+                embedding_model: String::new(),
+            },
+            score: 1.0,
+        }
+    }
+
+    fn episodic_tool(
+        hits: Vec<komo_core::domain::chunk_index::ChunkHit>,
+        fail_search: bool,
+        fail_embed: bool,
+    ) -> SessionTool {
+        let search = komo_services::session_indexing::SessionSearch::new(
+            Arc::new(FakeIndex { hits, fail_search }),
+            Arc::new(FakeEmbedder(fail_embed)),
+        );
+        tool().with_episodic_search(Arc::new(search))
+    }
+
+    /// The point of the episodic path: a question about "some past
+    /// conversation" is answerable without already knowing which one.
+    #[tokio::test]
+    async fn episodic_search_spans_every_session_by_default() {
+        let out = episodic_tool(
+            vec![
+                chunk_hit("feishu:oc_9", 3, "user: 要不要用 rig?\nassistant: 不建议"),
+                chunk_hit("cli:old", 7, "user: rig 的问题\nassistant: 侵入 runtime"),
+            ],
+            false,
+            false,
+        )
+        .call(
+            json!({ "action": "search", "query": "为什么不用 rig" }),
+            &ctx("chat:1"),
+        )
+        .await
+        .unwrap()
+        .text;
+
+        assert!(out.contains("across all stored conversations"), "{out}");
+        assert!(out.contains("feishu:oc_9"), "{out}");
+        assert!(out.contains("cli:old"), "{out}");
+        // A hit has to carry the coordinates `show` takes, or reading it in
+        // full means guessing.
+        assert!(out.contains("#3"), "{out}");
+        assert!(
+            out.contains("2026-08-01"),
+            "the date locates the turn: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_named_session_narrows_the_episodic_search() {
+        let out = episodic_tool(vec![chunk_hit("cli:old", 7, "user: rig")], false, false)
+            .call(
+                json!({ "action": "search", "query": "rig", "session": "cli:old" }),
+                &ctx("chat:1"),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("in cli:old"), "{out}");
+    }
+
+    /// Degrading is the contract: an embedding backend that is down must leave
+    /// the model with the substring scan, not with "no matches" — which reads
+    /// as *the conversation never happened*.
+    #[tokio::test]
+    async fn a_failing_index_falls_back_to_the_substring_scan() {
+        for (fail_search, fail_embed) in [(true, false), (false, true)] {
+            let out = episodic_tool(Vec::new(), fail_search, fail_embed)
+                .call(
+                    json!({ "action": "search", "query": "pikachu" }),
+                    &ctx("chat:1"),
+                )
+                .await
+                .unwrap()
+                .text;
+            assert!(
+                out.contains("we should deploy pikachu"),
+                "expected the lexical scan to answer; got: {out}"
+            );
+        }
+    }
+
+    /// An honest empty answer, and one that does not invite a reword — the
+    /// search already covered meaning, so rephrasing is not the missing step.
+    #[tokio::test]
+    async fn an_empty_episodic_result_says_it_checked() {
+        let out = episodic_tool(Vec::new(), false, false)
+            .call(
+                json!({ "action": "search", "query": "something never discussed" }),
+                &ctx("chat:1"),
+            )
+            .await
+            .unwrap()
+            .text;
+        assert!(out.contains("no matches"), "{out}");
+        assert!(out.contains("say you checked"), "{out}");
     }
 }

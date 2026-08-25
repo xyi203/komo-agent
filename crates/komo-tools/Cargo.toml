@@ -13,6 +13,7 @@ komo-infra = { path = "../komo-infra" }
 komo-mcp = { path = "../komo-mcp" }
 komo-pyhost = { path = "../komo-pyhost" }
 komo-services = { path = "../komo-services" }
+tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

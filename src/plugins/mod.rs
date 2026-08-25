@@ -331,6 +331,9 @@ pub struct ToolCx<'a> {
     pub clarify: Arc<ClarifyState>,
     pub memory_repo: Arc<dyn MemoryRepository>,
     pub memory_query: Arc<MemoryQueryService>,
+    /// Hybrid search over stored transcripts. `None` = no embedding backend (or
+    /// an unopenable index), which leaves `session` search on its substring scan.
+    pub episodic: Option<Arc<komo_services::session_indexing::SessionSearch>>,
     pub skills: Arc<SkillRegistry>,
     pub skill_store: Arc<FsSkillStore>,
 }
@@ -720,6 +723,7 @@ mod tests {
             clarify: Arc::new(ClarifyState::new()),
             memory_query: Arc::new(MemoryQueryService::new(memory_repo.clone())),
             memory_repo,
+            episodic: None,
             skills: Arc::new(SkillRegistry::load_from_dirs(&[])),
             skill_store: Arc::new(komo_infra::skills::FsSkillStore::new(
                 std::env::temp_dir().join("komo-plugin-test-skills"),

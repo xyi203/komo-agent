@@ -61,6 +61,7 @@ process's own log mid-conversation.
 | `~/.komo/memory.db` | long-term memories | durable |
 | `~/.komo/cron.db` | scheduled cron jobs | durable |
 | `~/.komo/permissions.json` | saved approval grants | durable |
+| `~/.komo/session-index/` | episodic search index over transcripts | disposable — rebuilt on search |
 | `~/.komo/tool-output/` | over-limit tool results + per-session `index.jsonl` (7-day retention) | disposable |
 | `~/.komo/skills/` | skill files (filesystem is the source of truth) | durable |
 
@@ -240,6 +241,7 @@ komo-infra     persistence · memory · skills · logs · workday ·
 komo-services  tool_execution · tool_output_store · memory_query ·
                memory_consolidation · memory_enrichment · clarify ·
                skill_registry · cron_actions · wiki_indexing ·
+               session_indexing · episode ·
                diff/patch/search/file_mutation                (→ core, config)
 komo-tools     every tool                      (→ core, infra, mcp, services)
 komo-agent     runtime · gateway · daemon · interaction · system_prompt ·
@@ -315,6 +317,24 @@ call the same functions, which is what keeps validation from forking.
   deny-only file-read gate as `read`), `wiki_read` (vault-confined by
   canonicalized prefix, `Risk::Safe` deny-only; reads the markdown, not the
   index, so a note edited since the last index run is served current).
+- `session` + `komo-services`' `session_indexing` — **episodic memory**:
+  hybrid search over komo's own transcripts, the third memory beside `memory.db`
+  (semantic) and skills (procedural). `search` spans **every** stored
+  conversation by default, because "why did we decide against rig?" is a
+  question about *some* past session and requiring its id up front is requiring
+  the answer as the input. It matches meaning as well as wording, over the same
+  `ChunkIndex` the vault uses but its own collection (`~/.komo/session-index`) —
+  transcripts are komo's own corpus and must not depend on `[wiki]` being
+  configured. **A chunk is a turn, not a message**: "那就不用 rig 了" embeds into
+  nothing alone, and its `ordinal` is its opening user message's `show` offset,
+  so a hit is readable in full without translating coordinates. Indexing is
+  incremental (append past the indexed chunk count) and happens **on the search
+  path**, newest session first and budget-capped — a turn that never searches
+  pays nothing, and a first search after a long gap does useful work instead of
+  hanging. **Every failure degrades to the substring scan, never to "no
+  matches"** — an empty answer reads as *the conversation never happened*, which
+  is the one wrong thing this can say. Without `[memory] embedding_model` there
+  is no index and `search` is the single-session scan it always was.
 - `komo-agent`'s `reviewer` + `learning_coordinator`, `komo-core`'s
   `domain::episode`, `komo-services`' `episode` — the post-run extraction pass
   (docs/episode-learning-framework.md). Its unit is an **episode**: one finished

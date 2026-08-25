@@ -257,12 +257,44 @@ pub async fn build(
     // the enricher's automatic recall — that sharing is the point: a model handed
     // a memory unprompted must be able to find the same memory by asking. Built
     // before the tool set because the tool holds it.
+    // Probed once and shared: the same backend serves memory recall and the
+    // episodic index over transcripts, and probing it twice would just be two
+    // round-trips to the same Ollama.
+    let embedder = build_embedder(config.runtime.embedding.as_ref()).await;
     let mut memory_query =
         komo_services::memory_query::MemoryQueryService::new(memory_repo.clone());
-    if let Some(embedder) = build_embedder(config.runtime.embedding.as_ref()).await {
-        memory_query = memory_query.with_embedder(embedder);
+    if let Some(embedder) = &embedder {
+        memory_query = memory_query.with_embedder(embedder.clone());
     }
     let memory_query = Arc::new(memory_query);
+
+    // Episodic search over komo's own transcripts. Its own collection, beside
+    // the wiki's and independent of `[wiki]`: this corpus is komo's, exists
+    // whether or not the operator keeps a note vault, and needs only the
+    // embedding backend memory recall already asked for.
+    //
+    // Absent when there is no embedder, or when the store cannot be opened —
+    // `session` search then falls back to the substring scan it had before,
+    // which is worse but never silent.
+    let episodic = match &embedder {
+        Some(embedder) => {
+            let dir = komo_config::komo_home().join("session-index");
+            match komo_wiki::edge::EdgeIndex::open(&dir, "komo_sessions") {
+                Ok(index) => Some(Arc::new(
+                    komo_services::session_indexing::SessionSearch::new(
+                        Arc::new(index),
+                        embedder.clone(),
+                    ),
+                )),
+                Err(error) => {
+                    tracing::warn!(%error, dir = %dir.display(),
+                        "session index unusable — `session` search stays lexical");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
 
     // ── Plugin phase 1: every tool and hook, tagged per runtime ──────────────
     // The roster is `plugins::builtin()`; `[plugins.<name>] enabled = false`
@@ -283,6 +315,7 @@ pub async fn build(
         workspace: workspace.clone(),
         clarify: clarify.clone(),
         memory_repo: memory_repo.clone(),
+        episodic: episodic.clone(),
         memory_query: memory_query.clone(),
         skills: skills.clone(),
         skill_store: skill_store.clone(),
