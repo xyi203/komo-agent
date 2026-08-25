@@ -598,7 +598,14 @@ call the same functions, which is what keeps validation from forking.
   the tool's `save_automation`, not in an event stream that costs an LLM turn
   per sensor tick.
 - `cli/wiring.rs` — shared `AgentRuntime` construction (chat vs gateway differ
-  only in `Approver`); register new tools here.
+  only in `Approver`); register new tools here. Each runtime is a
+  **`CapabilityProfile`** — scope, llm, tools, `max_turns`, `learns`,
+  `resumable` — built by `RuntimeParts`, which holds what all of them share.
+  The load-bearing field is `scope`: it used to be written twice per runtime,
+  once per hook lookup, with nothing checking the two agreed or matched the
+  executor's own scope, so a copy-pasted `Scope::MAIN` would hand a sweep the
+  conversation's hooks. Adding a runtime is a profile, not a struct literal
+  whose three real differences hide among nine identical fields.
 - `tui/` — ratatui chat front end over gateway-or-in-process backends; state +
   key handling terminal-free in `tui/app.rs`. `komo resume <id>` (or the
   compatible `komo session resume <id>`) re-enters a session; a bare API UUID

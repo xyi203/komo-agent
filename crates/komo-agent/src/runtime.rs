@@ -67,7 +67,7 @@ pub struct AgentRuntime {
     pub history_window: usize,
     /// Post-run learning goes through the shared coordinator (also driven by the
     /// gateway's scheduled sweep); `None` = this runtime never learns.
-    pub review: Option<Arc<LearningCoordinator>>,
+    pub learning: Option<Arc<LearningCoordinator>>,
     /// Turn-journal store: each turn's provider-level state, persisted so an
     /// interrupted turn can be continued (`resume_interrupted`) instead of
     /// re-run. `None` — aux runtimes (delegate/cron/briefing) — journals
@@ -269,7 +269,7 @@ impl AgentRuntime {
         // run whose outcome had not been written yet. Whether the interval is
         // due, which episodes the extractor sees, and the watermark are all the
         // coordinator's knowledge; the runtime only reports that a run ended.
-        if let Some(learning) = &self.review {
+        if let Some(learning) = &self.learning {
             let learning = learning.clone();
             let run_id = run.id.clone();
             tokio::spawn(async move {
@@ -983,7 +983,7 @@ mod tests {
             tool_executor: executor,
             max_turns,
             history_window: 0,
-            review: None,
+            learning: None,
             journal: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
@@ -1398,7 +1398,7 @@ mod tests {
             ),
             max_turns: 30,
             history_window: 0,
-            review: None,
+            learning: None,
             journal: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
@@ -1976,7 +1976,7 @@ mod tests {
             ),
             max_turns: 30,
             history_window: 0,
-            review: None,
+            learning: None,
             journal: Some(db.clone()),
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
@@ -2124,7 +2124,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (mut rt, _) =
             scripted_runtime(db.clone(), vec![Step::Final("done".into())], Vec::new(), 30);
-        rt.review = Some(Arc::new(
+        rt.learning = Some(Arc::new(
             crate::learning_coordinator::LearningCoordinator::new(
                 db.clone(),
                 db.clone(),

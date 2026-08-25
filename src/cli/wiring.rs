@@ -19,6 +19,7 @@ use komo_agent::runtime::AgentRuntime;
 use komo_agent::system_prompt::SystemPromptBuilder;
 use komo_core::domain::embedding::EmbeddingClient;
 use komo_core::domain::skill::SkillOffer;
+use komo_core::domain::turn_journal::TurnJournalRepository;
 use komo_infra::embedding::OllamaEmbedder;
 use komo_infra::memory::memory_db::MemoryDb;
 use komo_infra::permissions_store::PermissionsStore;
@@ -82,6 +83,73 @@ pub struct Wiring {
 /// Probed once here rather than trusted, because the failure is otherwise
 /// invisible: an unreachable daemon would silently drop recall back to lexical
 /// matching every turn, which looks exactly like "memory just doesn't work".
+/// What distinguishes one runtime from another.
+///
+/// Five runtimes exist — interactive, delegate, cron, briefing, and the
+/// reviewer's aux calls — and they were four near-identical struct literals
+/// whose *differences* were three fields buried among nine identical ones.
+/// Everything shared (the stores, the history window, the learning
+/// coordinator) is supplied by [`RuntimeParts`]; a profile states only what is
+/// its own.
+///
+/// The load-bearing field is `scope`. It used to be written twice per runtime,
+/// once for each hook lookup, with nothing checking the two agreed or that
+/// either matched the executor's own scope — so a copy-pasted `Scope::MAIN`
+/// would silently give a sweep the conversation's hooks. Named once here, that
+/// cannot be spelled wrong in only one of the places.
+struct CapabilityProfile {
+    /// Which runtime this is. Selects the tool catalog's hooks, and must be the
+    /// same scope `tools` was built for.
+    scope: Scope,
+    llm: Arc<dyn LlmClient>,
+    tools: ToolExecutor,
+    max_turns: usize,
+    /// Learns from its own finished turns. **False for every aux runtime**: a
+    /// sub-agent's transcript is scratch work, and a sweep restates what komo
+    /// already knows, so extracting from either feeds the memory pipeline its
+    /// own output. (`LearningCoordinator` also refuses sweep sessions by id —
+    /// this is the half that stops them being offered at all.)
+    learns: bool,
+    /// Journals each turn's provider state so an interrupted one can be
+    /// continued. True only for conversations: an aux turn is re-dispatched
+    /// whole, so a journal for one would only ever be written and deleted.
+    resumable: bool,
+}
+
+/// What every runtime shares. Held once so [`CapabilityProfile`] can be read as
+/// a list of differences.
+struct RuntimeParts<'a> {
+    db: Arc<Db>,
+    registry: &'a plugins::ToolRegistry,
+    /// Mirrors the LLM's own history window, so a turn loads exactly what the
+    /// model will replay and no long transcript is read in full.
+    history_window: usize,
+    learning: Arc<LearningCoordinator>,
+}
+
+impl RuntimeParts<'_> {
+    fn build(&self, profile: CapabilityProfile) -> AgentRuntime {
+        AgentRuntime {
+            llm: profile.llm,
+            sessions: self.db.clone(),
+            messages: self.db.clone(),
+            // Every runtime shares the run ledger, which is what makes a
+            // delegation, a cron job and a briefing each auditable through
+            // `komo run list` alongside ordinary turns.
+            runs: self.db.clone(),
+            tool_executor: profile.tools,
+            max_turns: profile.max_turns,
+            history_window: self.history_window,
+            learning: profile.learns.then(|| self.learning.clone()),
+            journal: profile
+                .resumable
+                .then(|| self.db.clone() as Arc<dyn TurnJournalRepository>),
+            turn_hooks: self.registry.turn_hooks_for(profile.scope),
+            step_hooks: self.registry.step_hooks_for(profile.scope),
+        }
+    }
+}
+
 /// A warning, never a fatal — the same call komo makes for a missing model key
 /// or a token-less HA channel. Recall keeps working without it.
 pub(crate) async fn build_embedder(
@@ -458,21 +526,49 @@ pub async fn build(
         None,
         Some("delegate"),
     )?;
-    let subagent_runtime = Arc::new(AgentRuntime {
-        llm: subagent_llm,
-        sessions: db.clone(),
-        messages: db.clone(),
-        runs: db.clone(),
-        tool_executor: subagent_tools,
-        max_turns: model_config.max_turns,
+    let skill_repo: Arc<dyn SkillRepository> = skill_store.clone();
+    // The seam every extracted observation goes through. It shares the query
+    // service with recall, so "which existing claims might this be about" is
+    // answered by the same hybrid matching that decides what gets injected.
+    let consolidator = Arc::new(
+        komo_services::memory_consolidation::MemoryConsolidator::new(
+            memory_repo.clone(),
+            aux_llm.clone(),
+            memory_query.clone(),
+        ),
+    );
+    let reviewer: Arc<dyn Reviewer> = Arc::new(ReflectiveReviewer::new(
+        aux_llm.clone(),
+        consolidator,
+        skill_repo,
+        kanban.clone(),
+    ));
+    // One coordinator instance shared by the runtime's post-run trigger and
+    // the gateway's scheduled sweep — that sharing is what makes its
+    // per-session in-flight guard effective across the two paths.
+    let review = Arc::new(LearningCoordinator::new(
+        db.clone(),
+        db.clone(),
+        reviewer,
+        config.runtime.review_interval,
+    ));
+
+    // Built before the runtimes because every one of them is assembled from it.
+    let parts = RuntimeParts {
+        db: db.clone(),
+        registry: &registry,
         history_window: model_config.max_history_messages,
-        // A sub-agent's transcript is scratch work, not a conversation to learn
-        // from — the reviewer only ever sees the real one.
-        review: None,
-        journal: None,
-        turn_hooks: registry.turn_hooks_for(Scope::SUBAGENT),
-        step_hooks: registry.step_hooks_for(Scope::SUBAGENT),
-    });
+        learning: review.clone(),
+    };
+
+    let subagent_runtime = Arc::new(parts.build(CapabilityProfile {
+        scope: Scope::SUBAGENT,
+        llm: subagent_llm,
+        tools: subagent_tools,
+        max_turns: model_config.max_turns,
+        learns: false,
+        resumable: false,
+    }));
     let delegate = Arc::new(DelegateTool::new(
         subagent_runtime,
         db.clone(),
@@ -520,52 +616,19 @@ pub async fn build(
         memory_query.clone(),
     ));
     let llm = build_llm(model_config, Some(&tools), preamble, Some(enricher), None)?;
-    let skill_repo: Arc<dyn SkillRepository> = skill_store.clone();
-    // The seam every extracted observation goes through. It shares the query
-    // service with recall, so "which existing claims might this be about" is
-    // answered by the same hybrid matching that decides what gets injected.
-    let consolidator = Arc::new(
-        komo_services::memory_consolidation::MemoryConsolidator::new(
-            memory_repo.clone(),
-            aux_llm.clone(),
-            memory_query.clone(),
-        ),
-    );
-    let reviewer: Arc<dyn Reviewer> = Arc::new(ReflectiveReviewer::new(
-        aux_llm.clone(),
-        consolidator,
-        skill_repo,
-        kanban.clone(),
-    ));
-    // One coordinator instance shared by the runtime's post-run trigger and
-    // the gateway's scheduled sweep — that sharing is what makes its
-    // per-session in-flight guard effective across the two paths.
-    let review = Arc::new(LearningCoordinator::new(
-        db.clone(),
-        db.clone(),
-        reviewer,
-        config.runtime.review_interval,
-    ));
 
-    let runtime = AgentRuntime {
+    // The conversation: the only runtime that learns from what it did, and the
+    // only one whose turns are worth resuming.
+    let runtime = parts.build(CapabilityProfile {
+        scope: Scope::MAIN,
         llm,
-        sessions: db.clone(),
-        messages: db.clone(),
-        runs: db.clone(),
         // The in-house agent loop hands each round to this executor; the LLM
         // above was handed the same catalog's schemas, declaration only.
-        tool_executor: tools,
+        tools,
         max_turns: model_config.max_turns,
-        // Mirror the LLM's history window so the turn loads exactly what the
-        // model will replay (no full-transcript read on long chat sessions).
-        history_window: model_config.max_history_messages,
-        review: Some(review.clone()),
-        // The one runtime whose turns are worth resuming: conversations. The
-        // aux runtimes below journal nothing — their turns re-dispatch whole.
-        journal: Some(db.clone()),
-        turn_hooks: registry.turn_hooks_for(Scope::MAIN),
-        step_hooks: registry.step_hooks_for(Scope::MAIN),
-    };
+        learns: true,
+        resumable: true,
+    });
 
     // ── Cron agent runtime (general cron, agent mode) ────────────────────────
     // Runs `CronAction::Agent` jobs: the SAME full tool set as the main agent
@@ -608,19 +671,14 @@ pub async fn build(
         None,
         Some("cron"),
     )?;
-    let cron_runtime = Arc::new(AgentRuntime {
+    let cron_runtime = Arc::new(parts.build(CapabilityProfile {
+        scope: Scope::CRON,
         llm: cron_llm,
-        sessions: db.clone(),
-        messages: db.clone(),
-        runs: db.clone(),
-        tool_executor: cron_tools,
+        tools: cron_tools,
         max_turns: model_config.max_turns,
-        history_window: model_config.max_history_messages,
-        review: None,
-        journal: None,
-        turn_hooks: registry.turn_hooks_for(Scope::CRON),
-        step_hooks: registry.step_hooks_for(Scope::CRON),
-    });
+        learns: false,
+        resumable: false,
+    }));
 
     // ── Briefing runtime (roadmap §2) ────────────────────────────────────────
     // A second, deliberately small agent the BriefingSweep drives: aux model,
@@ -653,20 +711,15 @@ pub async fn build(
         None,
         Some("briefing"),
     )?;
-    let briefing_runtime = Arc::new(AgentRuntime {
+    let briefing_runtime = Arc::new(parts.build(CapabilityProfile {
+        scope: Scope::BRIEFING,
         llm: briefing_llm,
-        sessions: db.clone(),
-        messages: db.clone(),
-        runs: db.clone(),
-        tool_executor: briefing_tools,
+        tools: briefing_tools,
         // A briefing is an aggregation read, not a long-running job.
         max_turns: BRIEFING_MAX_TURNS,
-        history_window: model_config.max_history_messages,
-        review: None,
-        journal: None,
-        turn_hooks: registry.turn_hooks_for(Scope::BRIEFING),
-        step_hooks: registry.step_hooks_for(Scope::BRIEFING),
-    });
+        learns: false,
+        resumable: false,
+    }));
 
     Ok(Wiring {
         runtime,
