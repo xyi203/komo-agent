@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex};
 use tracing::warn;
 
 use komo_core::domain::{
-    episode::AssessedEpisode,
+    episode::{AssessedEpisode, OutcomeAssessment},
+    llm::LlmClient,
     repository::SessionRepository,
     reviewer::{ReviewOutcome, Reviewer},
     run::{Run, RunRepository},
@@ -99,6 +100,9 @@ pub struct LearningCoordinator {
     reviewer: Arc<dyn Reviewer>,
     /// Learn once a session has this many finished turns waiting.
     interval: usize,
+    /// Aux model for reading a turn's reply as a verdict on the previous one.
+    /// `None` = outcomes stay deterministic, which means they stay `Unknown`.
+    aux: Option<Arc<dyn LlmClient>>,
     /// Session ids currently being learned from (either trigger).
     in_flight: Mutex<HashSet<String>>,
 }
@@ -115,8 +119,17 @@ impl LearningCoordinator {
             runs,
             reviewer,
             interval: interval.max(1),
+            aux: None,
             in_flight: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Attach the aux model that reads the user's next message as a verdict on
+    /// the previous turn. Without it every outcome stays `Unknown`: nothing
+    /// observable when a turn ends distinguishes success from silence.
+    pub fn with_feedback(mut self, aux: Arc<dyn LlmClient>) -> Self {
+        self.aux = Some(aux);
+        self
     }
 
     /// Run one learning pass for `trigger`. Callers pass no counts or
@@ -128,6 +141,12 @@ impl LearningCoordinator {
                 let Some(run) = self.runs.get(&run_id).await? else {
                     return Ok(report);
                 };
+                // Two things happen before any learning: this run gets its
+                // provisional assessment, and the *previous* run may get a
+                // verdict out of what the user just said. The second is the
+                // whole reason assessments are stored rather than recomputed.
+                self.assess(&run).await;
+                self.absorb_feedback(&run).await;
                 if exempt_from_learning(&run.session_id) {
                     // Retire it from the backlog rather than leaving it to be
                     // re-examined and re-declined by every future sweep.
@@ -160,6 +179,77 @@ impl LearningCoordinator {
             }
         }
         Ok(report)
+    }
+
+    /// Write the deterministic reading of a just-finished run.
+    ///
+    /// Best-effort: an unassessed run reads as `Unknown` at learning time,
+    /// which is what it would have said anyway.
+    async fn assess(&self, run: &Run) {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let Ok(Some(view)) = assemble(&self.runs, &run.id).await else {
+            return;
+        };
+        let assessment = OutcomeAssessment::deterministic(&view, now);
+        self.store_outcome(&run.id, &assessment).await;
+    }
+
+    /// Read this run's user message as a verdict on the one before it, and
+    /// revise that one's assessment if it is.
+    ///
+    /// Only the immediately preceding turn, and only within the same session:
+    /// "还是不行" is about what just happened. Reaching further back would
+    /// attach a confident verdict to a turn the user was not talking about,
+    /// which is worse than missing one.
+    async fn absorb_feedback(&self, run: &Run) {
+        let Some(aux) = &self.aux else {
+            return;
+        };
+        if exempt_from_learning(&run.session_id) {
+            return;
+        }
+        let Ok(Some(previous)) = self.runs.previous_in_session(&run.id).await else {
+            return;
+        };
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let Some(evidence) = crate::feedback::classify(aux, &previous, &run.input, now).await
+        else {
+            return;
+        };
+
+        // Append and re-resolve, never replace: the deterministic evidence
+        // still holds — an uncertain step is still uncertain — and the
+        // strength ordering is what decides between them.
+        //
+        // Recomputed when the previous run has no stored assessment, rather
+        // than starting from an empty one. A turn whose own trigger never fired
+        // (a crash, a restart, a runtime that was not yet learning) would
+        // otherwise lose its uncertain steps and failures the moment feedback
+        // arrived — and losing evidence is not what appending evidence should do.
+        let mut assessment = match serde_json::from_str::<OutcomeAssessment>(&previous.outcome) {
+            Ok(stored) => stored,
+            Err(_) => match assemble(&self.runs, &previous.id).await {
+                Ok(Some(view)) => OutcomeAssessment::deterministic(&view, now),
+                _ => OutcomeAssessment::resolve(previous.id.clone(), Vec::new(), now),
+            },
+        };
+        assessment.evidence.push(evidence);
+        let revised = OutcomeAssessment::resolve(previous.id.clone(), assessment.evidence, now);
+        tracing::info!(
+            run_id = %previous.id,
+            verdict = revised.verdict.as_str(),
+            "outcome revised by the user's next message"
+        );
+        self.store_outcome(&previous.id, &revised).await;
+    }
+
+    async fn store_outcome(&self, run_id: &str, assessment: &OutcomeAssessment) {
+        let Ok(json) = serde_json::to_string(assessment) else {
+            return;
+        };
+        if let Err(error) = self.runs.set_outcome(run_id, &json).await {
+            warn!(%error, run_id, "failed to store an outcome assessment");
+        }
     }
 
     /// Learn from one session's pending runs, then retire exactly the batch that
@@ -197,7 +287,14 @@ impl LearningCoordinator {
             if !view.learning_eligible() {
                 continue;
             }
-            episodes.push(AssessedEpisode::deterministic(view, now));
+            // The stored assessment, when there is one, may carry the user's
+            // own verdict — the strongest evidence there is, and the only kind
+            // that arrives after the turn it judges.
+            episodes.push(AssessedEpisode::stored_or_deterministic(
+                view,
+                &run.outcome,
+                now,
+            ));
         }
         if episodes.is_empty() {
             // Nothing to extract from, but the batch was still examined.
@@ -290,7 +387,7 @@ mod tests {
     /// A ledger of hand-built runs, recording which ids were retired.
     struct FakeRuns {
         runs: Mutex<Vec<Run>>,
-        steps: Vec<RunStep>,
+        steps: Mutex<Vec<RunStep>>,
         marked: Mutex<Vec<String>>,
         fail_mark: bool,
     }
@@ -299,7 +396,7 @@ mod tests {
         fn new(runs: Vec<Run>) -> Arc<Self> {
             Arc::new(Self {
                 runs: Mutex::new(runs),
-                steps: Vec::new(),
+                steps: Mutex::new(Vec::new()),
                 marked: Mutex::new(Vec::new()),
                 fail_mark: false,
             })
@@ -320,6 +417,8 @@ mod tests {
         async fn steps(&self, run_id: &str) -> anyhow::Result<Vec<RunStep>> {
             Ok(self
                 .steps
+                .lock()
+                .unwrap()
                 .iter()
                 .filter(|s| s.run_id == run_id)
                 .cloned()
@@ -340,6 +439,24 @@ mod tests {
                 .take(limit)
                 .cloned()
                 .collect())
+        }
+        async fn set_outcome(&self, run_id: &str, outcome: &str) -> anyhow::Result<()> {
+            let mut runs = self.runs.lock().unwrap();
+            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+                run.outcome = outcome.to_string();
+            }
+            Ok(())
+        }
+        async fn previous_in_session(&self, run_id: &str) -> anyhow::Result<Option<Run>> {
+            let runs = self.runs.lock().unwrap();
+            let Some(current) = runs.iter().find(|r| r.id == run_id) else {
+                return Ok(None);
+            };
+            Ok(runs
+                .iter()
+                .filter(|r| r.session_id == current.session_id && r.started_at < current.started_at)
+                .max_by_key(|r| r.started_at)
+                .cloned())
         }
         async fn mark_learned(&self, run_ids: &[String]) -> anyhow::Result<()> {
             if self.fail_mark {
@@ -427,6 +544,7 @@ mod tests {
     /// Records the episodes it was handed, per call.
     struct RecordingReviewer {
         calls: Mutex<Vec<(String, Vec<String>)>>,
+        verdicts: Mutex<Vec<komo_core::domain::episode::OutcomeVerdict>>,
         fail: bool,
         gate: Option<Arc<tokio::sync::Notify>>,
         outcome: ReviewOutcome,
@@ -436,6 +554,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                verdicts: Mutex::new(Vec::new()),
                 fail: false,
                 gate: None,
                 outcome: ReviewOutcome::default(),
@@ -454,6 +573,10 @@ mod tests {
                 session.id.clone(),
                 episodes.iter().map(|e| e.view.id().to_string()).collect(),
             ));
+            self.verdicts
+                .lock()
+                .unwrap()
+                .extend(episodes.iter().map(|e| e.outcome.verdict));
             if let Some(gate) = &self.gate {
                 gate.notified().await;
             }
@@ -724,7 +847,7 @@ mod tests {
     async fn a_watermark_failure_still_reports_what_was_learned() {
         let mut fake = FakeRuns {
             runs: Mutex::new(vec![done("run-1", "cli:s")]),
-            steps: Vec::new(),
+            steps: Mutex::new(Vec::new()),
             marked: Mutex::new(Vec::new()),
             fail_mark: false,
         };
@@ -777,5 +900,212 @@ mod tests {
 
         assert!(report.is_empty());
         assert!(reviewer.calls.lock().unwrap().is_empty());
+    }
+
+    // ── delayed feedback (Phase 2) ─────────────────────────────────────────
+
+    struct VerdictLlm(&'static str);
+
+    #[async_trait]
+    impl LlmClient for VerdictLlm {
+        async fn complete(&self, _session: &Session) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    /// Two runs in one session, the second carrying the user's reaction to the
+    /// first.
+    fn feedback_pair(reaction: &str) -> Arc<FakeRuns> {
+        let mut first = done("run-1", "cli:s");
+        first.started_at = 100;
+        first.input = "fix the failing test".into();
+        first.final_output = "Fixed — the assertion was inverted.".into();
+        let mut second = done("run-2", "cli:s");
+        second.started_at = 200;
+        second.input = reaction.into();
+        second.final_output = "ok".into();
+        FakeRuns::new(vec![first, second])
+    }
+
+    fn verdict_of(runs: &Arc<FakeRuns>, id: &str) -> OutcomeVerdictName {
+        let stored = runs
+            .runs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .outcome
+            .clone();
+        serde_json::from_str::<OutcomeAssessment>(&stored)
+            .map(|a| a.verdict)
+            .unwrap_or_default()
+    }
+
+    type OutcomeVerdictName = komo_core::domain::episode::OutcomeVerdict;
+
+    fn coordinator_with_feedback(runs: Arc<FakeRuns>, answer: &'static str) -> LearningCoordinator {
+        LearningCoordinator::new(
+            FakeSessions::new(),
+            runs,
+            Arc::new(RecordingReviewer::default()),
+            10,
+        )
+        .with_feedback(Arc::new(VerdictLlm(answer)))
+    }
+
+    /// The point of Phase 2: "可以了" is a verdict on the turn *before* it, not
+    /// on the empty turn that carried it.
+    #[tokio::test]
+    async fn a_confirmation_settles_the_previous_run_not_the_current_one() {
+        let runs = feedback_pair("可以了");
+        let c = coordinator_with_feedback(runs.clone(), "SUCCESS");
+
+        c.run(LearningTrigger::AfterRun {
+            run_id: "run-2".into(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(verdict_of(&runs, "run-1"), OutcomeVerdictName::Success);
+        assert_eq!(
+            verdict_of(&runs, "run-2"),
+            OutcomeVerdictName::Unknown,
+            "the turn carrying the feedback is not the turn it judges"
+        );
+    }
+
+    /// The agent said it fixed it. The user says otherwise, and the user wins —
+    /// that ordering is the whole reason evidence carries a strength.
+    #[tokio::test]
+    async fn a_rejection_overturns_the_turns_own_report() {
+        let runs = feedback_pair("还是不行");
+        let c = coordinator_with_feedback(runs.clone(), "FAILURE");
+
+        c.run(LearningTrigger::AfterRun {
+            run_id: "run-2".into(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(verdict_of(&runs, "run-1"), OutcomeVerdictName::Failure);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_next_request_leaves_the_previous_run_unknown() {
+        let runs = feedback_pair("现在改一下 README");
+        let c = coordinator_with_feedback(runs.clone(), "NEITHER");
+
+        c.run(LearningTrigger::AfterRun {
+            run_id: "run-2".into(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(verdict_of(&runs, "run-1"), OutcomeVerdictName::Unknown);
+    }
+
+    /// An uncertain step still means "we do not know", even when the user is
+    /// happy: their satisfaction says the goal was met, and it is — the
+    /// strongest evidence decides, and user confirmation outranks it.
+    #[tokio::test]
+    async fn a_confirmation_outranks_an_uncertain_step() {
+        let runs = feedback_pair("可以了");
+        runs.steps.lock().unwrap().push(RunStep {
+            run_id: "run-1".into(),
+            seq: 1,
+            tool_name: "shell".into(),
+            args: "{}".into(),
+            result: String::new(),
+            error: "timed out".into(),
+            ok: false,
+            uncertain: true,
+            started_at: 0,
+            ended_at: 0,
+            elapsed_ms: 0,
+            structured: serde_json::Value::Null,
+            output_paths: Vec::new(),
+        });
+        let c = coordinator_with_feedback(runs.clone(), "SUCCESS");
+
+        c.run(LearningTrigger::AfterRun {
+            run_id: "run-2".into(),
+        })
+        .await
+        .unwrap();
+
+        let stored = runs
+            .runs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == "run-1")
+            .unwrap()
+            .outcome
+            .clone();
+        let assessment: OutcomeAssessment = serde_json::from_str(&stored).unwrap();
+        assert_eq!(assessment.verdict, OutcomeVerdictName::Success);
+        assert_eq!(
+            assessment.evidence.len(),
+            2,
+            "the uncertain step is kept as evidence, just outranked"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_run_of_a_session_has_nothing_to_give_feedback_on() {
+        let runs = FakeRuns::new(vec![done("run-1", "cli:s")]);
+        let c = coordinator_with_feedback(runs.clone(), "SUCCESS");
+
+        c.run(LearningTrigger::AfterRun {
+            run_id: "run-1".into(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(verdict_of(&runs, "run-1"), OutcomeVerdictName::Unknown);
+    }
+
+    /// Without an aux model there is no verdict to be had, and the turn must
+    /// still be assessed and still be learnable.
+    #[tokio::test]
+    async fn feedback_is_optional() {
+        let runs = feedback_pair("可以了");
+        let c = coordinator(runs.clone(), Arc::new(RecordingReviewer::default()), 10);
+
+        c.run(LearningTrigger::AfterRun {
+            run_id: "run-2".into(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(verdict_of(&runs, "run-1"), OutcomeVerdictName::Unknown);
+        assert!(
+            !runs.runs.lock().unwrap()[1].outcome.is_empty(),
+            "the deterministic assessment is still stored"
+        );
+    }
+
+    /// A revised outcome has to reach the extractor, or revising it changed
+    /// nothing about what komo learns.
+    #[tokio::test]
+    async fn learning_reads_the_stored_outcome_rather_than_recomputing_it() {
+        let runs = feedback_pair("可以了");
+        let reviewer = Arc::new(RecordingReviewer::default());
+        let c = LearningCoordinator::new(FakeSessions::new(), runs.clone(), reviewer.clone(), 2)
+            .with_feedback(Arc::new(VerdictLlm("SUCCESS")));
+
+        c.run(LearningTrigger::AfterRun {
+            run_id: "run-2".into(),
+        })
+        .await
+        .unwrap();
+
+        let verdicts = reviewer.verdicts.lock().unwrap();
+        assert_eq!(
+            verdicts.first().copied(),
+            Some(OutcomeVerdictName::Success),
+            "the extractor must see the confirmed outcome, not a fresh Unknown"
+        );
     }
 }

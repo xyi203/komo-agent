@@ -189,6 +189,9 @@ struct RunRecord {
     /// row reads as `false`, which offers it to the pass once — the extractor's
     /// own dedup makes a re-read harmless.
     learned: bool,
+
+    /// Serialized `OutcomeAssessment`. Additive column; empty = never assessed.
+    outcome: String,
 }
 
 /// One tool invocation within a run. `run_id` indexes back to [`RunRecord`];
@@ -398,6 +401,7 @@ impl Db {
                 // upgrade that adds it — thousands of old turns re-extracted at
                 // once, each an "independent occasion" to the consolidator.
                 ("learned", "\"learned\" boolean NOT NULL DEFAULT true"),
+                ("outcome", "\"outcome\" text NOT NULL DEFAULT ''"),
             ];
             ensure_columns(p, "run_records", RUN_COLUMNS).await?;
             const STEP_COLUMNS: &[(&str, &str)] = &[
@@ -1194,6 +1198,7 @@ impl RunRepository for Db {
                 // Explicit, so the column's backfill default never applies to a
                 // run the learning pass is meant to see.
                 learned: run.learned,
+                outcome: run.outcome.clone(),
             })
             .exec(&mut conn)
             .await?;
@@ -1467,6 +1472,38 @@ impl RunRepository for Db {
             .collect()
     }
 
+    async fn set_outcome(&self, run_id: &str, outcome: &str) -> anyhow::Result<()> {
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut record = RunRecord::get_by_id(&mut conn, run_id).await?;
+            record
+                .update()
+                .outcome(outcome.to_string())
+                .exec(&mut conn)
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn previous_in_session(&self, run_id: &str) -> anyhow::Result<Option<Run>> {
+        let mut conn = self.inner.connection().await?;
+        let Ok(current) = RunRecord::get_by_id(&mut conn, run_id).await else {
+            return Ok(None);
+        };
+        let session = current.session_id.clone();
+        let started = current.started_at;
+        // Strictly earlier, newest first — the turn whose work a follow-up
+        // message is most plausibly about.
+        let rows = toasty::query!(
+            RunRecord FILTER .session_id == #session AND .started_at < #started
+            ORDER BY .started_at DESC LIMIT 1usize
+        )
+        .exec(&mut conn)
+        .await?;
+        rows.into_iter().next().map(run_from_record).transpose()
+    }
+
     async fn mark_learned(&self, run_ids: &[String]) -> anyhow::Result<()> {
         if run_ids.is_empty() {
             return Ok(());
@@ -1640,6 +1677,7 @@ fn run_from_record(record: RunRecord) -> anyhow::Result<Run> {
         // record, and one bad row must not fail the read of a whole run.
         memories: serde_json::from_str(&record.memories).unwrap_or_default(),
         learned: record.learned,
+        outcome: record.outcome,
     })
 }
 
@@ -2232,6 +2270,7 @@ mod tests {
             resumed_from: None,
             memories: Default::default(),
             learned: false,
+            outcome: String::new(),
         };
         for (id, t) in [("run-a", 100), ("run-b", 200), ("run-c", 300)] {
             let run = make(id, t);

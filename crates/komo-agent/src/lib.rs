@@ -14,6 +14,7 @@
 pub mod auto_reviewer;
 pub mod daemon;
 pub mod delegate;
+pub mod feedback;
 pub mod gateway;
 pub mod interaction;
 pub mod learning_coordinator;

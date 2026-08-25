@@ -130,6 +130,16 @@ pub struct Run {
     /// sweep re-examines them forever.
     #[serde(default)]
     pub learned: bool,
+    /// This turn's [`OutcomeAssessment`](super::episode::OutcomeAssessment) as
+    /// JSON, or empty for a run never assessed (one written before the column,
+    /// or one still in flight).
+    ///
+    /// Persisted rather than recomputed because it is **revisable**: most work
+    /// is confirmed or refuted by what the user says *next*, which is a fact
+    /// that does not exist when the turn ends. The deterministic reading is
+    /// written when the run finishes, and later evidence is appended to it.
+    #[serde(default)]
+    pub outcome: String,
 }
 
 impl Run {
@@ -152,6 +162,7 @@ impl Run {
             resumed_from: None,
             memories: RecalledMemories::default(),
             learned: false,
+            outcome: String::new(),
         }
     }
 }
@@ -451,6 +462,15 @@ pub trait RunRepository: Send + Sync {
     /// Mark runs as consumed by the learning pass. Best-effort like every other
     /// ledger write: a failure just means those runs are offered again.
     async fn mark_learned(&self, run_ids: &[String]) -> anyhow::Result<()>;
+
+    /// Store a run's outcome assessment (serialized). Overwrites: an
+    /// assessment is a *reading* of the evidence, and later evidence produces a
+    /// new reading rather than a second one.
+    async fn set_outcome(&self, run_id: &str, outcome: &str) -> anyhow::Result<()>;
+
+    /// The run immediately before `run_id` in the same session, if any — whose
+    /// work the user's next message is most likely commenting on.
+    async fn previous_in_session(&self, run_id: &str) -> anyhow::Result<Option<Run>>;
 }
 
 /// Whether a ledger step is the `skill` tool loading `skill_name`'s

@@ -1,6 +1,6 @@
 # Episode 学习闭环设计
 
-> 状态：Phase 1 已实现（2026-08-25）；Phase 2、3 仍是设计提案。
+> 状态：Phase 1、2 已实现（2026-08-25）；Phase 3 仍是设计提案。
 >
 > 范围：在现有 run ledger、reflective reviewer、Memory consolidation 和 Skill governance 之上，建立基于任务结果证据的学习闭环。
 >
@@ -423,20 +423,28 @@ Outcome evidence 应保存引用和摘要，而不是复制完整工具输出。
 Golden cases 覆盖情况：第 11 节的 1、4、11、12 已有对应测试；2、3 依赖 Phase 2 的
 用户反馈证据与 aux 判定；5–10 由既有 consolidator / skill governance 测试覆盖。
 
-### Phase 2：接收延迟反馈
+### Phase 2：接收延迟反馈 ✅ 已实现
 
-实现：
+实现（`komo-agent` `feedback.rs` + `LearningCoordinator::absorb_feedback`；
+`OutcomeAssessment` 落在 `Run.outcome` 追加列）：
 
 - 识别后续用户消息对上一相关 run 的明确确认或否定；
 - 追加 OutcomeEvidence 并重新计算 verdict；
 - 将更新后的结果关联到已有 candidates。
 
-验证：
+验证（均有测试）：
 
 - “可以了”能确认上一 run，而不是当前空操作；
 - “还是不行”能推翻 agent 的自报成功；
-- 模糊反馈保持 Unknown；
-- 新证据不会关联到不相关的旧 run。
+- 模糊反馈保持 Unknown —— 分类器 fail-closed：模型报错、超时、无法解析、
+  一行里同时出现两个判词、判词不在行首，一律无判决；
+- 新证据只关联同 session 的紧邻上一个 run，不向更早回溯；
+- 用户确认压过 uncertain step，但 uncertain 证据仍然保留在列表里；
+- 抽取器读的是存储的 outcome，不是重新计算的 —— 否则改判等于没改。
+
+与本文的一处偏差：`absorb_feedback` 在上一个 run 没有存储 assessment 时会
+重新计算确定性部分再追加，而不是从空列表开始。否则一个自身触发未曾跑过的 run
+（崩溃、重启）会在收到反馈的那一刻丢掉它的 uncertain step 和失败记录。
 
 ### Phase 3：Procedure 效果证据
 

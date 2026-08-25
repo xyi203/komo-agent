@@ -557,12 +557,18 @@ pub async fn build(
     // One coordinator instance shared by the runtime's post-run trigger and
     // the gateway's scheduled sweep — that sharing is what makes its
     // per-session in-flight guard effective across the two paths.
-    let review = Arc::new(LearningCoordinator::new(
-        db.clone(),
-        db.clone(),
-        reviewer,
-        config.runtime.review_interval,
-    ));
+    let review = Arc::new(
+        LearningCoordinator::new(
+            db.clone(),
+            db.clone(),
+            reviewer,
+            config.runtime.review_interval,
+        )
+        // Reads the user's next message as a verdict on the previous turn.
+        // Without it every outcome stays `Unknown`, since nothing observable
+        // when a turn ends tells success from silence.
+        .with_feedback(aux_llm.clone()),
+    );
 
     // Pre-images for `komo run rollback`. Swept once here rather than on a
     // schedule: the directory is read only on demand, and a gateway start is

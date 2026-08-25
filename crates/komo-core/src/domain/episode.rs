@@ -81,6 +81,21 @@ impl AssessedEpisode {
         let outcome = OutcomeAssessment::deterministic(&view, now);
         Self { view, outcome }
     }
+
+    /// Prefer a stored assessment over recomputing one.
+    ///
+    /// The stored one is the better answer whenever it exists, because it may
+    /// carry evidence that did not exist when the turn ended — the user's next
+    /// message saying it worked, or did not. Recomputing would silently discard
+    /// exactly the evidence worth having. Unparseable stored text falls back to
+    /// the deterministic reading rather than failing: a mangled cell must not
+    /// cost the episode its assessment.
+    pub fn stored_or_deterministic(view: EpisodeView, stored: &str, now: i64) -> Self {
+        match serde_json::from_str::<OutcomeAssessment>(stored) {
+            Ok(outcome) => Self { view, outcome },
+            Err(_) => Self::deterministic(view, now),
+        }
+    }
 }
 
 /// What the evidence currently says about whether the user's goal was met.

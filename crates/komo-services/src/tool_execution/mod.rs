@@ -1000,6 +1000,12 @@ mod tests {
         async fn mark_learned(&self, _run_ids: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
+        async fn set_outcome(&self, _run_id: &str, _outcome: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn previous_in_session(&self, _run_id: &str) -> anyhow::Result<Option<Run>> {
+            Ok(None)
+        }
     }
 
     struct EchoTool;

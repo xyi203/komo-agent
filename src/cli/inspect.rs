@@ -342,6 +342,14 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
     if !run.plan.is_empty() {
         println!("plan    {}", run.plan);
     }
+    if let Ok(assessment) =
+        serde_json::from_str::<komo_core::domain::episode::OutcomeAssessment>(&run.outcome)
+    {
+        println!("outcome {}", assessment.verdict.as_str());
+        for evidence in &assessment.evidence {
+            println!("        - {} ({})", evidence.detail, evidence.source);
+        }
+    }
     // Read straight off the checkpoint directory rather than from a ledger
     // column: the store already knows what this run changed, and a second copy
     // in the ledger could only ever disagree with it.
