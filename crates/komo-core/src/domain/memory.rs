@@ -252,6 +252,32 @@ impl Memory {
             .unwrap_or(self.created_at)
     }
 
+    /// When something last conflicted with this memory and nothing has ruled on
+    /// it since — `None` when nothing conflicts, or when a confirmation came
+    /// after the conflict (the operator has since decided the question).
+    ///
+    /// Read off the contradicting evidence, falling back to `updated_at` for a
+    /// conflict that left no entry: `contest`/`supersede` write none, and the
+    /// oldest entries drain out of the capped list. The fallback is an edit
+    /// clock, so it can only ever read *later* than the real refutation — which
+    /// delays retiring a refuted claim, never hastens it.
+    pub fn unresolved_refutation_at(&self) -> Option<i64> {
+        if self.contradiction_count == 0 && self.belief == BeliefState::Current {
+            return None;
+        }
+        let refuted_at = self
+            .evidence
+            .iter()
+            .filter(|e| e.relation == EvidenceRelation::Contradicts)
+            .map(|e| e.observed_at)
+            .max()
+            .unwrap_or(self.updated_at);
+        if self.last_confirmed_at.is_some_and(|c| c >= refuted_at) {
+            return None;
+        }
+        Some(refuted_at)
+    }
+
     /// Whether nothing has vouched for this memory in [`MEMORY_STALE_AFTER_DAYS`].
     /// Injected memories say so, because acting on a long-unconfirmed preference
     /// is how an assistant gets corrected.
@@ -1061,6 +1087,15 @@ pub const DREAM_MIN_SUPPORT: i64 = 2;
 /// `recall_count`, so a *weakly* recalled candidate (one or two hits long ago)
 /// is retired too rather than lingering in the pile forever.
 pub const DREAM_FORGET_AGE_DAYS: i64 = 30;
+/// How long an *unresolved refutation* is left for someone to rule on before the
+/// candidate carrying it is archived.
+///
+/// A week, against the clean candidate's thirty days, and the asymmetry is the
+/// point: retiring a refuted claim early costs an archived candidate that triage
+/// can restore, while keeping one costs a recall slot in every search about the
+/// very thing it is wrong about. Support has to accumulate across independent
+/// occasions to promote; a contradiction retires on its own.
+pub const DREAM_REFUTED_FORGET_AGE_DAYS: i64 = 7;
 
 /// Dreaming score for a candidate, for **ordering the `komo dream` preview** —
 /// never the verdict, which [`dream_verdict`] decides on its own gates.
@@ -1099,6 +1134,18 @@ pub fn dream_verdict(memory: &Memory, now: i64) -> DreamVerdict {
     let proven = memory.last_confirmed_at.is_some() || memory.support_count >= DREAM_MIN_SUPPORT;
     if believed && proven {
         return DreamVerdict::Promote;
+    }
+    // Forget what has been refuted, on a shorter clock than the merely unused
+    // and without waiting for it to go cold. A candidate under an unresolved
+    // contradiction can never promote however often it is retrieved, so the only
+    // thing left that could change its fate is a human ruling — and once nobody
+    // has ruled for a week, retrieval warmth is keeping alive a claim the user
+    // has already spoken against.
+    let refuted_days = memory
+        .unresolved_refutation_at()
+        .map(|at| (now - at).max(0) as f64 / 86_400.0);
+    if refuted_days.is_some_and(|days| days > DREAM_REFUTED_FORGET_AGE_DAYS as f64) {
+        return DreamVerdict::Archive;
     }
     // Forget the flotsam: old enough to have had its chance, and now cold. Cold
     // is measured on `last_used_at` (never used, or last used outside the forget
@@ -1490,6 +1537,60 @@ mod tests {
         let mut superseded = m.clone();
         superseded.supersede("mem-new", now);
         assert_eq!(dream_verdict(&superseded, now), DreamVerdict::Keep);
+    }
+
+    /// The asymmetry: a refutation nobody rules on retires the candidate well
+    /// before the thirty-day cold rule would, and *regardless* of how warm
+    /// retrieval keeps it — a claim the user has spoken against cannot earn its
+    /// recall slot back by being relevant.
+    #[test]
+    fn dream_archives_a_candidate_left_refuted() {
+        let now = 10_000 * 86_400;
+        let stale = now - (DREAM_REFUTED_FORGET_AGE_DAYS + 1) * 86_400;
+
+        // Warm (recalled yesterday) and young — neither saves it.
+        let mut contradicted = candidate(20, 5, now);
+        contradicted.record_evidence("s-1", EvidenceRelation::Contradicts, "no", stale);
+        assert_eq!(dream_verdict(&contradicted, now), DreamVerdict::Archive);
+
+        // `contest`/`supersede` write no evidence entry; the edit clock stands in.
+        let mut superseded = candidate(20, 5, now);
+        superseded.supersede("mem-new", stale);
+        assert_eq!(dream_verdict(&superseded, now), DreamVerdict::Archive);
+    }
+
+    /// A refutation is a question for the operator first. It only becomes a
+    /// retirement once a week has passed with nobody answering it.
+    #[test]
+    fn dream_leaves_a_fresh_refutation_for_the_operator() {
+        let now = 10_000 * 86_400;
+        let mut m = candidate(20, 5, now);
+        m.record_evidence(
+            "s-1",
+            EvidenceRelation::Contradicts,
+            "no",
+            now - (DREAM_REFUTED_FORGET_AGE_DAYS - 1) * 86_400,
+        );
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Keep);
+    }
+
+    /// A confirmation *after* the conflict is the ruling the window was waiting
+    /// for — the candidate goes back to being judged on support alone.
+    #[test]
+    fn dream_does_not_retire_a_refutation_a_confirmation_has_settled() {
+        let now = 10_000 * 86_400;
+        let mut m = candidate(0, 5, now);
+        m.record_evidence(
+            "s-1",
+            EvidenceRelation::Contradicts,
+            "no",
+            now - (DREAM_REFUTED_FORGET_AGE_DAYS + 1) * 86_400,
+        );
+        m.last_confirmed_at = Some(now - 86_400);
+        assert_eq!(m.unresolved_refutation_at(), None);
+        // Still not promoted — an outstanding contradiction count blocks that —
+        // but no longer on the refuted clock either.
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Keep);
     }
 
     /// The preview ordering has to put what is closest to promotion on top, or

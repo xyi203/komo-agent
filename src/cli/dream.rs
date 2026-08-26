@@ -2,9 +2,11 @@
 //! consolidation (the OpenClaw-borrowed back-loop).
 //!
 //! By default this is a **dry run**: it shows which candidate memories would be
-//! promoted (recalled often enough) or archived (old and gone cold), with
-//! the dreaming score that drove each verdict — like OpenClaw's `rem-harness` /
-//! `promote-explain`. Pass `--apply` to actually run one consolidation cycle
+//! promoted (corroborated on independent occasions, or explicitly confirmed) or
+//! archived (refuted and left unresolved, or old and gone cold), ordered by the
+//! dreaming score — like OpenClaw's `rem-harness` / `promote-explain`. The score
+//! ranks each bucket; it never decides a verdict.
+//! Pass `--apply` to actually run one consolidation cycle
 //! (the same `DreamSweep` the gateway runs on `dream_schedule`).
 //!
 //! Both preview and apply run through the operator surface — whichever
@@ -33,7 +35,7 @@ pub async fn run(control: &OperatorControl, apply: bool) -> anyhow::Result<()> {
         "promote → active (well-recalled candidates)",
         &report.promote,
     );
-    report_bucket("archive (old, gone cold)", &report.archive);
+    report_bucket("archive (refuted, or old and gone cold)", &report.archive);
 
     let observing = report.observing_count();
     if observing > 0 {

@@ -144,11 +144,13 @@ impl Maintenance for ReviewSweep {
 
 /// The "dreaming" consolidation sweep (OpenClaw's dreaming, adapted to komo's
 /// governance ladder). Runs on a low-frequency schedule (e.g. nightly `0 3 * * *`)
-/// and decides each candidate memory's fate purely from its accumulated usage:
-/// a candidate recalled often enough is promoted to active (and so becomes
-/// eligible for L3 recall going forward), while one that is old and never
-/// recalled is archived. **Importance is proven by use, not guessed at write
-/// time.** Only candidates are ever touched — user-saved/active memories are left
+/// and decides each candidate memory's fate from its accumulated evidence and
+/// usage: a candidate corroborated on independent occasions (or explicitly
+/// confirmed) is promoted to active, while one left refuted with nobody ruling
+/// on it, or simply old and never recalled, is archived. **Truth is proven by
+/// evidence and retention by use** — never the reverse, or a wrong memory
+/// promotes itself by being retrieved.
+/// Only candidates are ever touched — user-saved/active memories are left
 /// to the operator (`komo memory report`) — and nothing is ever auto-*pinned*:
 /// dreaming can promote into recall (L3) but never into the always-injected
 /// profile (L1), which stays a manual, confirmed-only path.
