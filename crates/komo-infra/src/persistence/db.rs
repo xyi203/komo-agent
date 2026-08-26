@@ -1750,6 +1750,8 @@ fn skill_from_record(record: SkillRecord) -> Skill {
         // declares neither key.
         platforms: Vec::new(),
         requires_tools: Vec::new(),
+        // Stamped when the import writes the file, not carried from the row.
+        updated_at: None,
     }
 }
 

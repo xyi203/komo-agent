@@ -138,19 +138,34 @@ pub struct DreamReport {
     /// CLI can still render the actionable buckets safely.
     #[serde(default)]
     pub candidate_count: usize,
+    /// Skill proposals this cycle would withdraw, by name — the other half of
+    /// dreaming's governance. Names only: a proposal's body is `komo skills
+    /// inspect`'s business, and the preview's job is to say what will move.
+    #[serde(default)]
+    pub expire_skills: Vec<String>,
+    /// Skill candidates awaiting triage, expiring or not — the denominator the
+    /// withdrawal count means nothing without.
+    #[serde(default)]
+    pub skill_candidate_count: usize,
 }
 
 impl DreamReport {
     /// Whether this cycle has any state transition to apply.
     pub fn has_actions(&self) -> bool {
-        !self.promote.is_empty() || !self.archive.is_empty()
+        !self.promote.is_empty() || !self.archive.is_empty() || !self.expire_skills.is_empty()
     }
 
-    /// Candidates that are neither ready to promote nor old and cold enough to
-    /// archive yet.
+    /// Memory candidates that are neither ready to promote nor old and cold
+    /// enough to archive yet.
     pub fn observing_count(&self) -> usize {
         self.candidate_count
             .saturating_sub(self.promote.len() + self.archive.len())
+    }
+
+    /// Skill proposals still inside their window, waiting on a human verdict.
+    pub fn skills_awaiting_count(&self) -> usize {
+        self.skill_candidate_count
+            .saturating_sub(self.expire_skills.len())
     }
 
     /// Backwards-compatible spelling for callers that mean “no state changes”,

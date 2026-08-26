@@ -53,6 +53,12 @@ impl DirectOperatorAdapter {
         }
     }
 
+    /// The governed skill store. A path holder, not a connection — nothing to
+    /// open, so it is built per use rather than cached like the databases.
+    pub(super) fn skills(&self) -> komo_infra::skills::FsSkillStore {
+        komo_infra::skills::FsSkillStore::new(self.urls.skills_root.clone())
+    }
+
     /// The session/run/pairing store (`state.db`), opened on first use.
     pub(super) async fn db(&self) -> anyhow::Result<&Arc<Db>> {
         self.db
@@ -176,9 +182,15 @@ impl DirectOperatorAdapter {
                 PairingRepository::list(self.db().await?.as_ref()).await?,
                 now(),
             )),
-            OperatorQuery::DreamPreview => OperatorQueryResult::DreamPreview(
-                actions::dream_classify(&self.memory().await?.list().await?, now()),
-            ),
+            OperatorQuery::DreamPreview => {
+                let at = now();
+                let mut report = actions::dream_classify(&self.memory().await?.list().await?, at);
+                let (expire_skills, skill_candidate_count) =
+                    actions::dream_classify_skills(&self.skills().list_candidates(), at);
+                report.expire_skills = expire_skills;
+                report.skill_candidate_count = skill_candidate_count;
+                OperatorQueryResult::DreamPreview(report)
+            }
             OperatorQuery::SkillAudit { name } => {
                 let steps = RunRepository::steps_by_tool(
                     self.db().await?.as_ref(),
@@ -206,12 +218,11 @@ impl DirectOperatorAdapter {
                     actions::AUDIT_SCAN_LIMIT,
                 )
                 .await?;
-                let names = komo_infra::skills::FsSkillStore::new(
-                    komo_infra::skills::FsSkillStore::default_root(),
-                )
-                .list_active()
-                .into_iter()
-                .map(|skill| skill.name);
+                let names = self
+                    .skills()
+                    .list_active()
+                    .into_iter()
+                    .map(|skill| skill.name);
                 let runs =
                     RunRepository::list(self.db().await?.as_ref(), actions::AUDIT_SCAN_LIMIT)
                         .await?;
@@ -291,12 +302,14 @@ impl DirectOperatorAdapter {
             OperatorCommand::DreamApply => {
                 let summary = komo_agent::daemon::DreamSweep {
                     memories: self.memory().await?.clone() as Arc<dyn MemoryRepository>,
+                    skills: Arc::new(self.skills()),
                 }
                 .apply()
                 .await?;
                 OperatorCommandResult::DreamApplied {
                     promoted: summary.memories_promoted,
                     archived: summary.memories_archived,
+                    skills_expired: summary.skill_candidates_expired,
                 }
             }
             // Backfill needs an embedder, which is assembled with the rest of

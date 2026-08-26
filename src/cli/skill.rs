@@ -82,6 +82,7 @@ pub fn list() -> anyhow::Result<()> {
     let active = managed.list_active();
     let candidates = managed.list_candidates();
     let archived = managed.list_archived();
+    let expired = managed.list_expired();
     let managed_names = active
         .iter()
         .map(|skill| skill.name.as_str())
@@ -94,7 +95,11 @@ pub fn list() -> anyhow::Result<()> {
         .filter(|skill| !managed_names.contains(skill.name.as_str()))
         .collect::<Vec<_>>();
 
-    if active.is_empty() && candidates.is_empty() && shared_skills.is_empty() && archived.is_empty()
+    if active.is_empty()
+        && candidates.is_empty()
+        && shared_skills.is_empty()
+        && archived.is_empty()
+        && expired.is_empty()
     {
         println!(
             "No skills in {} or ~/.agents/skills.",
@@ -132,6 +137,12 @@ pub fn list() -> anyhow::Result<()> {
     if !archived.is_empty() {
         println!("archived (`komo skills restore <name>`):");
         for skill in &archived {
+            println!("  {}  {}", skill.name, oneline(&skill.description, 80));
+        }
+    }
+    if !expired.is_empty() {
+        println!("withdrawn proposals (`komo skills restore <name>` to reconsider):");
+        for skill in &expired {
             println!("  {}  {}", skill.name, oneline(&skill.description, 80));
         }
     }
@@ -219,9 +230,23 @@ pub fn archive(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Move an archived skill back into the active catalog.
+/// Bring back a skill that was set aside — an archived one to the active
+/// catalog, a candidate dreaming withdrew back to triage.
+///
+/// One verb for both, dispatching on where the skill actually is: an expired
+/// proposal returns as a *candidate*, never as active, because nobody ever
+/// approved it.
 pub fn restore(name: &str) -> anyhow::Result<()> {
-    let skill = store().restore(name)?;
+    let managed = store();
+    if managed.find_expired(name).is_some() {
+        let skill = managed.unexpire(name)?;
+        println!(
+            "Restored `{}` to candidates — promote it with `komo skills promote {}`.",
+            skill.name, skill.name
+        );
+        return Ok(());
+    }
+    let skill = managed.restore(name)?;
     println!("Restored `{}` to active. {RELOAD_HINT}", skill.name);
     Ok(())
 }

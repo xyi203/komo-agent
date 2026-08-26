@@ -21,6 +21,10 @@
 //! - `.archive/<name>/` — an archived skill's whole tree. Archiving is the
 //!   heaviest thing the operator can do to an active skill and it is reversible
 //!   (`komo skills restore`); nothing in this store deletes an active skill.
+//! - `.expired/<name>/` — a candidate dreaming withdrew for want of a verdict.
+//!   Kept apart from `.archive/` on purpose: restoring one must return it to
+//!   `.candidates/`, never to the active catalog, or a proposal no human ever
+//!   approved would go live by way of a restore.
 //!
 //! The [`SkillRepository`] impl is the automated write path (the reflective
 //! reviewer): `save` only ever writes a candidate — it never touches an active
@@ -45,6 +49,8 @@ const CANDIDATES_DIR: &str = ".candidates";
 const HISTORY_DIR: &str = ".history";
 /// Directory (under the store root) holding archived skills.
 const ARCHIVE_DIR: &str = ".archive";
+/// Directory (under the store root) holding candidates dreaming withdrew.
+const EXPIRED_DIR: &str = ".expired";
 /// Marker file: the one-time import of legacy `komo.db` skills already ran.
 const DB_IMPORT_MARKER: &str = ".imported-from-db";
 
@@ -95,6 +101,10 @@ impl FsSkillStore {
         self.root.join(ARCHIVE_DIR)
     }
 
+    pub fn expired_root(&self) -> PathBuf {
+        self.root.join(EXPIRED_DIR)
+    }
+
     pub fn active_path(&self, name: &str) -> PathBuf {
         self.root.join(name).join("SKILL.md")
     }
@@ -105,6 +115,10 @@ impl FsSkillStore {
 
     pub fn archived_path(&self, name: &str) -> PathBuf {
         self.archive_root().join(name).join("SKILL.md")
+    }
+
+    pub fn expired_path(&self, name: &str) -> PathBuf {
+        self.expired_root().join(name).join("SKILL.md")
     }
 
     /// Rolled prior versions of a candidate (file names, oldest first) — the
@@ -136,9 +150,20 @@ impl FsSkillStore {
         scan_dir(&self.archive_root())
     }
 
+    /// Candidates dreaming withdrew — proposals that lapsed, still recoverable.
+    pub fn list_expired(&self) -> Vec<Skill> {
+        scan_dir(&self.expired_root())
+    }
+
     pub fn find_archived(&self, name: &str) -> Option<Skill> {
         valid_skill_name(name)
             .then(|| read_skill(&self.archived_path(name)))
+            .flatten()
+    }
+
+    pub fn find_expired(&self, name: &str) -> Option<Skill> {
+        valid_skill_name(name)
+            .then(|| read_skill(&self.expired_path(name)))
             .flatten()
     }
 
@@ -202,6 +227,51 @@ impl FsSkillStore {
         }
         fs::create_dir_all(self.archive_root())?;
         fs::rename(self.root.join(name), &dest)?;
+        Ok(skill)
+    }
+
+    /// Withdraw a lapsed candidate: move `.candidates/<name>/` aside to
+    /// `.expired/<name>/`. The dreaming counterpart of [`archive`](Self::archive),
+    /// and reversible the same way ([`unexpire`](Self::unexpire)) — a sweep that
+    /// runs unattended at 3am must not be able to destroy a proposal.
+    ///
+    /// Deliberately **not** `.archive/`: restoring from there lands a skill in
+    /// the active catalog, which would let a proposal no human ever approved go
+    /// live by way of a restore.
+    pub fn expire_candidate(&self, name: &str) -> anyhow::Result<Skill> {
+        let Some(skill) = self.find_candidate(name) else {
+            anyhow::bail!("no candidate skill named `{name}`");
+        };
+        let dest = self.expired_root().join(name);
+        if dest.exists() {
+            anyhow::bail!(
+                "`{name}` is already expired at {} — restore or remove that copy first",
+                dest.display()
+            );
+        }
+        fs::create_dir_all(self.expired_root())?;
+        fs::rename(self.candidates_root().join(name), &dest)?;
+        Ok(skill)
+    }
+
+    /// Bring a withdrawn candidate back for triage — to `.candidates/`, never
+    /// to the active catalog: it is still a proposal awaiting a verdict.
+    pub fn unexpire(&self, name: &str) -> anyhow::Result<Skill> {
+        let Some(skill) = self.find_expired(name) else {
+            anyhow::bail!("no expired candidate named `{name}`");
+        };
+        let dest = self.candidates_root().join(name);
+        if dest.exists() {
+            anyhow::bail!("a candidate named `{name}` already exists — promote or reject it first");
+        }
+        fs::create_dir_all(self.candidates_root())?;
+        fs::rename(self.expired_root().join(name), &dest)?;
+        // Restamp in place, or the restored proposal is still older than the
+        // expiry window and the next sweep withdraws it again the same night.
+        // Written directly rather than through `write_candidate`, which would
+        // roll the identical body into `.history/` and report a revision that
+        // never happened.
+        fs::write(self.candidate_path(name), render(&skill))?;
         Ok(skill)
     }
 
@@ -517,6 +587,7 @@ mod tests {
             source: SOURCE_REVIEWER.to_string(),
             platforms: Vec::new(),
             requires_tools: Vec::new(),
+            updated_at: None,
         }
     }
 
@@ -628,6 +699,101 @@ mod tests {
         assert!(store.find_active("sync-cal").is_some());
         assert!(store.list_archived().is_empty());
         assert!(store.root().join("sync-cal").join("notes.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn expiring_a_candidate_sets_it_aside_recoverably() {
+        let store = store("komo_skillstore_expire");
+        store.save(&skill("sync-cal")).await.unwrap();
+        fs::write(
+            store
+                .candidate_path("sync-cal")
+                .parent()
+                .unwrap()
+                .join("notes.md"),
+            "aside",
+        )
+        .unwrap();
+
+        store.expire_candidate("sync-cal").unwrap();
+        assert!(store.find_candidate("sync-cal").is_none());
+        assert!(store.list_candidates().is_empty());
+        assert_eq!(store.list_expired().len(), 1);
+
+        store.unexpire("sync-cal").unwrap();
+        assert!(store.find_candidate("sync-cal").is_some());
+        assert!(store.list_expired().is_empty());
+        assert!(
+            store
+                .candidate_path("sync-cal")
+                .parent()
+                .unwrap()
+                .join("notes.md")
+                .is_file(),
+            "the whole proposal tree comes back, not just SKILL.md"
+        );
+    }
+
+    /// A withdrawn proposal must never re-enter the catalog as an *active*
+    /// skill: nobody ever approved it. Restoring returns it to triage.
+    #[tokio::test]
+    async fn an_expired_candidate_comes_back_as_a_candidate_not_as_active() {
+        let store = store("komo_skillstore_expire_governance");
+        store.save(&skill("sync-cal")).await.unwrap();
+        store.expire_candidate("sync-cal").unwrap();
+
+        // It is not archived, so the active-catalog restore cannot reach it.
+        assert!(store.find_archived("sync-cal").is_none());
+        assert!(store.restore("sync-cal").is_err());
+
+        store.unexpire("sync-cal").unwrap();
+        assert!(store.find_active("sync-cal").is_none());
+        assert!(store.find_candidate("sync-cal").is_some());
+    }
+
+    /// Restoring restamps the proposal, or the next sweep withdraws it again
+    /// the same night and the operator can never get a look at it.
+    #[tokio::test]
+    async fn unexpire_restarts_the_expiry_clock() {
+        use komo_core::domain::skill::{SKILL_CANDIDATE_EXPIRY_DAYS, candidate_expired};
+
+        let store = store("komo_skillstore_expire_clock");
+        store.save(&skill("sync-cal")).await.unwrap();
+        // Backdate the proposal past the window, as a real lapsed one would be.
+        let stale =
+            time::OffsetDateTime::now_utc() - time::Duration::days(SKILL_CANDIDATE_EXPIRY_DAYS + 5);
+        let path = store.candidate_path("sync-cal");
+        let backdated = fs::read_to_string(&path).unwrap().replace(
+            &fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .find(|l| l.starts_with("updated_at:"))
+                .unwrap()
+                .to_string(),
+            &format!(
+                "updated_at: {}",
+                stale
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap()
+            ),
+        );
+        fs::write(&path, backdated).unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        assert!(candidate_expired(
+            &store.find_candidate("sync-cal").unwrap(),
+            now
+        ));
+
+        store.expire_candidate("sync-cal").unwrap();
+        store.unexpire("sync-cal").unwrap();
+        assert!(!candidate_expired(
+            &store.find_candidate("sync-cal").unwrap(),
+            now
+        ));
+        assert!(
+            store.candidate_history("sync-cal").is_empty(),
+            "restamping must not fabricate a revision in the proposal history"
+        );
     }
 
     #[tokio::test]

@@ -98,8 +98,12 @@ impl GatewayOperatorAdapter {
                 revoked: self.client.pair_revoke(&id).await?,
             },
             OperatorCommand::DreamApply => {
-                let (promoted, archived) = self.client.dream_apply().await?;
-                OperatorCommandResult::DreamApplied { promoted, archived }
+                let (promoted, archived, skills_expired) = self.client.dream_apply().await?;
+                OperatorCommandResult::DreamApplied {
+                    promoted,
+                    archived,
+                    skills_expired,
+                }
             }
             OperatorCommand::MemoryBackfill => OperatorCommandResult::MemoryBackfilled {
                 embedded: self.client.memory_backfill().await?,

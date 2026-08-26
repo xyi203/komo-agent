@@ -212,6 +212,10 @@ impl Reviewer for ReflectiveReviewer {
                     .as_ref()
                     .map(|s| s.requires_tools.clone())
                     .unwrap_or_default(),
+                // Stamped by the store on write: a re-proposal restarts the
+                // expiry clock, which is what makes a recurring pattern outlast
+                // a single unattended cycle.
+                updated_at: None,
             };
             // `save` writes a *candidate* (never an active skill) — automated
             // extraction goes through triage like memory candidates. A refused
@@ -719,6 +723,7 @@ mod tests {
             source: "user".to_string(),
             platforms: Vec::new(),
             requires_tools: Vec::new(),
+            updated_at: None,
         }
     }
 

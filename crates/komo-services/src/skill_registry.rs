@@ -289,6 +289,7 @@ mod tests {
             source: "user".into(),
             platforms: Vec::new(),
             requires_tools: Vec::new(),
+            updated_at: None,
         }]);
         assert_eq!(reg.get("fixed").unwrap().skill.instructions, "b");
         assert!(reg.catalog().contains("fixed"));
@@ -383,6 +384,7 @@ mod tests {
             source: "user".into(),
             platforms: Vec::new(),
             requires_tools: Vec::new(),
+            updated_at: None,
         }]);
         assert!(reg.is_empty());
         assert!(reg.catalog().is_empty());

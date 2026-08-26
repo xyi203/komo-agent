@@ -204,7 +204,8 @@ impl Plugin for CronJobsPlugin {
 }
 
 /// Dreaming — mounts only when `dream_schedule` is in effect. Reads the whole
-/// memory library, promotes well-supported candidates, archives cold ones.
+/// memory library, promotes well-supported candidates, archives cold and refuted
+/// ones, and withdraws skill proposals nobody ruled on.
 pub struct DreamPlugin;
 
 #[async_trait]
@@ -222,6 +223,7 @@ impl Plugin for DreamPlugin {
             schedule,
             maintenance: Arc::new(DreamSweep {
                 memories: cx.memories.clone(),
+                skills: cx.skill_store.clone(),
             }),
             alert: Some(cx.notifier.clone()),
         });

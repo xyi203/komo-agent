@@ -29,6 +29,17 @@ pub struct Skill {
     pub platforms: Vec<String>,
     #[serde(default)]
     pub requires_tools: Vec<String>,
+    /// When the store last wrote this file, as unix seconds — read back from the
+    /// `updated_at` frontmatter the renderer has always written. `None` for a
+    /// hand-written file that carries no such key.
+    ///
+    /// An observation of the file, not state the caller sets: every write stamps
+    /// it afresh. It exists because a skill *candidate* has no other clock —
+    /// nothing can load one (dot directories never enter the runtime's scan), so
+    /// there is no usage signal to age it by, only how long the proposal has been
+    /// sitting there. See [`candidate_expired`].
+    #[serde(default)]
+    pub updated_at: Option<i64>,
 }
 
 /// What this runtime can offer, for **offer-time** skill gating.
@@ -115,6 +126,7 @@ impl Skill {
         let mut source = default_source();
         let mut platforms = Vec::new();
         let mut requires_tools = Vec::new();
+        let mut updated_at = None;
         let lines: Vec<&str> = front.lines().collect();
         let mut cursor = 0;
         while let Some(line) = lines.get(cursor) {
@@ -133,6 +145,8 @@ impl Skill {
                 platforms = parse_list(v, &lines, &mut cursor);
             } else if let Some(v) = line.strip_prefix("requires_tools:") {
                 requires_tools = parse_list(v, &lines, &mut cursor);
+            } else if let Some(v) = line.strip_prefix("updated_at:") {
+                updated_at = parse_rfc3339(&unquote(v.trim()));
             }
         }
 
@@ -149,6 +163,7 @@ impl Skill {
             source,
             platforms,
             requires_tools,
+            updated_at,
         })
     }
 
@@ -200,6 +215,45 @@ fn parse_list(inline: &str, lines: &[&str], cursor: &mut usize) -> Vec<String> {
 
 fn unquote(s: &str) -> String {
     s.trim_matches(|c| c == '"' || c == '\'').to_string()
+}
+
+/// An RFC 3339 frontmatter stamp as unix seconds, or `None` when it does not
+/// parse — an unreadable date reads as "no date", which is what keeps a
+/// malformed stamp from being taken for the epoch and aging a skill out
+/// instantly.
+fn parse_rfc3339(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|t| t.timestamp())
+}
+
+// ── candidate expiry (the skill half of dreaming) ────────────────────────────
+
+/// How long a skill candidate waits for a human verdict before dreaming
+/// withdraws it.
+///
+/// Thirty days, matching a memory candidate's forget window: these are both
+/// proposals that lapse for want of a decision. Withdrawal is reversible — the
+/// files move aside, nothing is deleted — and a pattern that still holds will be
+/// proposed again by the next review that sees it, which is what makes lapsing
+/// the right default rather than keeping every proposal forever.
+pub const SKILL_CANDIDATE_EXPIRY_DAYS: i64 = 30;
+
+/// Whether a candidate has sat unanswered long enough to be withdrawn.
+///
+/// Age is the *only* signal available here, and deliberately so. A candidate
+/// cannot be loaded — dot directories never enter the runtime's skill scan — so
+/// unlike a memory candidate it accumulates no usage to be judged on. A skill
+/// candidate that is never promoted is never used, and the only thing its
+/// continued presence measures is how long nobody has triaged it.
+///
+/// A file with no readable `updated_at` never expires: absent evidence of age is
+/// not evidence of staleness, and a hand-written candidate should not vanish
+/// because it lacks a key the store happens to write.
+pub fn candidate_expired(skill: &Skill, now: i64) -> bool {
+    skill
+        .updated_at
+        .is_some_and(|at| (now - at).max(0) / 86_400 > SKILL_CANDIDATE_EXPIRY_DAYS)
 }
 
 #[cfg(test)]
@@ -298,6 +352,48 @@ mod tests {
     #[test]
     fn rejects_document_without_frontmatter() {
         assert!(Skill::parse("no frontmatter here").is_none());
+    }
+
+    #[test]
+    fn updated_at_is_read_back_from_the_stamp_the_store_writes() {
+        let doc = "---\nname: a\nupdated_at: 2026-07-04T14:45:42.136487Z\n---\nbody";
+        let skill = Skill::parse(doc).unwrap();
+        assert_eq!(skill.updated_at, Some(1783176342));
+
+        // A file the store never wrote, and one whose stamp is unreadable, both
+        // read as undated rather than as the epoch.
+        assert_eq!(
+            Skill::parse("---\nname: a\n---\nb").unwrap().updated_at,
+            None
+        );
+        assert_eq!(
+            Skill::parse("---\nname: a\nupdated_at: last tuesday\n---\nb")
+                .unwrap()
+                .updated_at,
+            None
+        );
+    }
+
+    #[test]
+    fn a_candidate_expires_only_once_it_is_older_than_the_window() {
+        let now = 10_000 * 86_400;
+        let dated = |days_ago: i64| Skill {
+            updated_at: Some(now - days_ago * 86_400),
+            ..Skill::parse("---\nname: a\n---\nbody").unwrap()
+        };
+        assert!(!candidate_expired(&dated(SKILL_CANDIDATE_EXPIRY_DAYS), now));
+        assert!(candidate_expired(
+            &dated(SKILL_CANDIDATE_EXPIRY_DAYS + 1),
+            now
+        ));
+    }
+
+    /// An undated file is not a stale one: without a stamp there is no age to
+    /// judge, so it stays until a human rules on it.
+    #[test]
+    fn an_undated_candidate_never_expires() {
+        let skill = Skill::parse("---\nname: a\n---\nbody").unwrap();
+        assert!(!candidate_expired(&skill, 10_000 * 86_400));
     }
 
     #[test]

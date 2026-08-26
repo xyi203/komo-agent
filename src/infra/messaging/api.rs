@@ -1400,12 +1400,14 @@ async fn pair_revoke(
 async fn dream_apply(State(state): State<AppState>) -> Result<Response, ApiError> {
     let summary = DreamSweep {
         memories: state.actions.memories.clone(),
+        skills: state.actions.skills.clone(),
     }
     .apply()
     .await?;
     Ok(Json(json!({
         "promoted": summary.memories_promoted,
         "archived": summary.memories_archived,
+        "skills_expired": summary.skill_candidates_expired,
     }))
     .into_response())
 }

@@ -145,6 +145,8 @@ pub enum OperatorCommandResult {
     DreamApplied {
         promoted: usize,
         archived: usize,
+        /// Skill proposals withdrawn for want of a verdict.
+        skills_expired: usize,
     },
     /// How many memories were widened to `Global`.
     MemoryScopesRepaired {

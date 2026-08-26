@@ -95,7 +95,10 @@ pub struct OperatorActions {
     pub memories: Arc<dyn MemoryRepository>,
     pub runs: Arc<dyn RunRepository>,
     pub reminders: Arc<dyn ReminderRepository>,
-    pub skills: Arc<dyn SkillRepository>,
+    /// The concrete store, not `SkillRepository`: that trait carries only the
+    /// automated write path (find/list/save), while every governance transition
+    /// — promote, archive, expire — is an inherent method on the store.
+    pub skills: Arc<komo_infra::skills::FsSkillStore>,
     pub pairings: Arc<dyn PairingRepository>,
     pub home: Arc<dyn HomeRepository>,
     pub cron_jobs: Arc<dyn CronJobRepository>,
@@ -373,7 +376,13 @@ impl OperatorActions {
     }
 
     pub async fn dream_preview(&self) -> anyhow::Result<DreamReport> {
-        Ok(dream_classify(&self.memories.list().await?, now()))
+        let now = now();
+        let mut report = dream_classify(&self.memories.list().await?, now);
+        let (expire_skills, skill_candidate_count) =
+            dream_classify_skills(&self.skills.list_candidates(), now);
+        report.expire_skills = expire_skills;
+        report.skill_candidate_count = skill_candidate_count;
+        Ok(report)
     }
 
     pub async fn home_override(&self) -> anyhow::Result<Option<String>> {
@@ -689,6 +698,21 @@ pub fn skill_usage(
 /// Classify the memory library into the dreaming dry-run report: which
 /// candidates would promote (strongest case first) and which would archive.
 /// The same `dream_verdict` the sweep applies — this only *previews* it.
+/// The skill half of the preview: which proposals this cycle would withdraw,
+/// and how many are waiting on a verdict at all.
+pub fn dream_classify_skills(
+    candidates: &[komo_core::domain::skill::Skill],
+    now: i64,
+) -> (Vec<String>, usize) {
+    use komo_core::domain::skill::candidate_expired;
+    let expiring = candidates
+        .iter()
+        .filter(|skill| candidate_expired(skill, now))
+        .map(|skill| skill.name.clone())
+        .collect();
+    (expiring, candidates.len())
+}
+
 pub fn dream_classify(memories: &[Memory], now: i64) -> DreamReport {
     let mut report = DreamReport::default();
     for m in memories {

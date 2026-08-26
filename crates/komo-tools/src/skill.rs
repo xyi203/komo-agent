@@ -156,6 +156,8 @@ impl Tool for SkillTool {
                     // skill is worth advertising, not something to infer from a turn.
                     platforms: Vec::new(),
                     requires_tools: Vec::new(),
+                    // Stamped by the store on write, not carried in.
+                    updated_at: None,
                 };
                 // `save` writes a *candidate* (never an active skill): the same
                 // triage ladder as the reviewer, and it refuses a protected
@@ -274,6 +276,7 @@ mod tests {
             source: "user".to_string(),
             platforms: Vec::new(),
             requires_tools: Vec::new(),
+            updated_at: None,
         }]))
     }
 
@@ -324,6 +327,7 @@ mod tests {
                 source: "user".to_string(),
                 platforms: Vec::new(),
                 requires_tools: Vec::new(),
+                updated_at: None,
             }])),
             store("disabled"),
         );
@@ -510,6 +514,7 @@ mod tests {
                 source: komo_core::domain::skill::SOURCE_LEARNED.to_string(),
                 platforms: Vec::new(),
                 requires_tools: Vec::new(),
+                updated_at: None,
             })
             .await
             .unwrap();
