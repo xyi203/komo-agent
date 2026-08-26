@@ -30,7 +30,7 @@ komo dream [--apply]               # evidence-driven candidate consolidation (pr
 komo cron list|add|add-agent [--workspace DIR] [--grant c:m:v]|run|enable|disable|remove
 komo run list|inspect|resume|rollback|prune   # run ledger (⟲ = recoverable)
 komo skills list|install|inspect|promote|reject|protect|unprotect|enable|disable
-komo skills archive|restore            # retire an active skill / bring it back
+komo skills archive|restore            # retire an active skill / bring back an archived or withdrawn one
 komo skills audit [name]               # one skill's loads, or all ranked coldest-first
 komo policy list|check|saved       # permission policy: config rules + job grants + saved grants
 komo journey                       # learning timeline (memories + skills)
@@ -446,6 +446,13 @@ call the same functions, which is what keeps validation from forking.
   retention only the second (30-day-cold candidates archive). Deciding promotion on
   recall — as it once did — lets a wrong memory confirm itself by being retrieved:
   the thing retrieved is not the thing tested.
+  **Refutation is not symmetric with support.** Support has to accumulate across
+  independent occasions to promote; a candidate carrying an unresolved
+  contradiction (`unresolved_refutation_at` — a conflict with no confirmation
+  after it) is archived once nobody has ruled on it for
+  `DREAM_REFUTED_FORGET_AGE_DAYS`, *regardless* of how warm retrieval keeps it.
+  It can never promote anyway, so warmth would only keep a claim the user spoke
+  against occupying a recall slot in every search about it.
   **`BeliefState` is a separate column from `status`**, not a new status value.
   Status is the triage pipeline every operator surface is built on; belief is
   `current` / `contested` / `superseded`, and only `current` may be injected
@@ -558,10 +565,20 @@ call the same functions, which is what keeps validation from forking.
   only by crash reconciliation, cleared at-most-once, never auto-resumed.
 - `domain/skill.rs` + `komo-infra`'s `skills` + `services/skill_registry.rs` —
   skills are `SKILL.md` files under `~/.komo/skills/` (active), `.candidates/`
-  (proposals), and `.archive/` (retired — `komo skills archive|restore`; nothing
-  here ever deletes an active skill). Automated writes (`save` — reviewer +
+  (proposals), `.archive/` (retired — `komo skills archive|restore`; nothing
+  here ever deletes an active skill), and `.expired/` (proposals dreaming
+  withdrew). Automated writes (`save` — reviewer +
   `skill learn`) only ever produce candidates; `install` is the human-in-the-loop
   exception that lands active. `protected` skills refuse even proposals.
+  A candidate nobody rules on within `SKILL_CANDIDATE_EXPIRY_DAYS` is withdrawn
+  by the dream sweep. **Age is the only signal there is** — a candidate cannot
+  be loaded (dot dirs never enter the registry's scan), so unlike a memory
+  candidate it accrues no usage to be judged on, and its clock is the
+  `updated_at` frontmatter the renderer has always written. `.expired/` is kept
+  apart from `.archive/` because `restore` dispatches on where a skill sits:
+  archived → active, expired → **candidate**, never active — a proposal no human
+  approved must not go live by way of a restore. Restoring restamps the file, or
+  the next night's sweep withdraws it again before anyone can look.
   A `promote` that overwrites an active body rolls the old one into
   `.history/<name>/` — the automated path proposes *whole* bodies, so the
   overwrite has to be recoverable. `SkillRegistry` re-scans dirs on every query
@@ -595,7 +612,9 @@ call the same functions, which is what keeps validation from forking.
   tool-less `complete` on error; stamps a per-day watermark
   (`BriefingMarkRepository`, state.db settings) so a gateway restarted across
   today's slot catches up once at startup — `briefing_catchup_due`, same
-  "asleep over a slot → run late, once" rule as cron jobs), `DreamSweep`.
+  "asleep over a slot → run late, once" rule as cron jobs), `DreamSweep` (one
+  governance cycle over both candidate pools — memories promote/archive by
+  evidence, skill proposals lapse by age — previewed together by `komo dream`).
   `WorkdayGated` decorator gates a sweep to Chinese working days
   (`komo-infra`'s `workday`, cached per-year).
 - `komo-agent`'s `gateway` + `interaction` — gateway hosts channels +
