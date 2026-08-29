@@ -17,9 +17,16 @@ export function fmtAgo(ts: number): string {
   return `${Math.floor(months / 12)} 年前`;
 }
 
-/** UTC `MM-DD HH:MM` from unix seconds. */
+/** Local `MM-DD HH:MM` from unix seconds.
+ *
+ *  Local, not UTC: every caller renders a wall-clock moment the operator lived
+ *  through — when a session was opened, when a run started, when a task is due.
+ *  Read east of Greenwich a UTC clock is wrong by the offset and, past the
+ *  offset each evening, wrong about the *day* too, which reads as a stale list
+ *  rather than a timezone. `fmtAgo` above has always measured in local elapsed
+ *  time; this is the same clock. */
 export function fmtTs(ts: number): string {
   const d = new Date(ts * 1000);
   const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
