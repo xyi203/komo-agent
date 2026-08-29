@@ -555,6 +555,13 @@ pub async fn resolve_resume(runs: &dyn RunRepository, id: &str) -> anyhow::Resul
 }
 
 /// Summaries only — a list view never dumps full transcripts.
+///
+/// `title` is the session's *display* title (`Session::display_title`), not the
+/// stored one: a conversation nobody renamed is named by its opening message
+/// here, on read. Deriving rather than storing is what makes every session that
+/// already exists readable with no backfill and no write path to fail — and it
+/// keeps `Session::title` meaning exactly what its doc says, a name a person
+/// chose, which is also why a rename still wins.
 pub fn session_summaries(sessions: Vec<Session>) -> Vec<SessionSummary> {
     sessions
         .into_iter()
@@ -570,7 +577,7 @@ pub fn session_summaries(sessions: Vec<Session>) -> Vec<SessionSummary> {
             created_at: s.created_at,
             messages: s.messages.len(),
             user_turns: s.user_turns(),
-            title: s.title,
+            title: s.display_title(),
             status: s.status,
             id: s.id,
             workspace: s.workspace,
@@ -881,6 +888,34 @@ mod tests {
         ]);
         let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["api:real", "api:archived"]);
+    }
+
+    #[test]
+    fn an_unnamed_session_is_named_by_its_opening_message() {
+        let mut s = session("api:019fdfc7-f1df-7610-9abc-0123456789ab", "active");
+        s.messages
+            .push(Message::user("帮我查一下这个订单为什么下单失败"));
+        s.messages.push(Message::assistant("好的。"));
+        let rows = session_summaries(vec![s]);
+        assert_eq!(rows[0].title, "帮我查一下这个订单为什么下单失败");
+    }
+
+    #[test]
+    fn a_rename_beats_the_derived_name() {
+        let mut s = session("api:019fdfc7-f1df-7610-9abc-0123456789ab", "active");
+        s.title = "订单排查".into();
+        s.messages
+            .push(Message::user("帮我查一下这个订单为什么下单失败"));
+        let rows = session_summaries(vec![s]);
+        assert_eq!(rows[0].title, "订单排查");
+    }
+
+    #[test]
+    fn a_session_with_nothing_to_go_on_stays_unnamed() {
+        // The client falls back to something id- or time-based; an empty title
+        // is how it is told to.
+        let rows = session_summaries(vec![session("api:019fdfc7-f1df-7610-9abc-0", "active")]);
+        assert_eq!(rows[0].title, "");
     }
 
     #[test]

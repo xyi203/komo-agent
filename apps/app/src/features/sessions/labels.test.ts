@@ -28,4 +28,11 @@ describe("sessionLabel", () => {
   it("elides a long foreign id", () => {
     expect(sessionLabel(`telegram:${"9".repeat(40)}`)).toBe("telegram:99999999999…");
   });
+
+  it("has nothing to say about a bare uuid", () => {
+    // The common case, and the reason this returns null: the row headlines the
+    // time instead.
+    expect(sessionLabel("api:019fdfc7-f1df-7610-9abc-0123456789ab")).toBeNull();
+    expect(sessionLabel("0b7a6530-c869-4531-b0de-0123456789ab")).toBeNull();
+  });
 });

@@ -29,9 +29,9 @@ import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/shared/
 import { fetchSessions, renameSession, setSessionStatus } from "./api";
 import { DEFAULT_WORKSPACE, groupByWorkspace } from "./grouping";
 import { sessionLabel } from "./labels";
-import { fetchWorkspaces } from "@/features/workspaces/api";
+import { useWorkspaceCatalog } from "@/features/workspaces/use-catalog";
 
-const ROW = "group flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 transition-colors";
+const ROW = "group flex w-full items-center rounded-md px-2.5 py-1.5 transition-colors";
 
 export function SessionList({
   mobileOpen,
@@ -52,7 +52,6 @@ export function SessionList({
   const openSession = useAppStore((s) => s.openSession);
   const startNewSession = useAppStore((s) => s.startNewSession);
   const setModelChoice = useAppStore((s) => s.setModelChoice);
-  const pickedWorkspaces = useAppStore((s) => s.pickedWorkspaces);
   const qc = useQueryClient();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -66,14 +65,7 @@ export function SessionList({
     enabled: connected,
   });
   const sessions = query.data ?? [];
-  const workspacesQuery = useQuery({
-    queryKey: qk.workspaces,
-    queryFn: fetchWorkspaces,
-    enabled: connected,
-  });
-  const workspaces = [...(workspacesQuery.data ?? []), ...Object.values(pickedWorkspaces)].filter(
-    (item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index,
-  );
+  const { workspaces } = useWorkspaceCatalog();
 
   const invalidate = () => void qc.invalidateQueries({ queryKey: qk.sessions });
 
@@ -131,7 +123,14 @@ export function SessionList({
   const renderRow = (item: SessionSummary) => {
     const isOpen = item.id === session;
     const isArchived = item.status === "archive";
-    const label = item.title?.trim() ? item.title : sessionLabel(item.id);
+    // One line, and it is whatever names the conversation: the title — which
+    // the gateway now derives from the opening message for anything nobody
+    // renamed — else a name the id carries (`homeassistant:events`), else the
+    // time it was opened. A row earns its second line by saying something the
+    // first cannot, and "1 轮 · 08-08 13:10" never did; dropping it roughly
+    // doubles how many conversations are reachable without scrolling.
+    const name = item.title?.trim() || sessionLabel(item.id);
+    const headline = name ?? fmtTs(item.created_at);
     const tint = isOpen
       ? "bg-primary/10 ring-1 ring-primary/20"
       : "hover:bg-sidebar-accent hover:text-sidebar-accent-foreground";
@@ -148,7 +147,7 @@ export function SessionList({
               else if (e.key === "Escape") setEditingId(null);
             }}
             onBlur={() => commitRename(item.id)}
-            className="h-7 text-sm"
+            className="h-7 flex-1 text-sm"
           />
         </div>
       );
@@ -156,7 +155,7 @@ export function SessionList({
 
     return (
       <div key={item.id} className={cn(ROW, tint)}>
-        <div className="flex items-center gap-1">
+        <div className="flex min-w-0 flex-1 items-center gap-1">
           <button
             type="button"
             className="min-w-0 flex-1 text-left"
@@ -165,11 +164,13 @@ export function SessionList({
               onViewChange("chat");
               onMobileOpenChange(false);
             }}
-            title={item.id}
+            // The row truncates in CSS, so the tooltip carries the whole
+            // headline as well as the id — which stays the thing you copy to
+            // reach the conversation from `komo run` or the ledger.
+            title={`${headline}\n${item.id}`}
           >
-            <span className="block truncate text-sm">{label}</span>
-            <span className="text-xs text-muted-foreground">
-              {item.user_turns} 轮 · {fmtTs(item.created_at)}
+            <span className={cn("block truncate text-sm", !name && "tabular-nums")}>
+              {headline}
             </span>
           </button>
           <div className="flex shrink-0 gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
