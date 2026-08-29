@@ -2,15 +2,9 @@
 // imports the store, and the store touches the DOM) so it stays unit-testable.
 
 import type { SessionSummary, WorkspaceInfo } from "@/shared/types";
+import { DEFAULT_WORKSPACE, workspaceLabel } from "@/shared/lib/workspace";
 
-export const DEFAULT_WORKSPACE = "__default__";
-
-export function workspaceLabel(id: string, workspaces: WorkspaceInfo[]): string {
-  return (
-    workspaces.find((workspace) => workspace.id === id)?.name ??
-    (id === DEFAULT_WORKSPACE ? "默认 workspace" : id)
-  );
-}
+export { DEFAULT_WORKSPACE };
 
 export interface WorkspaceGroup {
   workspace: string;

@@ -1,12 +1,10 @@
-import { useQuery } from "@tanstack/react-query";
 import { FolderIcon } from "lucide-react";
 
-import { qk } from "@/shared/api/query-keys";
 import { getFolderPicker } from "@/shared/api/runtime";
-import { useConnection } from "@/shared/api/use-connection";
 import { useAppStore } from "@/shared/store";
+import { workspaceLabel, workspacePath } from "@/shared/lib/workspace";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/select";
-import { fetchWorkspaces } from "./api";
+import { useWorkspaceCatalog } from "./use-catalog";
 
 /** Sentinel value for the "pick a folder" row — never a workspace id. */
 const CHOOSE_FOLDER = "__choose_folder__";
@@ -37,23 +35,12 @@ export function WorkspacePicker({
    *  interactive-looking picker here would promise something it can't do. */
   locked?: boolean;
 }) {
-  const { connected } = useConnection();
   const addWorkspace = useAppStore((s) => s.addWorkspace);
-  const picked = useAppStore((s) => s.pickedWorkspaces);
   const chooseFolder = getFolderPicker();
-  const query = useQuery({
-    queryKey: qk.workspaces,
-    queryFn: fetchWorkspaces,
-    enabled: connected,
-  });
-  // The catalog wins on a collision: a folder picked earlier that has since
-  // appeared under the gateway's workspace home should read as the catalog entry.
-  const items = [...(query.data ?? []), ...Object.values(picked)].filter(
-    (item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index,
-  );
+  const { workspaces: items, isPending } = useWorkspaceCatalog();
   const current = items.find((item) => item.id === workspace);
-  const currentLabel =
-    current?.name ?? (workspace === "__default__" ? "默认 workspace" : workspace);
+  const currentLabel = workspaceLabel(workspace, items);
+  const currentPath = workspacePath(workspace, items);
   // Base UI deliberately renders a SelectValue's raw value unless the root is
   // given an item catalogue. Folder ids are base64url-encoded paths, so showing
   // the raw value makes a selected folder look like garbled text.
@@ -76,7 +63,7 @@ export function WorkspacePicker({
     return (
       <span
         className="inline-flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground"
-        title={current?.path ? `${currentLabel} · ${current.path}` : currentLabel}
+        title={currentPath ? `${currentLabel} · ${currentPath}` : currentLabel}
       >
         <FolderIcon className="size-3.5 shrink-0" />
         <span className="truncate">{currentLabel}</span>
@@ -102,7 +89,7 @@ export function WorkspacePicker({
         <FolderIcon className="size-4" />
         <SelectValue
           className="min-w-0"
-          placeholder={query.isPending ? "加载 workspace…" : "选择 workspace"}
+          placeholder={isPending ? "加载 workspace…" : "选择 workspace"}
         />
       </SelectTrigger>
       <SelectContent>

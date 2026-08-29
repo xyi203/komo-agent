@@ -2,12 +2,14 @@ import { useEffect, useState } from "react";
 import { FolderIcon, MoonIcon, PanelLeftIcon, PlugZapIcon, SunIcon } from "lucide-react";
 
 import { useConnection } from "@/shared/api/use-connection";
+import { workspaceLabel, workspacePath } from "@/shared/lib/workspace";
 import { useAppStore, useTheme } from "@/shared/store";
 import { Button } from "@/shared/ui/button";
 import { ChatView } from "@/features/chat/ChatView";
 import { MemoryCanopy } from "@/features/memory/MemoryCanopy";
 import { SessionList } from "@/features/sessions/SessionList";
 import { SettingsModal } from "@/features/settings/SettingsModal";
+import { useWorkspaceCatalog } from "@/features/workspaces/use-catalog";
 
 export function App() {
   const connection = useConnection();
@@ -15,6 +17,9 @@ export function App() {
   const workspace = useAppStore((s) => s.workspace);
   const theme = useTheme();
   const toggleTheme = useAppStore((s) => s.toggleTheme);
+  // The same name the sidebar's group header and the composer's picker show —
+  // a raw `__default__` or a base64 `folder:` id here contradicted both.
+  const { workspaces } = useWorkspaceCatalog();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [view, setView] = useState<"chat" | "memory">("chat");
@@ -64,8 +69,11 @@ export function App() {
               <>
                 <span className="h-3.5 w-px bg-border" aria-hidden="true" />
                 <FolderIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
-                <span className="truncate text-xs text-muted-foreground" title={workspace}>
-                  {workspace}
+                <span
+                  className="truncate text-xs text-muted-foreground"
+                  title={workspacePath(workspace, workspaces) ?? workspace}
+                >
+                  {workspaceLabel(workspace, workspaces)}
                 </span>
               </>
             )}

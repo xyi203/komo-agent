@@ -34,12 +34,18 @@ describe("groupByWorkspace", () => {
     expect(groups.map((g) => g.workspace)).toEqual(["notes", "__default__"]);
   });
 
-  it("labels a workspace by its catalog name, falling back to the raw id", () => {
+  it("labels a workspace by its catalog name, and an unlisted folder by its directory", () => {
+    // `L2Zvby9iYXI` decodes to "/foo/bar", so the group reads as "bar". `Zm9v`
+    // decodes to "foo" — not an absolute path, so the id stays opaque.
     const groups = groupByWorkspace(
-      [session("a", "__default__", 2), session("b", "folder:Zm9v", 1)],
+      [
+        session("a", "__default__", 3),
+        session("b", "folder:L2Zvby9iYXI", 2),
+        session("c", "folder:Zm9v", 1),
+      ],
       workspaces,
     );
-    expect(groups.map((g) => g.label)).toEqual(["komo", "folder:Zm9v"]);
+    expect(groups.map((g) => g.label)).toEqual(["komo", "bar", "folder:Zm9v"]);
   });
 
   it("treats a session from a pre-workspace gateway as the default", () => {
