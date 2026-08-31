@@ -6,8 +6,8 @@ use toasty_driver_turso::Turso;
 use tracing::info;
 
 use crate::persistence::{
-    DEFAULT_POOL_SIZE, ensure_columns, ensure_table, message_log::MessageLog, prepare_turso_path,
-    turso_marker_path, with_write_retry,
+    DEFAULT_POOL_SIZE, drop_retired_columns, ensure_columns, ensure_table,
+    message_log::MessageLog, prepare_turso_path, turso_marker_path, with_write_retry,
 };
 
 use komo_core::domain::{
@@ -377,6 +377,14 @@ impl Db {
                 ("effort", "\"effort\" text NOT NULL DEFAULT ''"),
             ];
             ensure_columns(p, "session_records", SESSION_COLUMNS).await?;
+            // Columns this komo no longer models. `reviewed_through` was the
+            // review sweep's per-session watermark until the watermark moved to
+            // `Run.learned` — but dropping it from the model left it in every
+            // file whose push_schema ran while it existed, `NOT NULL` and with
+            // no default, so creating any new session failed the constraint.
+            // Same repair as memory.db's `recall_query_hashes`.
+            const SESSION_RETIRED: &[&str] = &["reviewed_through"];
+            drop_retired_columns(p, "session_records", SESSION_RETIRED).await?;
             const MESSAGE_COLUMNS: &[(&str, &str)] =
                 &[("tool_note", "\"tool_note\" text NOT NULL DEFAULT ''")];
             ensure_columns(p, "message_records", MESSAGE_COLUMNS).await?;
@@ -3002,6 +3010,76 @@ mod tests {
             .find(|m| m.content == "done")
             .expect("the note-bearing message round-trips");
         assert!(saved.tool_note.contains("read foo"));
+    }
+
+    /// A state.db whose `push_schema` ran while `reviewed_through` was still a
+    /// model field carries the column `NOT NULL` with no default — so once the
+    /// field left the model, every new-session insert failed the constraint.
+    /// Connect must drop the retired column in place and accept writes again.
+    #[tokio::test]
+    async fn drops_retired_reviewed_through_column_in_place() {
+        let home = std::env::temp_dir().join("komo-test-db-dropcol");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        let path = home.join("state.db");
+
+        // Seed the shape push_schema wrote in the reviewed_through era: the
+        // watermark column NOT NULL and defaultless, beside a live session.
+        {
+            let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+            conn.execute(
+                "CREATE TABLE \"session_records\" (\
+                 \"id\" TEXT NOT NULL, \"created_at\" BIGINT NOT NULL, \
+                 \"reviewed_through\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE \"message_records\" (\
+                 \"id\" TEXT NOT NULL, \"session_id\" TEXT NOT NULL, \"role\" TEXT NOT NULL, \
+                 \"content\" TEXT NOT NULL, \"timestamp\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO \"session_records\" VALUES ('cli:old', 100, 3)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
+
+        let db = Db::connect(&format!("turso:{}", path.display()))
+            .await
+            .unwrap();
+
+        // The pre-existing session survives the drop…
+        assert!(
+            SessionRepository::find(&db, "cli:old")
+                .await
+                .unwrap()
+                .is_some(),
+            "pre-migration session survives the column drop"
+        );
+        // …and the store accepts new sessions again, which is exactly what the
+        // leftover NOT NULL column used to fail.
+        SessionRepository::save(&db, &Session::new("cli:new"))
+            .await
+            .expect("a new session inserts once the retired column is gone");
+        assert!(
+            SessionRepository::find(&db, "cli:new")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// A state.db created before `recoverable` existed must gain the column
