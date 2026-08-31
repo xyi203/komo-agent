@@ -21,7 +21,7 @@ use komo_core::domain::checkpoint::CheckpointStore;
 use komo_core::domain::embedding::EmbeddingClient;
 use komo_core::domain::skill::SkillOffer;
 use komo_core::domain::turn_journal::TurnJournalRepository;
-use komo_infra::embedding::OllamaEmbedder;
+use komo_infra::embedding::{GatedEmbedder, OllamaEmbedder};
 use komo_infra::memory::memory_db::MemoryDb;
 use komo_infra::permissions_store::PermissionsStore;
 use komo_infra::persistence::{db::Db, kanban::KanbanDb};
@@ -78,12 +78,6 @@ pub struct Wiring {
     pub wiki: Option<crate::services::operator_control::actions::WikiOps>,
 }
 
-/// Construct the memory embedding backend, or `None` when it is unconfigured
-/// or unreachable.
-///
-/// Probed once here rather than trusted, because the failure is otherwise
-/// invisible: an unreachable daemon would silently drop recall back to lexical
-/// matching every turn, which looks exactly like "memory just doesn't work".
 /// What distinguishes one runtime from another.
 ///
 /// Five runtimes exist — interactive, delegate, cron, briefing, and the
@@ -163,7 +157,15 @@ impl RuntimeParts<'_> {
 
 /// A warning, never a fatal — the same call komo makes for a missing model key
 /// or a token-less HA channel. Recall keeps working without it.
-pub(crate) async fn build_embedder(
+///
+/// The probe runs in the background, not here: awaiting it held the first TUI
+/// frame hostage to Ollama's cold model load (seconds), and its verdict is a
+/// diagnostic plus a kill switch, never a precondition — every embed caller
+/// already degrades to lexical on failure. A failed probe closes the
+/// [`GatedEmbedder`]'s gate so later calls fail instantly instead of re-paying
+/// a network timeout per turn; a successful one doubles as a model warm-up, so
+/// the first recall of the session usually hits a resident model.
+pub(crate) fn build_embedder(
     config: Option<&komo_config::EmbeddingConfig>,
 ) -> Option<Arc<dyn EmbeddingClient>> {
     let config = config?;
@@ -174,17 +176,21 @@ pub(crate) async fn build_embedder(
             return None;
         }
     };
-    if let Err(error) = embedder.probe().await {
-        tracing::warn!(
-            %error,
-            url = %config.url,
-            model = %config.model,
-            "memory embedding backend unreachable — recall stays lexical"
-        );
-        return None;
-    }
-    tracing::info!(model = %config.model, "memory embedding backend ready");
-    Some(Arc::new(embedder))
+    let gated = Arc::new(GatedEmbedder::new(embedder));
+    let probe = gated.clone();
+    let (url, model) = (config.url.clone(), config.model.clone());
+    tokio::spawn(async move {
+        match probe.probe().await {
+            Ok(()) => tracing::info!(model = %model, "memory embedding backend ready"),
+            Err(error) => tracing::warn!(
+                %error,
+                url = %url,
+                model = %model,
+                "memory embedding backend unreachable — recall stays lexical"
+            ),
+        }
+    });
+    Some(gated)
 }
 
 /// Build the agent against `db` (sessions/messages/etc.), `kanban` (durable
@@ -336,10 +342,10 @@ pub async fn build(
     // the enricher's automatic recall — that sharing is the point: a model handed
     // a memory unprompted must be able to find the same memory by asking. Built
     // before the tool set because the tool holds it.
-    // Probed once and shared: the same backend serves memory recall and the
-    // episodic index over transcripts, and probing it twice would just be two
-    // round-trips to the same Ollama.
-    let embedder = build_embedder(config.runtime.embedding.as_ref()).await;
+    // Built once and shared: the same backend serves memory recall and the
+    // episodic index over transcripts, and its background probe (see
+    // `build_embedder`) then covers both.
+    let embedder = build_embedder(config.runtime.embedding.as_ref());
     let mut memory_query =
         komo_services::memory_query::MemoryQueryService::new(memory_repo.clone());
     if let Some(embedder) = &embedder {
