@@ -6,8 +6,8 @@ use toasty_driver_turso::Turso;
 use tracing::info;
 
 use crate::persistence::{
-    DEFAULT_POOL_SIZE, drop_retired_columns, ensure_columns, ensure_table,
-    message_log::MessageLog, prepare_turso_path, turso_marker_path, with_write_retry,
+    DEFAULT_POOL_SIZE, drop_retired_columns, ensure_columns, ensure_table, message_log::MessageLog,
+    prepare_turso_path, turso_marker_path, with_write_retry,
 };
 
 use komo_core::domain::{
