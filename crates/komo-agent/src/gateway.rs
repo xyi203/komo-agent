@@ -192,8 +192,8 @@ impl Gateway {
         // from blocking shutdown.
         if let Some(notice) = &shutdown_notice {
             let send = notice.notify(
-                "⚠️ Komo 已下线",
-                "网关正在停止，暂时无法响应消息，稍后回来。",
+                "⚠️ Gateway shutting down — Your current task will be interrupted.",
+                "",
             );
             match tokio::time::timeout(SHUTDOWN_NOTICE_TIMEOUT, send).await {
                 Ok(Ok(())) => info!("sent shutdown notice to home channel"),
