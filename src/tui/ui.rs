@@ -171,7 +171,24 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
-    let status = if app.in_flight && app.awaiting_answer {
+    let status = if app.connecting {
+        // The UI paints before the backend finishes booting; say so instead of
+        // claiming 就绪, and tell the user their draft is not lost.
+        Line::from(vec![
+            Span::styled(
+                format!(" {} 正在启动后端… ", SPINNER[app.spinner % SPINNER.len()]),
+                Style::new().fg(Color::Yellow),
+            ),
+            Span::styled(
+                if app.in_flight {
+                    "消息已排队，就绪后自动发送 · Esc 取消"
+                } else {
+                    "可以先输入，Enter 会排队发送"
+                },
+                Style::new().fg(Color::DarkGray),
+            ),
+        ])
+    } else if app.in_flight && app.awaiting_answer {
         Line::from(vec![
             Span::styled(
                 " ❓ 等待你的回答 — 直接输入并回车 ",
@@ -741,6 +758,30 @@ mod tests {
             !content.contains("gamma"),
             "the folded content stays off screen"
         );
+    }
+
+    /// While the backend boots, the status line says so instead of claiming
+    /// 就绪 — and once a message is queued, it says the draft will be sent.
+    #[test]
+    fn status_line_shows_backend_boot_and_queued_draft() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = App::new("sess-1".into());
+        app.connecting = true;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains("正在启动后端"), "boot status rendered");
+        assert!(
+            !content.contains("就绪"),
+            "idle status suppressed while booting"
+        );
+
+        app.in_flight = true; // a submission was queued
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains("消息已排队"), "queued-draft hint rendered");
     }
 
     /// Headless render smoke for the tool activity feed: a running line shows

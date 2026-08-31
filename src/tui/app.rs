@@ -91,6 +91,10 @@ pub struct App {
     /// Scroll offset in wrapped lines from the bottom; 0 = follow the tail.
     pub scroll_from_bottom: u16,
     pub in_flight: bool,
+    /// The backend is still booting in the background (the UI paints before
+    /// connect finishes). Drafting works; a submission is queued by the event
+    /// loop and dispatched when the backend lands.
+    pub connecting: bool,
     /// Monotonic start time for the active turn. Kept in the UI state so the
     /// status row can show useful progress without depending on wall-clock
     /// time (or being affected by a system clock adjustment).
@@ -134,6 +138,7 @@ impl App {
             chips: Vec::new(),
             scroll_from_bottom: 0,
             in_flight: false,
+            connecting: false,
             turn_started_at: None,
             awaiting_answer: false,
             spinner: 0,

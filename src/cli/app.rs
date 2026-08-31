@@ -562,12 +562,12 @@ pub async fn run() -> anyhow::Result<()> {
         // explicit, script-friendly spelling, but make a bare `komo` open it.
         None | Some(Commands::Chat) => {
             require_terminal()?;
-            crate::tui::run(&config).await
+            crate::tui::run(config).await
         }
         Some(Commands::Init) => init::run(),
         Some(Commands::Resume { id }) => {
             require_terminal()?;
-            crate::tui::resume(&config, &id).await
+            crate::tui::resume(config, &id).await
         }
         Some(Commands::Gateway { action }) => match action {
             None => gateway::run(&config).await,
@@ -651,7 +651,7 @@ pub async fn run() -> anyhow::Result<()> {
             SessionAction::List => inspect::session_list(&operator(&config).await?).await,
             SessionAction::Resume { id } => {
                 require_terminal()?;
-                crate::tui::resume(&config, &id).await
+                crate::tui::resume(config, &id).await
             }
             SessionAction::Clean => inspect::session_clean(&operator(&config).await?).await,
         },

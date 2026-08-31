@@ -4,6 +4,12 @@
 //! [`GatewayClient::chat_streaming`] (trusted loopback, approvals auto-granted
 //! server-side), or the in-process [`AgentRuntime`] against the local db.
 //!
+//! The first frame paints before any backend exists: connecting (gateway
+//! probe, or db opens plus full wiring) runs on a background task ([`Boot`])
+//! while the event loop is already live. Drafting works immediately; one
+//! submission queues (`in_flight` already enforces one turn at a time) and
+//! dispatches the moment the backend lands.
+//!
 //! Layout: scrollable transcript · status line (spinner while a turn runs) ·
 //! bordered input box. Enter sends; Shift/Alt-Enter or Ctrl-J insert a newline,
 //! and the box grows with the draft. Pastes follow grok build (see
@@ -144,23 +150,91 @@ impl ReplySink for ChannelSink {
     }
 }
 
-/// Start the TUI on a fresh session: a running gateway holds the db lock, so
-/// route turns to it; otherwise run in-process.
-pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
+/// Everything the event loop needs that is not ready at first paint. Produced
+/// by the background boot task while the first frame is already on screen —
+/// connecting (gateway probe, or three db opens plus full wiring) is the whole
+/// startup cost, and nothing in it needs the terminal, so the paint must not
+/// wait for it.
+struct Boot {
+    backend: Backend,
+    /// Mid-turn clarify state (local mode only) — see [`Connected::clarify`].
+    clarify: Option<Arc<ClarifyState>>,
+    /// The session to drive: the fresh id, or the resolved one on resume.
+    session: String,
+    /// The resumed transcript; empty for a fresh session.
+    history: Vec<Message>,
+    /// The session's own workspace on resume; the startup directory otherwise.
+    workspace: PathBuf,
+}
+
+type BootTask = tokio::task::JoinHandle<anyhow::Result<Boot>>;
+
+/// Start the TUI on a fresh session: paint immediately, and connect in the
+/// background — a running gateway holds the db lock, so route turns to it;
+/// otherwise run in-process.
+pub async fn run(config: ConfigSnapshot) -> anyhow::Result<()> {
     let workspace = startup_workspace()?;
-    let connected = connect(config, &workspace).await?;
-    drive(connected, new_session_id(), false, workspace).await
+    let (approval_tx, approval_rx) = mpsc::unbounded_channel();
+    let session = new_session_id();
+    let boot: BootTask = tokio::spawn({
+        let (workspace, session) = (workspace.clone(), session.clone());
+        let approval_tx = approval_tx.clone();
+        async move {
+            let connected = connect(&config, &workspace, approval_tx).await?;
+            // The session row must exist before the first turn lands on it;
+            // rotation via `/new` is gated until this task completes, so the
+            // id ensured here is the id the first turn uses.
+            if let Backend::Local { db, .. } = &connected.backend {
+                ensure_session(db, &session, &workspace).await?;
+            }
+            Ok(Boot {
+                backend: connected.backend,
+                clarify: connected.clarify,
+                session,
+                history: Vec::new(),
+                workspace,
+            })
+        }
+    });
+    drive(boot, (approval_tx, approval_rx), session, false, workspace).await
 }
 
 /// Continue an existing session (`komo resume <id>` on a TTY). Errors if the
 /// session doesn't exist — resume never creates one. A bare API id is accepted
 /// as a convenience for the UUID shown by clients.
-pub async fn resume(config: &ConfigSnapshot, id: &str) -> anyhow::Result<()> {
+pub async fn resume(config: ConfigSnapshot, id: &str) -> anyhow::Result<()> {
     let fallback_workspace = startup_workspace()?;
-    let connected = connect(config, &fallback_workspace).await?;
-    let session_id = resolve_resume_id(&connected.backend, id).await?;
-    let workspace = resume_workspace(&connected.backend, &session_id, fallback_workspace).await?;
-    drive(connected, session_id, true, workspace).await
+    let (approval_tx, approval_rx) = mpsc::unbounded_channel();
+    let id = id.to_string();
+    let boot: BootTask = tokio::spawn({
+        let fallback = fallback_workspace.clone();
+        let id = id.clone();
+        let approval_tx = approval_tx.clone();
+        async move {
+            let connected = connect(&config, &fallback, approval_tx).await?;
+            let session = resolve_resume_id(&connected.backend, &id).await?;
+            let workspace = resume_workspace(&connected.backend, &session, fallback).await?;
+            let history = resume_messages(&connected.backend, &session).await?;
+            Ok(Boot {
+                backend: connected.backend,
+                clarify: connected.clarify,
+                session,
+                history,
+                workspace,
+            })
+        }
+    });
+    // The raw argument stands in as the session id until the boot task
+    // resolves it; a queued draft dispatches only after the resolved id is
+    // installed.
+    drive(
+        boot,
+        (approval_tx, approval_rx),
+        id,
+        true,
+        fallback_workspace,
+    )
+    .await
 }
 
 /// Resolve an exact id first. API sessions are stored as `api:<client-id>`, but
@@ -222,28 +296,26 @@ async fn resume_workspace(
 
 struct Connected {
     backend: Backend,
-    /// Approval prompts from the in-process agent (local mode). In remote mode
-    /// the sender half is parked in the struct so the channel never closes —
-    /// a closed receiver would busy-loop the `select!`.
-    approvals: (
-        mpsc::UnboundedSender<ApprovalPrompt>,
-        mpsc::UnboundedReceiver<ApprovalPrompt>,
-    ),
     /// Mid-turn clarify state (local mode only): the `ask_user` tool waits on
     /// it, the event loop resolves the user's answer into it. Remote turns
     /// clarify server-side (where the gateway dispatcher owns routing).
     clarify: Option<Arc<ClarifyState>>,
 }
 
-async fn connect(config: &ConfigSnapshot, workspace: &PathBuf) -> anyhow::Result<Connected> {
-    let (tx, rx) = mpsc::unbounded_channel();
+/// Connect to whatever backend is available. `approval_tx` feeds the event
+/// loop's approval modal; the loop keeps its own parked sender so the channel
+/// stays open in remote mode, where this one is simply dropped.
+async fn connect(
+    config: &ConfigSnapshot,
+    workspace: &PathBuf,
+    approval_tx: mpsc::UnboundedSender<ApprovalPrompt>,
+) -> anyhow::Result<Connected> {
     if let Some(gw) = GatewayClient::try_connect().await {
         return Ok(Connected {
             backend: Backend::Remote {
                 gateway: Arc::new(gw),
                 workspace: folder_workspace_id(workspace)?,
             },
-            approvals: (tx, rx),
             clarify: None,
         });
     }
@@ -253,14 +325,13 @@ async fn connect(config: &ConfigSnapshot, workspace: &PathBuf) -> anyhow::Result
     // cron.db here can't collide with its exclusive lock. Jobs the user
     // schedules from this session fire once a gateway comes up.
     let cron_jobs = Arc::new(CronDb::connect(&config.runtime.cron_db_url).await?);
-    let approver: Arc<dyn Approver> = Arc::new(TuiApprover::new(tx.clone()));
+    let approver: Arc<dyn Approver> = Arc::new(TuiApprover::new(approval_tx));
     let wired = wiring::build(config, db.clone(), kanban, cron_jobs, approver).await?;
     Ok(Connected {
         backend: Backend::Local {
             runtime: Arc::new(wired.runtime),
             db,
         },
-        approvals: (tx, rx),
         clarify: Some(wired.clarify),
     })
 }
@@ -268,7 +339,11 @@ async fn connect(config: &ConfigSnapshot, workspace: &PathBuf) -> anyhow::Result
 /// Set up the terminal, run the event loop, and always restore — including on
 /// an error path (the panic path is covered by `ratatui::init`'s hook).
 async fn drive(
-    connected: Connected,
+    boot: BootTask,
+    approvals: (
+        mpsc::UnboundedSender<ApprovalPrompt>,
+        mpsc::UnboundedReceiver<ApprovalPrompt>,
+    ),
     session: String,
     resuming: bool,
     workspace: PathBuf,
@@ -286,15 +361,17 @@ async fn drive(
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )
         .is_ok();
-    let result = event_loop(&mut terminal, connected, session, resuming, workspace).await;
+    let result = event_loop(&mut terminal, boot, approvals, session, resuming, workspace).await;
     if enhanced {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     // Print only after leaving the alternate screen, so the command survives in
-    // the user's normal terminal scrollback and is immediately copyable.
-    if let Ok(session_id) = &result {
+    // the user's normal terminal scrollback and is immediately copyable. A quit
+    // before the backend connected has no session to point at (fresh sessions
+    // are only created once the boot task lands), so the hint is skipped.
+    if let Ok(Some(session_id)) = &result {
         println!("komo resume {}", resume_command_id(session_id));
     }
     result.map(|_| ())
@@ -309,16 +386,15 @@ fn resume_command_id(session_id: &str) -> &str {
 
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
-    connected: Connected,
+    boot: BootTask,
+    approvals: (
+        mpsc::UnboundedSender<ApprovalPrompt>,
+        mpsc::UnboundedReceiver<ApprovalPrompt>,
+    ),
     session: String,
     resuming: bool,
     workspace: PathBuf,
-) -> anyhow::Result<String> {
-    let Connected {
-        backend,
-        approvals,
-        clarify,
-    } = connected;
+) -> anyhow::Result<Option<String>> {
     // Keep the sender alive for the whole loop (remote mode has no other
     // holder) so `approval_rx.recv()` pends instead of returning None forever.
     let (_approval_tx, mut approval_rx) = approvals;
@@ -334,44 +410,30 @@ async fn event_loop(
     // their slot already lives.
     let cancels = Arc::new(CancelState::new());
 
-    let history = if resuming {
-        resume_messages(&backend, &session).await?
-    } else {
-        Vec::new()
-    };
+    // The backend arrives from the boot task while the UI is already live.
+    // Until then the user can draft freely and queue one submission (the same
+    // one-turn-at-a-time discipline `in_flight` already enforces); everything
+    // that needs the backend — dispatch, `/new`, resume history — waits.
+    let mut boot = Some(boot);
+    let mut backend: Option<Backend> = None;
+    let mut clarify: Option<Arc<ClarifyState>> = None;
+    let mut pending: Option<String> = None;
+    let mut workspace = workspace;
+
     let mut app = App::new(session);
-    for message in history {
-        let role = match message.role {
-            MessageRole::User => Role::You,
-            MessageRole::Assistant => Role::Agent,
-            // Persisted system/tool entries are history, not live tool activity
-            // (which has special spinner/status rendering in the TUI).
-            MessageRole::System | MessageRole::Tool => Role::Info,
-        };
-        app.push(role, message.content);
-    }
-    let mode = match &backend {
-        Backend::Remote { .. } => "connected to the running gateway (trusted)",
-        Backend::Local { .. } => "in-process (no gateway)",
-    };
+    app.connecting = true;
     app.push(
         Role::Info,
-        format!(
-            "Komo v0.1 — {mode}, {} `{}`\nworkspace: `{}`",
-            if resuming {
-                "resumed session"
-            } else {
-                "session"
-            },
-            app.session_id,
-            workspace.display(),
-        ),
+        if resuming {
+            format!("Komo v0.1 — resuming `{}`…", app.session_id)
+        } else {
+            format!(
+                "Komo v0.1 — session `{}`\nworkspace: `{}`",
+                app.session_id,
+                workspace.display(),
+            )
+        },
     );
-    if let Backend::Local { db, .. } = &backend
-        && !resuming
-    {
-        ensure_session(db, &app.session_id, &workspace).await?;
-    }
 
     let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<Result<String, String>>();
     // Terminal input arrives over a channel rather than being awaited inline: a
@@ -402,6 +464,54 @@ async fn event_loop(
                 // Collected below, once the receiver is free again.
                 let Some(event) = maybe_event else { break 'main };
                 batch.push(event);
+            }
+            // The backend landing (fires once). Install it, render what it
+            // brought — resume history, the mode line — and dispatch the
+            // draft queued while it was starting. A boot failure ends the
+            // loop: the terminal is restored on the way out and the error
+            // prints where the pre-paint failure used to.
+            booted = async { boot.as_mut().expect("guarded by is_some").await }, if boot.is_some() => {
+                boot = None;
+                let ready = booted.map_err(anyhow::Error::from).and_then(|r| r)?;
+                app.connecting = false;
+                app.session_id = ready.session;
+                workspace = ready.workspace;
+                for message in ready.history {
+                    let role = match message.role {
+                        MessageRole::User => Role::You,
+                        MessageRole::Assistant => Role::Agent,
+                        // Persisted system/tool entries are history, not live
+                        // tool activity (which has special spinner/status
+                        // rendering in the TUI).
+                        MessageRole::System | MessageRole::Tool => Role::Info,
+                    };
+                    app.push(role, message.content);
+                }
+                let mode = match &ready.backend {
+                    Backend::Remote { .. } => "connected to the running gateway (trusted)",
+                    Backend::Local { .. } => "in-process (no gateway)",
+                };
+                app.push(
+                    Role::Info,
+                    if resuming {
+                        format!(
+                            "{mode}, resumed session `{}`\nworkspace: `{}`",
+                            app.session_id,
+                            workspace.display(),
+                        )
+                    } else {
+                        mode.to_string()
+                    },
+                );
+                clarify = ready.clarify;
+                backend = Some(ready.backend);
+                if let Some(text) = pending.take() {
+                    spawn_turn(
+                        backend.as_ref().expect("installed above"),
+                        &clarify, &cancels, &app.session_id, text,
+                        &turn_tx, &event_tx, &sink_tx,
+                    );
+                }
             }
             // Live tool-call events (both backends): render each as an activity
             // line, updating the same line in place when it finishes. Kept above
@@ -462,7 +572,7 @@ async fn event_loop(
                 app.modal = Some(prompt);
             }
             _ = tick.tick() => {
-                if app.in_flight {
+                if app.in_flight || app.connecting {
                     app.spinner = app.spinner.wrapping_add(1);
                 }
             }
@@ -498,50 +608,30 @@ async fn event_loop(
                     app.start_turn();
                     // Fresh tool feed for the new turn (seqs restart).
                     app.begin_tools();
-                    let backend = backend.clone();
-                    let session_id = app.session_id.clone();
-                    let turn_tx = turn_tx.clone();
-                    let events = event_tx.clone();
-                    // Local mode: an interactive context whose sink feeds
-                    // mid-turn messages into this loop, so `ask_user` can
-                    // question the user; fresh clarify budget per turn. Its
-                    // event sink drives the tool activity feed.
-                    let ctx = clarify.as_ref().map(|cl| {
-                        cl.begin_turn(&session_id);
-                        SessionContext {
-                            session_id: session_id.clone(),
-                            workspace_root: None,
-                            sink: Arc::new(ChannelSink {
-                                tx: sink_tx.clone(),
-                            }),
-                            interactive: true,
-                            auto_approve: false,
-                            event_sink: Some(Arc::new(TuiEventSink { tx: events.clone() })),
-                            // Esc stops the turn: the loop flips this signal and
-                            // the agent loop gives up at its next await.
-                            cancel: Some(cancels.register(&session_id)),
-                            interject: None,
-                            origin: SessionOrigin::User,
-                        }
-                    });
-                    let turn_cancels = cancels.clone();
-                    tokio::spawn(async move {
-                        let result = match backend.turn(&session_id, text, ctx, events).await {
-                            Ok(reply) => Ok(reply),
-                            // Classified **before** the error is stringified:
-                            // `is_cancelled` downcasts, and `{e:#}` would leave a
-                            // deliberate stop looking like a failure. The remote
-                            // arm never lands here — the gateway already answers
-                            // a cancelled turn with this same text.
-                            Err(error) if is_cancelled(&error) => Ok(CANCELLED_REPLY.to_string()),
-                            Err(error) => Err(format!("{error:#}")),
-                        };
-                        // Drop the slot so a later Esc can't hit a finished turn.
-                        turn_cancels.finish(&session_id);
-                        let _ = turn_tx.send(result);
-                    });
+                    match &backend {
+                        Some(backend) => spawn_turn(
+                            backend,
+                            &clarify,
+                            &cancels,
+                            &app.session_id,
+                            text,
+                            &turn_tx,
+                            &event_tx,
+                            &sink_tx,
+                        ),
+                        // Still booting: hold the message (`in_flight` blocks a
+                        // second one); the boot arm dispatches it on arrival.
+                        None => pending = Some(text),
+                    }
                 }
                 Some(Action::NewSession) => {
+                    // The boot task ensures the fresh session's row under the
+                    // id it was given; rotating before it lands would leave
+                    // the first turn on a row nobody created.
+                    let Some(backend) = &backend else {
+                        app.push(Role::Info, "正在启动，稍候再 /new。".to_string());
+                        continue;
+                    };
                     // Turns are keyed by session id, so an in-flight turn
                     // for the old id can finish and render harmlessly.
                     if let Some(cl) = &clarify {
@@ -550,7 +640,7 @@ async fn event_loop(
                     }
                     app.awaiting_answer = false;
                     app.session_id = new_session_id();
-                    if let Backend::Local { db, .. } = &backend {
+                    if let Backend::Local { db, .. } = backend {
                         ensure_session(db, &app.session_id, &workspace).await?;
                     }
                     app.push(
@@ -573,7 +663,19 @@ async fn event_loop(
                     // another await, so the question has to be resolved first or
                     // Esc looks inert until the clarify timeout. Same order the
                     // api channel's `cancel_turn` uses.
-                    let stopped = match &backend {
+                    // Still booting: the only thing running is the queued
+                    // draft, so Esc takes that back.
+                    let Some(backend) = &backend else {
+                        let message = if pending.take().is_some() {
+                            app.finish_turn();
+                            "已取消排队的消息。"
+                        } else {
+                            "没有正在运行的回合可中断。"
+                        };
+                        app.push(Role::Info, message.to_string());
+                        continue;
+                    };
+                    let stopped = match backend {
                         Backend::Remote { gateway, .. } => {
                             gateway.cancel_turn(&app.session_id).await.unwrap_or(false)
                         }
@@ -601,7 +703,63 @@ async fn event_loop(
             }
         }
     }
-    Ok(app.session_id)
+    // No backend means no session was ever created or resumed — there is
+    // nothing for the resume hint to point at.
+    Ok(backend.is_some().then_some(app.session_id))
+}
+
+/// Dispatch one turn onto its own task so the loop keeps handling keys. The
+/// result lands on `turn_tx`, live tool events on `event_tx`, and — local mode
+/// only — an interactive context whose sink feeds mid-turn messages (the
+/// `ask_user` question) onto `sink_tx`, with a fresh clarify budget per turn.
+#[allow(clippy::too_many_arguments)]
+fn spawn_turn(
+    backend: &Backend,
+    clarify: &Option<Arc<ClarifyState>>,
+    cancels: &Arc<CancelState>,
+    session_id: &str,
+    text: String,
+    turn_tx: &mpsc::UnboundedSender<Result<String, String>>,
+    event_tx: &mpsc::UnboundedSender<TurnEvent>,
+    sink_tx: &mpsc::UnboundedSender<String>,
+) {
+    let backend = backend.clone();
+    let session_id = session_id.to_string();
+    let turn_tx = turn_tx.clone();
+    let events = event_tx.clone();
+    let ctx = clarify.as_ref().map(|cl| {
+        cl.begin_turn(&session_id);
+        SessionContext {
+            session_id: session_id.clone(),
+            workspace_root: None,
+            sink: Arc::new(ChannelSink {
+                tx: sink_tx.clone(),
+            }),
+            interactive: true,
+            auto_approve: false,
+            event_sink: Some(Arc::new(TuiEventSink { tx: events.clone() })),
+            // Esc stops the turn: the loop flips this signal and the agent
+            // loop gives up at its next await.
+            cancel: Some(cancels.register(&session_id)),
+            interject: None,
+            origin: SessionOrigin::User,
+        }
+    });
+    let turn_cancels = cancels.clone();
+    tokio::spawn(async move {
+        let result = match backend.turn(&session_id, text, ctx, events).await {
+            Ok(reply) => Ok(reply),
+            // Classified **before** the error is stringified: `is_cancelled`
+            // downcasts, and `{e:#}` would leave a deliberate stop looking
+            // like a failure. The remote arm never lands here — the gateway
+            // already answers a cancelled turn with this same text.
+            Err(error) if is_cancelled(&error) => Ok(CANCELLED_REPLY.to_string()),
+            Err(error) => Err(format!("{error:#}")),
+        };
+        // Drop the slot so a later Esc can't hit a finished turn.
+        turn_cancels.finish(&session_id);
+        let _ = turn_tx.send(result);
+    });
 }
 
 async fn ensure_session(db: &Db, session_id: &str, workspace: &PathBuf) -> anyhow::Result<()> {
