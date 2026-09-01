@@ -4,6 +4,8 @@ pub mod cron;
 pub mod db;
 pub mod kanban;
 pub mod message_log;
+pub mod session_event_store;
+pub mod session_log;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

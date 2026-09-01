@@ -24,6 +24,7 @@ pub mod repository;
 pub mod reviewer;
 pub mod run;
 pub mod session;
+pub mod session_event;
 pub mod skill;
 pub mod task;
 pub mod todo;

@@ -175,7 +175,7 @@ async-trait = "0.1.92"
 dirs = "6"
 sha2 = "0.11"
 tracing = "0.1"
-time = { version = "0.3.55", features = ["formatting", "macros"] }
+time = { version = "0.3.55", features = ["formatting", "macros", "parsing", "serde-well-known"] }
 uuid = { version = "1.24.0", features = ["v4", "v7"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bytes = "1"

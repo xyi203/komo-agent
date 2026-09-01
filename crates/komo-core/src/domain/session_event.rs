@@ -1,0 +1,1380 @@
+//! The session's authoritative event log — vocabulary, envelope, and the folds
+//! that decide what a log *means*.
+//!
+//! A `SessionEvent` is "one thing that already happened in this session". It is
+//! immutable: nothing ever edits an event, and a later fact is expressed by
+//! appending another event. Two rules follow from that and are enforced here
+//! rather than at each call site:
+//!
+//! **Fail closed on anything unreadable.** An event type this build does not
+//! know may change how the rest of the log must be read, so meeting one is a
+//! refusal to reconstruct the session — not a skipped line. The single escape
+//! is [`SessionEvent::ignorable`], which a writer sets only on records whose
+//! loss cannot affect model history, recovery, or side-effect judgement.
+//! Defaulting to *required* means a forgotten marker over-refuses (an
+//! inconvenience) instead of silently resuming a gutted session. The first
+//! version marks nothing ignorable; the mechanism exists so a later one can.
+//!
+//! **`seq` is the only order.** It is contiguous and assigned by the session's
+//! single writer. [`SessionEvent::at`] is for display and diagnostics: a reader
+//! must never sort or reason about recovery by it.
+//!
+//! This module is pure — no I/O, no storage layout. The segment/manifest
+//! machinery that makes a log durable lives in `komo-infra`; what a *reader*
+//! may conclude from a log lives here, so both sides cannot disagree.
+
+use serde::{Deserialize, Serialize};
+
+use super::message::{Message, Role};
+use time::OffsetDateTime;
+
+/// Bumped when an event's envelope or an existing payload changes shape in a
+/// way serde defaults cannot absorb. A reader meeting a higher version refuses
+/// the log rather than guessing at it.
+pub const SESSION_EVENT_VERSION: u32 = 1;
+
+// ── header ───────────────────────────────────────────────────────────────────
+
+/// Who this log belongs to. Identity metadata, not something that happened:
+/// it is written once when the session materializes and never appears as an
+/// event, so `deriveMessages`-style folds never see it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHeader {
+    pub session_id: String,
+    /// What drives this conversation (`user` / `cron` / `briefing` /
+    /// `delegate`) — the same value the session record carries.
+    pub origin: String,
+    /// Workspace root this session's tools are confined to, when it has one.
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// RFC 3339, UTC.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// The `SESSION_EVENT_VERSION` this log was created under.
+    pub format_version: u32,
+}
+
+// ── envelope ─────────────────────────────────────────────────────────────────
+
+/// One immutable entry in the session log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionEvent {
+    #[serde(rename = "v")]
+    pub version: u32,
+    /// Monotonic, contiguous position within the session. The fold order.
+    pub seq: u64,
+    /// When it happened, RFC 3339 in UTC. **Display and diagnostics only** —
+    /// never an ordering or recovery input; that is `seq`'s job alone. Stored
+    /// as text because this file is one an operator opens and greps, and a
+    /// timestamp they cannot read at a glance is one they will convert by hand.
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+    /// A reader that does not recognize [`kind`](Self::kind) may skip this
+    /// event instead of refusing the log. Absent means required.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ignorable: bool,
+    #[serde(flatten)]
+    pub kind: SessionEventKind,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl SessionEvent {
+    /// A required event of this build's version at `seq`.
+    pub fn new(seq: u64, at: OffsetDateTime, kind: SessionEventKind) -> Self {
+        Self {
+            version: SESSION_EVENT_VERSION,
+            seq,
+            at,
+            ignorable: false,
+            kind,
+        }
+    }
+
+    /// A required event stamped with the current time.
+    pub fn now(seq: u64, kind: SessionEventKind) -> Self {
+        Self::new(seq, OffsetDateTime::now_utc(), kind)
+    }
+
+    /// The turn this event belongs to, when it belongs to one.
+    pub fn turn_id(&self) -> Option<&str> {
+        match &self.kind {
+            SessionEventKind::UserMessage(m) => Some(&m.turn_id)
+                .filter(|t| !t.is_empty())
+                .map(|t| t.as_str()),
+            SessionEventKind::AssistantMessage(m) => Some(m.turn_id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The surface placement this event declares, or `None` when it produces no
+    /// long-term conversation message.
+    ///
+    /// Only the two message-producing variants can answer with `Some`, and they
+    /// carry the field in their own payload — which is what makes "a non-message
+    /// event with a `surfaceOp`" unrepresentable rather than merely invalid.
+    pub fn surface(&self) -> Option<&SurfacePlacement> {
+        match &self.kind {
+            SessionEventKind::UserMessage(m) => Some(&m.surface),
+            SessionEventKind::AssistantMessage(m) => Some(&m.surface),
+            _ => None,
+        }
+    }
+}
+
+// ── vocabulary ───────────────────────────────────────────────────────────────
+
+/// The first version's event vocabulary.
+///
+/// Adjacently tagged so a line reads `{"v":1,"seq":42,"at":…,"type":"tool/call-started","data":{…}}`
+/// — the `type` is greppable by eye in a file an operator opens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum SessionEventKind {
+    #[serde(rename = "session/title-changed")]
+    SessionTitleChanged { title: String },
+    #[serde(rename = "session/model-changed")]
+    SessionModelChanged { model: String, effort: String },
+
+    #[serde(rename = "turn/started")]
+    TurnStarted { turn_id: String },
+    #[serde(rename = "user/message")]
+    UserMessage(UserMessageEvent),
+    #[serde(rename = "request/header")]
+    RequestHeader(RequestHeaderEvent),
+    #[serde(rename = "request/context")]
+    RequestContext(RequestContextEvent),
+    #[serde(rename = "assistant/round")]
+    AssistantRound(AssistantRoundEvent),
+    #[serde(rename = "tool/call-started")]
+    ToolCallStarted(ToolCallStartedEvent),
+    #[serde(rename = "tool/call-settled")]
+    ToolCallSettled(ToolCallSettledEvent),
+    #[serde(rename = "assistant/message")]
+    AssistantMessage(AssistantMessageEvent),
+    #[serde(rename = "turn/completed")]
+    TurnCompleted { turn_id: String },
+    #[serde(rename = "turn/failed")]
+    TurnFailed { turn_id: String, error: String },
+    #[serde(rename = "turn/cancelled")]
+    TurnCancelled {
+        turn_id: String,
+        /// The turn was stopped before it did anything worth remembering — no
+        /// tool ran. Its user message leaves the surface, so the conversation
+        /// reads as if the turn never happened while the log still knows it
+        /// did. A cancel *after* work is not pristine: those effects happened.
+        #[serde(default)]
+        pristine: bool,
+    },
+
+    #[serde(rename = "compaction/started")]
+    CompactionStarted { turn_id: String },
+    #[serde(rename = "compaction/completed")]
+    CompactionCompleted { turn_id: String },
+    #[serde(rename = "learning/completed")]
+    LearningCompleted { turn_id: String },
+    #[serde(rename = "learning/skipped")]
+    LearningSkipped { turn_id: String, reason: String },
+    #[serde(rename = "approval/requested")]
+    ApprovalRequested(ApprovalRequestedEvent),
+    #[serde(rename = "approval/resolved")]
+    ApprovalResolved(ApprovalResolvedEvent),
+}
+
+/// Where a `user/message` came from. A compaction summary enters the surface as
+/// a user message, so the surface fold needs no second message shape — but a
+/// human transcript still has to tell it from something a person typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageSource {
+    User,
+    Compaction,
+    /// Context a tool or hook injected into the conversation.
+    Injected,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserMessageEvent {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub turn_id: String,
+    pub content: String,
+    pub source: MessageSource,
+    #[serde(flatten)]
+    pub surface: SurfacePlacement,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssistantMessageEvent {
+    pub turn_id: String,
+    pub content: String,
+    /// Model-facing footnote: what tools this turn ran.
+    ///
+    /// The raw rounds do **not** re-enter the surface — replaying them would
+    /// make every later turn pay for work already summarized. But a turn that
+    /// cannot tell tools ran at all answers from nothing or runs them again, so
+    /// the digest stays, exactly as the transcript carries it today. Derived at
+    /// turn end from this turn's `tool/call-settled` events.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool_note: String,
+    #[serde(flatten)]
+    pub surface: SurfacePlacement,
+}
+
+/// Why a full `request/header` snapshot was written.
+///
+/// The envelope is large (a rendered system prompt plus every tool schema), so
+/// an unchanged one is *inherited* rather than copied per round — the habit the
+/// old turn journal had, and the reason a failed turn's rows dwarfed the
+/// transcript they described.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HeaderReason {
+    /// A new session's first provider request.
+    Initial,
+    /// The first request of a resumed loop — written even when identical, so a
+    /// continuation boundary is visible in the log.
+    Resume,
+    /// The canonical header differs from the latest snapshot.
+    Change,
+}
+
+/// The stable inputs of a provider request, apart from the derived messages.
+///
+/// Compared field-wise after canonicalization; anything that is not a *request
+/// input* (route capacity, for one) stays out, or a route change would register
+/// as an envelope change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestHeaderEvent {
+    pub reason: HeaderReason,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub effort: String,
+    /// Rendered system prompt; empty for a system-less request.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub system: String,
+    /// Tool schemas in assembly order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+}
+
+impl RequestHeaderEvent {
+    /// Whether a new snapshot is needed. Compares only the request inputs —
+    /// `reason` is how the snapshot was decided, not part of what it says.
+    pub fn differs_from(&self, latest: &Self) -> bool {
+        self.provider != latest.provider
+            || self.model != latest.model
+            || self.effort != latest.effort
+            || self.system != latest.system
+            || self.tools != latest.tools
+    }
+}
+
+/// Route metadata, appended only when the provider, model, or advertised
+/// capacity changes. Deliberately outside [`RequestHeaderEvent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestContextEvent {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
+/// One provider completion, verbatim, so an interrupted turn can be continued
+/// rather than re-run. `blocks` is provider-shaped JSON this crate deliberately
+/// does not model — the one writer and the one reader both live in the llm
+/// layer, so the shape cannot fork.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssistantRoundEvent {
+    pub turn_id: String,
+    pub round: u32,
+    pub blocks: serde_json::Value,
+    #[serde(default)]
+    pub tokens_in: i64,
+    #[serde(default)]
+    pub tokens_out: i64,
+    #[serde(default)]
+    pub tokens_cached: i64,
+}
+
+/// A tool call the round dispatched. Written — and made durable — **before**
+/// the round runs, because "never started" and "started, outcome unknown" need
+/// different answers on recovery and are otherwise indistinguishable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallStartedEvent {
+    pub turn_id: String,
+    pub call_id: String,
+    /// Position in the assistant round's call list, from 0.
+    ///
+    /// The round runs concurrently, so `tool/call-settled` lands in *completion*
+    /// order; a continuation must reassemble results in **this** order or the
+    /// rebuilt request stops matching the one the live turn sent.
+    pub call_index: u32,
+    pub tool: String,
+    /// Redacted arguments, as the ledger records them.
+    pub args: String,
+}
+
+/// What became of one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolOutcome {
+    Succeeded,
+    Failed,
+    /// The call did not confirm its result — it may still have taken effect.
+    Uncertain,
+    /// Refused before the tool body ran (policy, approval, spin).
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallSettledEvent {
+    pub turn_id: String,
+    pub call_id: String,
+    pub call_index: u32,
+    pub outcome: ToolOutcome,
+    /// Model-facing text, already capped.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub result: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(default)]
+    pub elapsed_ms: i64,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub structured: serde_json::Value,
+    /// Files holding the full output when it was too large to inline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_paths: Vec<String>,
+}
+
+/// Recorded — and made durable — *before* the approver is asked, so a crash
+/// during the wait proves the tool body never ran. Without it the widest crash
+/// window in a turn (a human may take five minutes) is indistinguishable from
+/// "the effect may have landed".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalRequestedEvent {
+    pub turn_id: String,
+    pub call_id: String,
+    pub call_index: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope_key: String,
+}
+
+/// How an approval resolved, and by which rung of the ladder. `waited_ms` is
+/// recorded because "it was allowed" and "a person thought about it for four
+/// minutes and then allowed it" are different facts about the same grant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalResolvedEvent {
+    pub turn_id: String,
+    pub call_id: String,
+    pub call_index: u32,
+    pub allowed: bool,
+    /// Which rung decided: `hardline` / `config-deny` / `job-grant` /
+    /// `saved-grant` / `config-allow` / `default` / `auto-review` / `human`.
+    pub decided_by: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    #[serde(default)]
+    pub waited_ms: i64,
+}
+
+/// The request envelope this turn will send, and why it is (or is not) worth a
+/// new snapshot.
+///
+/// Called once per provider request. `latest` is
+/// [`fold_request_header`]'s answer over everything already logged.
+pub fn header_snapshot_reason(
+    latest: Option<&RequestHeaderEvent>,
+    current: &RequestHeaderEvent,
+    resuming: bool,
+) -> Option<HeaderReason> {
+    match latest {
+        // Nothing logged yet: the first request of a session always records its
+        // envelope, or nothing downstream can say what the model was sent.
+        None => Some(HeaderReason::Initial),
+        // A continuation records its envelope even when identical, so the
+        // boundary between the interrupted loop and the one that picked it up
+        // is visible in the log rather than inferred from a gap.
+        Some(_) if resuming => Some(HeaderReason::Resume),
+        Some(latest) if current.differs_from(latest) => Some(HeaderReason::Change),
+        // The ordinary case, and the one this function exists for: an unchanged
+        // envelope is inherited. Copying a rendered system prompt and every tool
+        // schema into every round is what made the old turn journal dwarf the
+        // transcript it described.
+        Some(_) => None,
+    }
+}
+
+/// The request envelope in force at `through_seq`: the latest full snapshot at
+/// or below it. There are no deltas to apply — a snapshot is always complete,
+/// so reconstructing one is a search, not a replay.
+pub fn fold_request_header(
+    events: &[SessionEvent],
+    through_seq: u64,
+) -> Option<&RequestHeaderEvent> {
+    events
+        .iter()
+        .filter(|e| e.seq <= through_seq)
+        .filter_map(|e| match &e.kind {
+            SessionEventKind::RequestHeader(header) => Some(header),
+            _ => None,
+        })
+        .next_back()
+}
+
+/// The route in force at `through_seq`. Separate from the envelope on purpose:
+/// capacity describes where a request went, not what was in it, so a route
+/// change must not register as an envelope change.
+pub fn fold_request_context(
+    events: &[SessionEvent],
+    through_seq: u64,
+) -> Option<&RequestContextEvent> {
+    events
+        .iter()
+        .filter(|e| e.seq <= through_seq)
+        .filter_map(|e| match &e.kind {
+            SessionEventKind::RequestContext(context) => Some(context),
+            _ => None,
+        })
+        .next_back()
+}
+
+// ── surface placement ────────────────────────────────────────────────────────
+
+/// How a message-producing event joins the ordered conversation surface — the
+/// history later turns replay.
+///
+/// `Replace` is what a compaction is: the summary shadows a contiguous run of
+/// surface entries. The shadowed events stay in the authoritative log, which is
+/// why a human transcript can still show what the summary covered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SurfaceOp {
+    Append,
+    Replace { start: u64, end: u64 },
+}
+
+/// A surface declaration plus the events it cites.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfacePlacement {
+    #[serde(rename = "surfaceOp")]
+    pub op: SurfaceOp,
+    /// Every surface node this event shadows. Required to be complete for a
+    /// `Replace`; unused for an `Append`.
+    #[serde(
+        rename = "sourceEventSeqs",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub source_event_seqs: Vec<u64>,
+}
+
+impl SurfacePlacement {
+    pub fn append() -> Self {
+        Self {
+            op: SurfaceOp::Append,
+            source_event_seqs: Vec::new(),
+        }
+    }
+
+    pub fn replace(start: u64, end: u64, shadowed: Vec<u64>) -> Self {
+        Self {
+            op: SurfaceOp::Replace { start, end },
+            source_event_seqs: shadowed,
+        }
+    }
+}
+
+/// Project the conversation surface into the messages a later turn replays.
+///
+/// Only the surface is read, so a compaction's `replace` takes effect here with
+/// no special case: the summary stands where the messages it covers used to.
+/// Tool activity reaches the model as the assistant message's `tool_note`, not
+/// as replayed rounds — see [`AssistantMessageEvent::tool_note`].
+///
+/// `first_seq` is 0 for a complete log, or a retention base's
+/// `truncated_before` for a truncated one.
+pub fn derive_messages(events: &[SessionEvent], first_seq: u64) -> Result<Vec<Message>, FoldError> {
+    let surface = fold_surface(events, first_seq)?;
+    let mut by_seq: std::collections::HashMap<u64, &SessionEvent> =
+        std::collections::HashMap::with_capacity(events.len());
+    for event in events {
+        by_seq.insert(event.seq, event);
+    }
+    let mut out: Vec<Message> = Vec::with_capacity(surface.nodes().len());
+    for seq in surface.nodes() {
+        let Some(event) = by_seq.get(seq) else {
+            // The surface only ever holds seqs it saw, so this is unreachable
+            // through `fold_surface` — but a caller assembling a surface by
+            // hand must not silently get a short history.
+            return Err(FoldError::InvalidReplacement {
+                seq: *seq,
+                reason: "surface node has no event".to_string(),
+            });
+        };
+        match &event.kind {
+            // Something the user said while the turn was already running belongs
+            // to that turn's input, not to a turn of its own: two consecutive
+            // user messages is exactly what a transcript may not contain, and
+            // several providers reject it on replay.
+            SessionEventKind::UserMessage(m) if m.source == MessageSource::Injected => {
+                match out.last_mut().filter(|last| last.role == Role::User) {
+                    Some(last) => {
+                        last.content.push('\n');
+                        last.content.push_str(&m.content);
+                    }
+                    None => out.push(Message::user(&m.content)),
+                }
+            }
+            SessionEventKind::UserMessage(m) => out.push(Message::user(&m.content)),
+            SessionEventKind::AssistantMessage(m) => {
+                out.push(Message::assistant(&m.content).with_tool_note(&m.tool_note))
+            }
+            // `fold_surface` only admits the two message kinds; anything else on
+            // the surface means the fold and this projection disagree.
+            _ => {
+                return Err(FoldError::InvalidReplacement {
+                    seq: *seq,
+                    reason: "surface node is not a message event".to_string(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ── folds ────────────────────────────────────────────────────────────────────
+
+/// Why a log could not be read as a session.
+///
+/// Every variant is a refusal, not a warning: a reader that cannot account for
+/// an event cannot know what the rest of the log means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldError {
+    /// An event type this build does not know, and the writer did not mark it
+    /// skippable.
+    UnknownEventType { seq: u64, type_name: String },
+    /// Written by a newer komo.
+    UnsupportedVersion { seq: u64, version: u32 },
+    /// `seq` is not contiguous — the log has a hole, so what is missing cannot
+    /// be reasoned about.
+    SeqGap { expected: u64, found: u64 },
+    /// A replacement cited a range the surface does not hold, or did not cite
+    /// everything it shadows.
+    InvalidReplacement { seq: u64, reason: String },
+    /// The line is not a readable event at all.
+    Malformed { seq: Option<u64>, error: String },
+}
+
+impl std::fmt::Display for FoldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownEventType { seq, type_name } => write!(
+                f,
+                "event {seq} has type `{type_name}`, which this komo does not know \
+                 and its writer did not mark ignorable — upgrade komo to read this session"
+            ),
+            Self::UnsupportedVersion { seq, version } => write!(
+                f,
+                "event {seq} was written by a newer komo (format {version}, this build reads \
+                 {SESSION_EVENT_VERSION}) — upgrade komo to read this session"
+            ),
+            Self::SeqGap { expected, found } => {
+                write!(f, "session log jumps from seq {expected} to {found}")
+            }
+            Self::InvalidReplacement { seq, reason } => {
+                write!(
+                    f,
+                    "event {seq} is not a valid surface replacement: {reason}"
+                )
+            }
+            Self::Malformed { seq, error } => match seq {
+                Some(seq) => write!(f, "event {seq} is unreadable: {error}"),
+                None => write!(f, "unreadable session event: {error}"),
+            },
+        }
+    }
+}
+
+impl std::error::Error for FoldError {}
+
+/// Decode one stored line.
+///
+/// `Ok(None)` means the line was an unrecognized event its writer marked
+/// ignorable — the one case a reader may skip. Everything else is a refusal.
+pub fn decode_event(line: &str) -> Result<Option<SessionEvent>, FoldError> {
+    // Read the envelope first: whether an unknown type is fatal is the writer's
+    // call, and that answer is in the envelope, not in the payload.
+    let envelope: EventEnvelope =
+        serde_json::from_str(line).map_err(|error| FoldError::Malformed {
+            seq: None,
+            error: error.to_string(),
+        })?;
+    if envelope.version > SESSION_EVENT_VERSION {
+        return Err(FoldError::UnsupportedVersion {
+            seq: envelope.seq,
+            version: envelope.version,
+        });
+    }
+    match serde_json::from_str::<SessionEvent>(line) {
+        Ok(event) => Ok(Some(event)),
+        Err(error) if envelope.ignorable => {
+            tracing::debug!(seq = envelope.seq, %error, "skipped an ignorable session event");
+            Ok(None)
+        }
+        Err(_) if !KNOWN_EVENT_TYPES.contains(&envelope.type_name.as_str()) => {
+            Err(FoldError::UnknownEventType {
+                seq: envelope.seq,
+                type_name: envelope.type_name,
+            })
+        }
+        Err(error) => Err(FoldError::Malformed {
+            seq: Some(envelope.seq),
+            error: error.to_string(),
+        }),
+    }
+}
+
+/// Just enough of a line to decide how to read the rest of it.
+#[derive(Deserialize)]
+struct EventEnvelope {
+    #[serde(rename = "v", default = "default_version")]
+    version: u32,
+    seq: u64,
+    #[serde(default)]
+    ignorable: bool,
+    #[serde(rename = "type")]
+    type_name: String,
+}
+
+fn default_version() -> u32 {
+    SESSION_EVENT_VERSION
+}
+
+/// Every type this build writes. An unrecognized type outside this list is what
+/// the fail-closed rule is about; a *known* type that will not parse is a
+/// malformed record instead.
+pub const KNOWN_EVENT_TYPES: &[&str] = &[
+    "session/title-changed",
+    "session/model-changed",
+    "turn/started",
+    "user/message",
+    "request/header",
+    "request/context",
+    "assistant/round",
+    "tool/call-started",
+    "tool/call-settled",
+    "assistant/message",
+    "turn/completed",
+    "turn/failed",
+    "turn/cancelled",
+    "compaction/started",
+    "compaction/completed",
+    "learning/completed",
+    "learning/skipped",
+    "approval/requested",
+    "approval/resolved",
+];
+
+/// The ordered conversation surface, folded from a log.
+///
+/// Holds seqs, not content: the log stays the authority on what an event says,
+/// and this answers only *which* events a later turn replays, in what order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Surface {
+    nodes: Vec<u64>,
+    /// Committed positional replacements, so an incremental consumer can tell
+    /// plain tail growth from a rewrite.
+    replace_generation: u64,
+}
+
+impl Surface {
+    pub fn nodes(&self) -> &[u64] {
+        &self.nodes
+    }
+
+    pub fn replace_generation(&self) -> u64 {
+        self.replace_generation
+    }
+
+    /// Drop every node the predicate rejects. Used by the pristine-cancel rule;
+    /// deliberately not a general edit — nothing else may remove a node once it
+    /// is on the surface except a replacement.
+    fn retain(&mut self, keep: impl Fn(&u64) -> bool) {
+        self.nodes.retain(|seq| keep(seq));
+    }
+
+    /// Apply one message-producing event's declaration.
+    pub fn apply(&mut self, seq: u64, placement: &SurfacePlacement) -> Result<(), FoldError> {
+        match placement.op {
+            SurfaceOp::Append => {
+                self.nodes.push(seq);
+                Ok(())
+            }
+            SurfaceOp::Replace { start, end } => {
+                let invalid = |reason: &str| FoldError::InvalidReplacement {
+                    seq,
+                    reason: reason.to_string(),
+                };
+                let from = self
+                    .nodes
+                    .iter()
+                    .position(|n| *n == start)
+                    .ok_or_else(|| invalid("`start` is not on the surface"))?;
+                let to = self
+                    .nodes
+                    .iter()
+                    .position(|n| *n == end)
+                    .ok_or_else(|| invalid("`end` is not on the surface"))?;
+                if from > to {
+                    return Err(invalid("`start` comes after `end`"));
+                }
+                let shadowed: Vec<u64> = self.nodes[from..=to].to_vec();
+                // Citing every shadowed node is what lets a human transcript
+                // show what a summary covered. An incomplete citation would
+                // lose that silently.
+                if !shadowed
+                    .iter()
+                    .all(|n| placement.source_event_seqs.contains(n))
+                {
+                    return Err(invalid(
+                        "`sourceEventSeqs` does not cite every shadowed surface node",
+                    ));
+                }
+                self.nodes.splice(from..=to, [seq]);
+                self.replace_generation += 1;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Fold a whole log: check `seq` contiguity from `first_seq` and build the
+/// surface. `first_seq` is 0 for a complete log, or a retention base's
+/// `truncated_before` for a truncated one.
+pub fn fold_surface(events: &[SessionEvent], first_seq: u64) -> Result<Surface, FoldError> {
+    let mut surface = Surface::default();
+    // Which turn put each node on the surface, so a pristine cancel can take
+    // its own back without touching anything else.
+    let mut owner: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    for (expected, event) in (first_seq..).zip(events) {
+        if event.seq != expected {
+            return Err(FoldError::SeqGap {
+                expected,
+                found: event.seq,
+            });
+        }
+        if let Some(placement) = event.surface() {
+            surface.apply(event.seq, placement)?;
+            if let Some(turn) = event.turn_id() {
+                owner.insert(event.seq, turn.to_string());
+            }
+        }
+        // A turn stopped before it did anything is not a thing that was said.
+        // The events stay in the log — the log never forgets that the user
+        // asked and then stopped — but the conversation a later turn replays
+        // must not carry a question nobody answered.
+        if let SessionEventKind::TurnCancelled {
+            turn_id,
+            pristine: true,
+        } = &event.kind
+        {
+            surface.retain(|seq| owner.get(seq) != Some(turn_id));
+        }
+    }
+    Ok(surface)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::format_description::well_known::Rfc3339;
+
+    fn at(text: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(text, &Rfc3339).unwrap()
+    }
+
+    fn user(seq: u64, text: &str) -> SessionEvent {
+        SessionEvent::new(
+            seq,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::UserMessage(UserMessageEvent {
+                turn_id: "turn-1".into(),
+                content: text.into(),
+                source: MessageSource::User,
+                surface: SurfacePlacement::append(),
+            }),
+        )
+    }
+
+    fn assistant(seq: u64, text: &str) -> SessionEvent {
+        SessionEvent::new(
+            seq,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::AssistantMessage(AssistantMessageEvent {
+                turn_id: "turn-1".into(),
+                content: text.into(),
+                tool_note: String::new(),
+                surface: SurfacePlacement::append(),
+            }),
+        )
+    }
+
+    #[test]
+    fn an_event_round_trips_through_its_stored_line() {
+        let event = SessionEvent::new(
+            42,
+            at("2026-09-01T10:30:00Z"),
+            SessionEventKind::ToolCallStarted(ToolCallStartedEvent {
+                turn_id: "turn-7".into(),
+                call_id: "call-3".into(),
+                call_index: 0,
+                tool: "shell".into(),
+                args: r#"{"command":"cargo test"}"#.into(),
+            }),
+        );
+        let line = serde_json::to_string(&event).unwrap();
+        // The type is a top-level, greppable field — an operator opening the
+        // file should not have to know the payload shape to see what happened.
+        assert!(line.contains(r#""type":"tool/call-started""#), "{line}");
+        assert!(line.contains(r#""seq":42"#), "{line}");
+        // Required is the default, so it costs no bytes.
+        assert!(!line.contains("ignorable"), "{line}");
+        assert_eq!(decode_event(&line).unwrap(), Some(event));
+    }
+
+    #[test]
+    fn a_message_event_writes_its_surface_declaration_inline() {
+        // Locks the stored shape: everything downstream (segments, folds, the
+        // human transcript) reads these bytes, so a silent change here is a
+        // silent change to every session on disk.
+        let event = SessionEvent::new(
+            4,
+            at("2026-09-01T10:30:00Z"),
+            SessionEventKind::UserMessage(UserMessageEvent {
+                turn_id: "turn-2".into(),
+                content: "[summary]".into(),
+                source: MessageSource::Compaction,
+                surface: SurfacePlacement::replace(0, 1, vec![0, 1]),
+            }),
+        );
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"v":1,"seq":4,"at":"2026-09-01T10:30:00Z","type":"user/message","data":{"turn_id":"turn-2","content":"[summary]","source":"compaction","surfaceOp":{"replace":{"start":0,"end":1}},"sourceEventSeqs":[0,1]}}"#
+        );
+
+        let plain = user(0, "hi");
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"v":1,"seq":0,"at":"2026-08-31T00:00:00Z","type":"user/message","data":{"turn_id":"turn-1","content":"hi","source":"user","surfaceOp":"append"}}"#
+        );
+    }
+
+    #[test]
+    fn an_unknown_required_event_refuses_the_log() {
+        // Written by a newer komo that added a type this build does not know.
+        let line = r#"{"v":1,"seq":9,"at":"2026-08-31T00:00:00Z","type":"workflow/step-entered","data":{}}"#;
+        assert_eq!(
+            decode_event(line),
+            Err(FoldError::UnknownEventType {
+                seq: 9,
+                type_name: "workflow/step-entered".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_unknown_ignorable_event_is_skipped_instead() {
+        // The one escape: its writer promised losing it cannot change what the
+        // rest of the log means.
+        let line = r#"{"v":1,"seq":9,"at":"2026-08-31T00:00:00Z","ignorable":true,"type":"telemetry/first-token","data":{}}"#;
+        assert_eq!(decode_event(line), Ok(None));
+    }
+
+    #[test]
+    fn a_newer_format_version_refuses_before_the_payload_is_read() {
+        let line = r#"{"v":2,"seq":9,"at":"2026-08-31T00:00:00Z","type":"turn/started","data":{"turn_id":"t"}}"#;
+        assert_eq!(
+            decode_event(line),
+            Err(FoldError::UnsupportedVersion { seq: 9, version: 2 })
+        );
+    }
+
+    #[test]
+    fn the_first_version_marks_nothing_ignorable() {
+        // The mechanism exists for a later version; shipping one now would mean
+        // this build already tolerates losing something.
+        let events = [
+            user(0, "hi"),
+            assistant(1, "hello"),
+            SessionEvent::new(
+                2,
+                at("2026-08-31T00:00:00Z"),
+                SessionEventKind::TurnStarted {
+                    turn_id: "t".into(),
+                },
+            ),
+        ];
+        assert!(events.iter().all(|e| !e.ignorable));
+    }
+
+    #[test]
+    fn only_message_events_can_declare_a_surface_placement() {
+        assert!(user(0, "hi").surface().is_some());
+        assert!(assistant(1, "hello").surface().is_some());
+        // Not "invalid" — unrepresentable: the field lives in the two message
+        // payloads, so no other variant has one to set.
+        let round = SessionEvent::new(
+            2,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::AssistantRound(AssistantRoundEvent {
+                turn_id: "t".into(),
+                round: 0,
+                blocks: serde_json::json!([]),
+                tokens_in: 0,
+                tokens_out: 0,
+                tokens_cached: 0,
+            }),
+        );
+        assert!(round.surface().is_none());
+    }
+
+    #[test]
+    fn derived_messages_are_the_surface_in_order() {
+        let events = [user(0, "q1"), assistant(1, "a1"), user(2, "q2")];
+        let messages = derive_messages(&events, 0).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["q1", "a1", "q2"]
+        );
+        assert_eq!(messages[1].role, super::super::message::Role::Assistant);
+    }
+
+    #[test]
+    fn a_compaction_summary_stands_where_the_messages_it_covers_used_to() {
+        let mut events = vec![user(0, "q1"), assistant(1, "a1"), user(2, "q2")];
+        events.push(SessionEvent::new(
+            3,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::UserMessage(UserMessageEvent {
+                turn_id: "turn-2".into(),
+                content: "[summary of q1/a1]".into(),
+                source: MessageSource::Compaction,
+                surface: SurfacePlacement::replace(0, 1, vec![0, 1]),
+            }),
+        ));
+        // No special case in the projection: the surface already resolved it.
+        assert_eq!(
+            derive_messages(&events, 0)
+                .unwrap()
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["[summary of q1/a1]", "q2"]
+        );
+    }
+
+    #[test]
+    fn tool_activity_reaches_the_model_as_a_note_not_as_replayed_rounds() {
+        // A round and its calls are durable, but they are not conversation: a
+        // later turn must not pay for work its assistant message already
+        // summarized — while still being able to tell that tools ran at all.
+        let events = vec![
+            user(0, "run the tests"),
+            SessionEvent::new(
+                1,
+                at("2026-08-31T00:00:00Z"),
+                SessionEventKind::AssistantRound(AssistantRoundEvent {
+                    turn_id: "turn-1".into(),
+                    round: 0,
+                    blocks: serde_json::json!([{"tool_call": "shell"}]),
+                    tokens_in: 100,
+                    tokens_out: 20,
+                    tokens_cached: 0,
+                }),
+            ),
+            SessionEvent::new(
+                2,
+                at("2026-08-31T00:00:00Z"),
+                SessionEventKind::ToolCallSettled(ToolCallSettledEvent {
+                    turn_id: "turn-1".into(),
+                    call_id: "c0".into(),
+                    call_index: 0,
+                    outcome: ToolOutcome::Succeeded,
+                    result: "test result: ok".into(),
+                    error: String::new(),
+                    elapsed_ms: 4100,
+                    structured: serde_json::Value::Null,
+                    output_paths: vec![],
+                }),
+            ),
+            SessionEvent::new(
+                3,
+                at("2026-08-31T00:00:00Z"),
+                SessionEventKind::AssistantMessage(AssistantMessageEvent {
+                    turn_id: "turn-1".into(),
+                    content: "全部通过".into(),
+                    tool_note: "1. shell → test result: ok".into(),
+                    surface: SurfacePlacement::append(),
+                }),
+            ),
+        ];
+        let messages = derive_messages(&events, 0).unwrap();
+        assert_eq!(
+            messages.len(),
+            2,
+            "the round and the call are not conversation"
+        );
+        assert_eq!(messages[1].content, "全部通过");
+        assert_eq!(messages[1].tool_note, "1. shell → test result: ok");
+    }
+
+    fn cancelled(seq: u64, turn: &str, pristine: bool) -> SessionEvent {
+        SessionEvent::new(
+            seq,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::TurnCancelled {
+                turn_id: turn.into(),
+                pristine,
+            },
+        )
+    }
+
+    fn said(seq: u64, turn: &str, text: &str, source: MessageSource) -> SessionEvent {
+        SessionEvent::new(
+            seq,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::UserMessage(UserMessageEvent {
+                turn_id: turn.into(),
+                content: text.into(),
+                source,
+                surface: SurfacePlacement::append(),
+            }),
+        )
+    }
+
+    #[test]
+    fn a_pristine_cancel_takes_its_own_question_back_off_the_surface() {
+        // The log keeps every event — an operator can still see that the user
+        // asked and then stopped — but a later turn must not replay a question
+        // nobody answered.
+        let events = vec![
+            said(0, "turn-1", "q1", MessageSource::User),
+            assistant(1, "a1"),
+            said(2, "turn-2", "oops, never mind", MessageSource::User),
+            cancelled(3, "turn-2", true),
+            said(4, "turn-3", "the real question", MessageSource::User),
+        ];
+        assert_eq!(
+            derive_messages(&events, 0)
+                .unwrap()
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["q1", "a1", "the real question"]
+        );
+    }
+
+    #[test]
+    fn a_cancel_after_work_keeps_its_question() {
+        // Tools ran. Those effects happened, so the turn is part of the
+        // conversation whatever the user pressed afterwards.
+        let events = vec![
+            said(
+                0,
+                "turn-1",
+                "delete the stale migrations",
+                MessageSource::User,
+            ),
+            cancelled(1, "turn-1", false),
+        ];
+        assert_eq!(derive_messages(&events, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_interjection_joins_the_turn_it_interrupted() {
+        // Not a second user message: several providers reject two in a row on
+        // replay, and both halves really are one person's input for one turn.
+        let events = vec![
+            said(0, "turn-1", "看下 A", MessageSource::User),
+            said(1, "turn-1", "顺便也看下 B", MessageSource::Injected),
+            assistant(2, "两个都看了"),
+        ];
+        let messages = derive_messages(&events, 0).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "看下 A\n顺便也看下 B");
+    }
+
+    #[test]
+    fn a_seq_gap_refuses_the_log() {
+        let events = [user(0, "hi"), assistant(2, "hello")];
+        assert_eq!(
+            fold_surface(&events, 0),
+            Err(FoldError::SeqGap {
+                expected: 1,
+                found: 2
+            })
+        );
+    }
+
+    #[test]
+    fn a_truncated_log_folds_from_its_retention_base() {
+        // After a truncate the log legitimately starts above zero; contiguity is
+        // checked against the base, not against 0.
+        let events = [user(100, "hi"), assistant(101, "hello")];
+        let surface = fold_surface(&events, 100).unwrap();
+        assert_eq!(surface.nodes(), &[100, 101]);
+    }
+
+    #[test]
+    fn a_replacement_shadows_its_range_and_counts_as_a_rewrite() {
+        let mut events = vec![
+            user(0, "q1"),
+            assistant(1, "a1"),
+            user(2, "q2"),
+            assistant(3, "a2"),
+        ];
+        events.push(SessionEvent::new(
+            4,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::UserMessage(UserMessageEvent {
+                turn_id: "turn-2".into(),
+                content: "[summary of the first exchange]".into(),
+                source: MessageSource::Compaction,
+                surface: SurfacePlacement::replace(0, 1, vec![0, 1]),
+            }),
+        ));
+        let surface = fold_surface(&events, 0).unwrap();
+        // The summary stands where the two it covers used to; everything after
+        // is untouched, and the shadowed events remain in the log.
+        assert_eq!(surface.nodes(), &[4, 2, 3]);
+        assert_eq!(surface.replace_generation(), 1);
+    }
+
+    #[test]
+    fn a_second_compaction_can_replace_the_first_summary() {
+        // The reason a reader cannot "stop at the first compaction": a later
+        // summary may target an earlier one, so the ops have to be folded.
+        let mut surface = Surface::default();
+        for seq in 0..4 {
+            surface.apply(seq, &SurfacePlacement::append()).unwrap();
+        }
+        surface
+            .apply(4, &SurfacePlacement::replace(0, 1, vec![0, 1]))
+            .unwrap();
+        assert_eq!(surface.nodes(), &[4, 2, 3]);
+        surface
+            .apply(5, &SurfacePlacement::replace(4, 2, vec![4, 2]))
+            .unwrap();
+        assert_eq!(surface.nodes(), &[5, 3]);
+        assert_eq!(surface.replace_generation(), 2);
+    }
+
+    #[test]
+    fn an_invalid_replacement_refuses_rather_than_guessing() {
+        let mut surface = Surface::default();
+        for seq in 0..3 {
+            surface.apply(seq, &SurfacePlacement::append()).unwrap();
+        }
+
+        // A range the surface does not hold.
+        let off_surface = surface
+            .clone()
+            .apply(9, &SurfacePlacement::replace(7, 8, vec![7, 8]));
+        assert!(matches!(
+            off_surface,
+            Err(FoldError::InvalidReplacement { seq: 9, .. })
+        ));
+
+        // Backwards.
+        let backwards = surface
+            .clone()
+            .apply(9, &SurfacePlacement::replace(2, 0, vec![0, 1, 2]));
+        assert!(matches!(
+            backwards,
+            Err(FoldError::InvalidReplacement { seq: 9, .. })
+        ));
+
+        // Covers three nodes but cites two: the uncited one would vanish from
+        // the human transcript's account of what the summary replaced.
+        let undercited = surface
+            .clone()
+            .apply(9, &SurfacePlacement::replace(0, 2, vec![0, 2]));
+        assert!(matches!(
+            undercited,
+            Err(FoldError::InvalidReplacement { seq: 9, .. })
+        ));
+    }
+
+    fn header(system: &str, tools: &[&str]) -> RequestHeaderEvent {
+        RequestHeaderEvent {
+            reason: HeaderReason::Initial,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            effort: String::new(),
+            system: system.into(),
+            tools: tools.iter().map(|t| (*t).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn ten_identical_rounds_write_one_header_and_the_change_writes_a_second() {
+        let steady = header("You are komo.", &["read", "shell"]);
+        let mut log: Vec<SessionEvent> = Vec::new();
+        let mut seq = 0u64;
+
+        for _ in 0..10 {
+            let latest = fold_request_header(&log, seq);
+            if let Some(reason) = header_snapshot_reason(latest, &steady, false) {
+                log.push(SessionEvent::new(
+                    seq,
+                    at("2026-08-31T00:00:00Z"),
+                    SessionEventKind::RequestHeader(RequestHeaderEvent {
+                        reason,
+                        ..steady.clone()
+                    }),
+                ));
+                seq += 1;
+            }
+            // Each round also logs *something*, so `seq` moves whether or not a
+            // snapshot was written.
+            log.push(user(seq, "another question"));
+            seq += 1;
+        }
+        let headers: Vec<HeaderReason> = log
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::RequestHeader(h) => Some(h.reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec![HeaderReason::Initial],
+            "ten rounds, one snapshot"
+        );
+
+        // A tool mounts: exactly one `change`.
+        let widened = header("You are komo.", &["read", "shell", "edit"]);
+        let reason = header_snapshot_reason(fold_request_header(&log, seq), &widened, false);
+        assert_eq!(reason, Some(HeaderReason::Change));
+        log.push(SessionEvent::new(
+            seq,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::RequestHeader(RequestHeaderEvent {
+                reason: HeaderReason::Change,
+                ..widened.clone()
+            }),
+        ));
+        let change_seq = seq;
+
+        // And a continuation always marks itself, identical or not.
+        assert_eq!(
+            header_snapshot_reason(fold_request_header(&log, change_seq), &widened, true),
+            Some(HeaderReason::Resume)
+        );
+    }
+
+    #[test]
+    fn a_header_fold_answers_with_the_envelope_in_force_at_that_seq() {
+        let first = header("v1", &["read"]);
+        let second = header("v2", &["read", "edit"]);
+        let log = vec![
+            SessionEvent::new(
+                0,
+                at("2026-08-31T00:00:00Z"),
+                SessionEventKind::RequestHeader(first.clone()),
+            ),
+            user(1, "q"),
+            SessionEvent::new(
+                2,
+                at("2026-08-31T00:00:00Z"),
+                SessionEventKind::RequestHeader(second.clone()),
+            ),
+            user(3, "q2"),
+        ];
+        assert_eq!(fold_request_header(&log, 1).unwrap().system, "v1");
+        assert_eq!(fold_request_header(&log, 3).unwrap().system, "v2");
+        // Before any snapshot there is no envelope to report — not an empty one.
+        assert!(fold_request_header(&log[1..], 1).is_none());
+    }
+
+    #[test]
+    fn a_route_change_is_not_an_envelope_change() {
+        // The whole reason capacity lives outside `RequestHeaderEvent`: a
+        // provider advertising a different context window must not force the
+        // system prompt and every tool schema to be copied again.
+        let steady = header("You are komo.", &["read"]);
+        let log = vec![SessionEvent::new(
+            0,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::RequestHeader(steady.clone()),
+        )];
+        assert_eq!(
+            header_snapshot_reason(fold_request_header(&log, 0), &steady, false),
+            None
+        );
+
+        let routes = vec![
+            SessionEvent::new(
+                1,
+                at("2026-08-31T00:00:00Z"),
+                SessionEventKind::RequestContext(RequestContextEvent {
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4-6".into(),
+                    context_window: Some(200_000),
+                }),
+            ),
+            SessionEvent::new(
+                2,
+                at("2026-08-31T00:00:00Z"),
+                SessionEventKind::RequestContext(RequestContextEvent {
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4-6".into(),
+                    context_window: None,
+                }),
+            ),
+        ];
+        // A route that advertises nothing clears the older capacity rather than
+        // leaving a stale number in force.
+        assert_eq!(
+            fold_request_context(&routes, 2).unwrap().context_window,
+            None
+        );
+        assert_eq!(
+            fold_request_context(&routes, 1).unwrap().context_window,
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn an_unchanged_request_header_needs_no_new_snapshot() {
+        let initial = RequestHeaderEvent {
+            reason: HeaderReason::Initial,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            effort: String::new(),
+            system: "You are komo.".into(),
+            tools: vec!["read".into(), "shell".into()],
+        };
+        // Same inputs, different reason: still the same request envelope, so no
+        // snapshot — this is what keeps a rendered system prompt out of every
+        // round, the habit that made the old turn journal dwarf its transcript.
+        let same = RequestHeaderEvent {
+            reason: HeaderReason::Change,
+            ..initial.clone()
+        };
+        assert!(!same.differs_from(&initial));
+
+        let one_more_tool = RequestHeaderEvent {
+            tools: vec!["read".into(), "shell".into(), "edit".into()],
+            ..initial.clone()
+        };
+        assert!(one_more_tool.differs_from(&initial));
+    }
+}
