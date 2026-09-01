@@ -16,3 +16,8 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 # Cron-expression parsing for `domain::cron`'s next-occurrence math.
 croner = "3"
+
+[dev-dependencies]
+# Test-only: the approval gate is async, so its tests need a runtime. A
+# dev-dependency does not reach consumers, so the crate stays runtime-free.
+tokio = { version = "1.53.1", features = ["macros", "rt"] }

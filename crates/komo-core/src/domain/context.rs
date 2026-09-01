@@ -18,8 +18,12 @@ use crate::domain::cancel::CancelSignal;
 use crate::domain::events::ToolEventSink;
 use crate::domain::gateway::{InterjectSource, ReplySink};
 use crate::domain::policy::LOCAL_CHANNEL;
+use crate::domain::repository::SessionEventRepository;
 use crate::domain::run::RunRepository;
 use crate::domain::session::ChannelPeer;
+use crate::domain::session_event::{
+    ApprovalRequestedEvent, ApprovalResolvedEvent, SessionEventKind,
+};
 
 /// What is driving a turn, as far as **approval** is concerned.
 ///
@@ -358,6 +362,52 @@ pub struct ToolContext {
     pub session: SessionContext,
     pub run: Option<RunContext>,
     approver: Arc<dyn Approver>,
+    /// Makes this call's approval a durable fact. `None` for a turn with no
+    /// event log (aux runtimes), which simply loses the not-started proof.
+    approval: Option<ApprovalGate>,
+}
+
+/// What one call needs to record its approval durably.
+///
+/// The gate exists because an approval is the **widest** crash window in a
+/// turn: a person may take five minutes. Without it, a crash during that wait
+/// is indistinguishable from a crash during the tool, so recovery has to assume
+/// the effect may have landed — and tell the model to go verify something that
+/// never happened.
+#[derive(Clone)]
+pub struct ApprovalGate {
+    events: Arc<dyn SessionEventRepository>,
+    session_id: String,
+    turn_id: String,
+    call_id: String,
+    call_index: u32,
+}
+
+impl ApprovalGate {
+    pub fn new(
+        events: Arc<dyn SessionEventRepository>,
+        session_id: &str,
+        turn_id: &str,
+        call_id: &str,
+        call_index: u32,
+    ) -> Self {
+        Self {
+            events,
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            call_id: call_id.to_string(),
+            call_index,
+        }
+    }
+
+    async fn append(&self, kind: SessionEventKind) -> anyhow::Result<()> {
+        self.events.append(&self.session_id, vec![kind]).await?;
+        Ok(())
+    }
+
+    async fn durable(&self) -> anyhow::Result<()> {
+        self.events.durable_flush(&self.session_id).await
+    }
 }
 
 impl ToolContext {
@@ -370,7 +420,15 @@ impl ToolContext {
             session,
             run,
             approver,
+            approval: None,
         }
+    }
+
+    /// Make this call's approvals durable facts. Installed by the executor,
+    /// which is the only place a call's identity is known.
+    pub fn with_approval_gate(mut self, gate: ApprovalGate) -> Self {
+        self.approval = Some(gate);
+        self
     }
 
     /// Ask the wired approver to allow `request`, keeping only the yes/no. The
@@ -389,7 +447,67 @@ impl ToolContext {
     /// [`ToolError::Denied`](crate::domain::tool::ToolError::Denied) so the next
     /// round can correct itself rather than retry verbatim.
     pub async fn decide(&self, request: &ApprovalRequest) -> Decision {
-        self.approver.decide(request).await
+        let Some(gate) = &self.approval else {
+            return self.approver.decide(request).await;
+        };
+        let scope_key = request.scope_key.clone().unwrap_or_default();
+
+        // Before the wait. A crash past this point but before a durable
+        // `allow` proves the tool body never ran — the one thing that makes an
+        // approval-gated call recoverable as *not started* rather than unknown.
+        //
+        // Fail closed: if the intent to ask did not survive, do not ask. A
+        // prompt answered `yes` whose record was lost would let the effect
+        // begin while the log still said it had not been approved.
+        let requested = SessionEventKind::ApprovalRequested(ApprovalRequestedEvent {
+            turn_id: gate.turn_id.clone(),
+            call_id: gate.call_id.clone(),
+            call_index: gate.call_index,
+            scope_key: scope_key.clone(),
+        });
+        if let Err(error) = gate.append(requested).await {
+            return Decision::deny_because(format!(
+                "could not record the approval request durably ({error}); refusing rather than \
+                 acting on an approval the log would not remember"
+            ));
+        }
+        if let Err(error) = gate.durable().await {
+            return Decision::deny_because(format!(
+                "could not make the approval request durable ({error}); refusing rather than \
+                 acting on an approval the log would not remember"
+            ));
+        }
+
+        let asked_at = std::time::Instant::now();
+        let decision = self.approver.decide(request).await;
+        let waited_ms = asked_at.elapsed().as_millis() as i64;
+        let allowed = decision.is_allowed();
+
+        let resolved = SessionEventKind::ApprovalResolved(ApprovalResolvedEvent {
+            turn_id: gate.turn_id.clone(),
+            call_id: gate.call_id.clone(),
+            call_index: gate.call_index,
+            allowed,
+            // Which rung of the ladder decided is not yet reported by the
+            // approver; the field is here because recovery reads `allowed`, and
+            // filling it in is the run-ledger projection's job.
+            decided_by: String::new(),
+            reason: decision.feedback().unwrap_or_default().to_string(),
+            waited_ms,
+        });
+        if let Err(error) = gate.append(resolved).await {
+            return Decision::deny_because(format!("could not record the approval ({error})"));
+        }
+        // Only an *allow* has to be durable before it is acted on: it is what
+        // licenses the side effect. A denial runs nothing, so it can ride the
+        // next barrier like any other record.
+        if allowed && let Err(error) = gate.durable().await {
+            return Decision::deny_because(format!(
+                "the approval could not be made durable ({error}); refusing rather than acting \
+                 on one a crash would erase"
+            ));
+        }
+        decision
     }
 
     /// Resolves once this turn has been cancelled — and **never** otherwise, so
@@ -408,5 +526,136 @@ impl ToolContext {
             Some(signal) => signal.cancelled().await,
             None => std::future::pending().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod approval_gate_tests {
+    use super::*;
+    use crate::domain::session_event::SessionEvent;
+    use std::sync::Mutex;
+
+    /// An event store that records what reached it, and can be told to fail.
+    #[derive(Default)]
+    struct Recording {
+        appended: Mutex<Vec<SessionEventKind>>,
+        durable_calls: Mutex<usize>,
+        fail_append: bool,
+        fail_durable: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionEventRepository for Recording {
+        async fn append(&self, _s: &str, kinds: Vec<SessionEventKind>) -> anyhow::Result<Vec<u64>> {
+            if self.fail_append {
+                anyhow::bail!("disk full");
+            }
+            let mut all = self.appended.lock().unwrap();
+            let seqs = (all.len() as u64..).take(kinds.len()).collect();
+            all.extend(kinds);
+            Ok(seqs)
+        }
+        async fn durable_flush(&self, _s: &str) -> anyhow::Result<()> {
+            *self.durable_calls.lock().unwrap() += 1;
+            if self.fail_durable {
+                anyhow::bail!("fsync failed");
+            }
+            Ok(())
+        }
+        async fn events(&self, _s: &str) -> anyhow::Result<Vec<SessionEvent>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct Fixed(Decision);
+
+    #[async_trait::async_trait]
+    impl Approver for Fixed {
+        async fn decide(&self, _request: &ApprovalRequest) -> Decision {
+            self.0.clone()
+        }
+    }
+
+    fn ctx(store: Arc<Recording>, decision: Decision) -> ToolContext {
+        ToolContext::new(
+            SessionContext::detached("s"),
+            None,
+            Arc::new(Fixed(decision)),
+        )
+        .with_approval_gate(ApprovalGate::new(store, "s", "t1", "call-0", 0))
+    }
+
+    fn request() -> ApprovalRequest {
+        ApprovalRequest::normal("write /tmp/x").with_scope_key("file:write")
+    }
+
+    #[tokio::test]
+    async fn an_allow_is_durable_before_the_tool_may_act_on_it() {
+        let store = Arc::new(Recording::default());
+        let decision = ctx(store.clone(), Decision::Allow).decide(&request()).await;
+        assert!(decision.is_allowed());
+
+        let events = store.appended.lock().unwrap();
+        assert!(matches!(events[0], SessionEventKind::ApprovalRequested(_)));
+        assert!(matches!(events[1], SessionEventKind::ApprovalResolved(_)));
+        // Twice: once before the wait, once before Allow is handed back. Those
+        // are the two boundaries a crash has to be able to land between.
+        assert_eq!(*store.durable_calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_denial_needs_no_fsync_of_its_own() {
+        // A denial runs nothing, so it can ride the next barrier like any other
+        // record — only an allow licenses a side effect.
+        let store = Arc::new(Recording::default());
+        let decision = ctx(store.clone(), Decision::deny_because("no"))
+            .decide(&request())
+            .await;
+        assert!(!decision.is_allowed());
+        assert_eq!(
+            *store.durable_calls.lock().unwrap(),
+            1,
+            "only the pre-wait flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_cannot_be_recorded_is_never_asked() {
+        // Fail closed: a prompt answered `yes` whose record was lost would let
+        // the effect begin while the log still said it was never approved.
+        let store = Arc::new(Recording {
+            fail_append: true,
+            ..Recording::default()
+        });
+        let decision = ctx(store.clone(), Decision::Allow).decide(&request()).await;
+        assert!(!decision.is_allowed(), "must refuse, not proceed");
+        assert!(store.appended.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_allow_that_cannot_be_made_durable_is_refused() {
+        let store = Arc::new(Recording {
+            fail_durable: true,
+            ..Recording::default()
+        });
+        let decision = ctx(store.clone(), Decision::Allow).decide(&request()).await;
+        assert!(
+            !decision.is_allowed(),
+            "refusing beats acting on an approval a crash would erase"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_no_event_log_still_approves_normally() {
+        // Aux runtimes keep no log. They lose the not-started proof and nothing
+        // else — approval itself must not depend on being recordable.
+        let decision = ToolContext::new(
+            SessionContext::detached("s"),
+            None,
+            Arc::new(Fixed(Decision::Allow)),
+        )
+        .decide(&request())
+        .await;
+        assert!(decision.is_allowed());
     }
 }

@@ -35,6 +35,7 @@ pub use context::{
 use crate::tool_output_store::{Bounded, ToolOutputStore};
 use komo_core::domain::approval::{ApprovalRequest, Approver, Decision};
 use komo_core::domain::catalog::{CatalogSnapshot, ToolCatalog};
+use komo_core::domain::context::ApprovalGate;
 use komo_core::domain::events::TurnEvent;
 use komo_core::domain::hooks::{HookDecision, ToolHook};
 use komo_core::domain::llm::{ToolCallReq, ToolOutcome};
@@ -640,11 +641,22 @@ impl ToolExecutionCore {
                 // spawned task — the approvers still read them (they don't
                 // take a context parameter), and a fresh task doesn't inherit
                 // task-locals.
-                let ctx = ToolContext::new(
+                let mut ctx = ToolContext::new(
                     context.session.clone(),
                     context.run.clone(),
                     self.approver.clone(),
                 );
+                // Makes this call's approval a durable fact — the widest crash
+                // window in a turn is a person deciding.
+                if let (Some(events), Some(run)) = (&self.events, &context.run) {
+                    ctx = ctx.with_approval_gate(ApprovalGate::new(
+                        events.clone(),
+                        &context.session.session_id,
+                        &run.run_id,
+                        call_id,
+                        call_index,
+                    ));
+                }
                 let scope = context.session.clone();
                 let grants = current_job_grants();
                 let join = tokio::spawn(
