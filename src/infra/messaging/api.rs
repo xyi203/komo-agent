@@ -95,6 +95,13 @@ struct AppState {
     /// what is mounted *now* (python plugins mount and unmount live).
     tools: Arc<komo_core::domain::catalog::ToolCatalog>,
     handler: Arc<dyn MessageHandler>,
+    /// The gateway's turn arbiter. An HTTP turn takes the same per-session slot
+    /// a chat turn takes (`claim_session`), so "one turn per session" holds
+    /// across ingresses. Without it two clients on one session — a second TUI
+    /// resuming it, the desktop app beside the terminal — run concurrent turns,
+    /// and the later one assembles its history before the earlier one has
+    /// written its answer, so it re-runs work that is still in progress.
+    dispatcher: Arc<GatewayDispatcher>,
     actions: Arc<OperatorActions>,
     /// Channel names enabled on this gateway (for `/api/status`).
     channels: Arc<Vec<String>>,
@@ -170,6 +177,7 @@ impl ApiChannel {
     pub fn new(
         config: &ApiConfig,
         handler: Arc<dyn MessageHandler>,
+        dispatcher: Arc<GatewayDispatcher>,
         actions: Arc<OperatorActions>,
         tools: Arc<komo_core::domain::catalog::ToolCatalog>,
         channels: Vec<String>,
@@ -187,6 +195,7 @@ impl ApiChannel {
             state: AppState {
                 api_key: Arc::new(config.server_key.clone()),
                 handler,
+                dispatcher,
                 actions,
                 tools,
                 channels: Arc::new(channels),
@@ -475,8 +484,23 @@ fn bearer_matches(presented: &str, expected: &str) -> bool {
     crate::domain::pairing::ct_eq(&digest_hex(presented), &digest_hex(expected))
 }
 
-/// Maps any handler error to a 500 with a JSON body.
-struct ApiError(anyhow::Error);
+/// Maps a handler error to a JSON body — a 500 unless the handler says
+/// otherwise. A caller's own malformed input is a 400: reporting it as a server
+/// fault puts the client into a retry loop over the one thing only it can fix.
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    error: anyhow::Error,
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error: anyhow::anyhow!(message.into()),
+        }
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -484,19 +508,21 @@ impl IntoResponse for ApiError {
         // the *least* specific thing known about the failure — "qdrant is not
         // reachable" hides the "no route to host" underneath that says which
         // kind of unreachable it was.
-        let message = format!("{:#}", self.0);
-        warn!(error = %message, "api request failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": message })),
-        )
-            .into_response()
+        let message = format!("{:#}", self.error);
+        // A rejected request is the caller's business, not an incident.
+        if self.status.is_server_error() {
+            warn!(error = %message, "api request failed");
+        }
+        (self.status, Json(json!({ "error": message }))).into_response()
     }
 }
 
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(error: E) -> Self {
-        Self(error.into())
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error: error.into(),
+        }
     }
 }
 
@@ -553,7 +579,7 @@ async fn chat_completions(
     headers: axum::http::HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let (session_id, stateful) = resolve_session(&headers);
+    let (session_id, stateful) = resolve_session(&headers)?;
     let input = build_input(&req.messages, stateful);
     let model = if req.model.is_empty() {
         "komo".to_string()
@@ -614,12 +640,6 @@ async fn chat_completions(
             ctx = ctx.with_workspace(root);
         }
     }
-    // Every api turn is interruptible: the caller holds the connection, so it is
-    // the one surface with somewhere to put a stop button. The slot is dropped
-    // when the turn ends (below / in `stream_turn`) so a late cancel can't hit
-    // the next turn's signal.
-    let ctx = ctx.with_cancel(state.cancels.register(&session_id));
-
     let id = format!("chatcmpl-{}", uuid::Uuid::now_v7());
     let created = now();
 
@@ -630,6 +650,7 @@ async fn chat_completions(
         // stream) — this streams the *tool-call process*, which is the point.
         Ok(stream_turn(
             state.handler.clone(),
+            state.dispatcher.clone(),
             state.cancels.clone(),
             ctx,
             session_id,
@@ -639,9 +660,22 @@ async fn chat_completions(
             model,
         ))
     } else {
-        // Synchronous: drive the turn and await the full reply.
+        // Synchronous: take the session's turn slot, drive the turn, await the
+        // full reply. The claim waits out any turn already running on this
+        // session — a chat channel's or another HTTP caller's — so this turn
+        // reads a history that already holds the previous answer instead of
+        // starting the same work over.
+        let claim = state.dispatcher.claim_session(&session_id).await;
+        // Every api turn is interruptible: the caller holds the connection, so
+        // it is the one surface with somewhere to put a stop button. Registered
+        // only now that the slot is ours — the cancel map holds one signal per
+        // session, so registering while waiting would replace the running
+        // turn's and leave it unstoppable. Dropped when the turn ends so a late
+        // cancel can't hit the next turn's signal.
+        let ctx = ctx.with_cancel(state.cancels.register(&session_id));
         let reply = with_session(ctx, state.handler.handle(&session_id, input)).await;
         state.cancels.finish(&session_id);
+        claim.release();
         let reply = match reply {
             Err(error) if is_cancelled(&error) => CANCELLED_REPLY.to_string(),
             other => other?,
@@ -908,6 +942,7 @@ impl ToolEventSink for ChannelEventSink {
 #[allow(clippy::too_many_arguments)]
 fn stream_turn(
     handler: Arc<dyn MessageHandler>,
+    dispatcher: Arc<GatewayDispatcher>,
     cancels: Arc<CancelState>,
     ctx: SessionContext,
     session_id: String,
@@ -923,8 +958,15 @@ fn stream_turn(
     // Drive the turn; on completion push the final reply, then drop every sender
     // (this `tx` and the sink's clone inside `ctx`) so the receiver closes.
     tokio::spawn(async move {
+        // Claimed here rather than in the request handler so the SSE response
+        // starts at once: a caller queued behind a long turn sees keepalives
+        // and a live connection instead of a stalled request. See
+        // `GatewayDispatcher::claim_session` for why the wait exists at all.
+        let claim = dispatcher.claim_session(&session_id).await;
+        let ctx = ctx.with_cancel(cancels.register(&session_id));
         let outcome = with_session(ctx, handler.handle(&session_id, input)).await;
         cancels.finish(&session_id);
+        claim.release();
         let final_msg = match outcome {
             Ok(text) => text,
             // A cancel is the caller's own doing, not a failure to report as one.
@@ -984,21 +1026,30 @@ fn stream_turn(
 /// Continue an existing conversation only when the client opts in with
 /// `X-Komo-Session-Id`. Without it, mint an ephemeral session so no server-side
 /// history accrues — the client manages its own context.
-fn resolve_session(headers: &axum::http::HeaderMap) -> (String, bool) {
-    if let Some(id) = headers
+///
+/// The header **must be a UUID**, and is used verbatim. It used to be wrapped in
+/// an `api:` namespace, which every client then stripped back off — but that
+/// wrapper was doing one thing nobody had written down: keeping a caller from
+/// addressing another ingress's session. Without it a client could send
+/// `feishu:oc_x` and have its turn evaluated against that channel's permission
+/// scope and write into its memory scope. Requiring a UUID is what replaces the
+/// wrapper, and is why a rejected header is a 400 rather than a fresh session:
+/// silently answering somewhere else is how a client loses a conversation.
+fn resolve_session(headers: &axum::http::HeaderMap) -> Result<(String, bool), ApiError> {
+    let Some(id) = headers
         .get("x-komo-session-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-    {
-        // Dashboard clients may persist the server-returned id. It is already
-        // namespaced, so adding `api:` again creates an empty conversation.
-        // Strip every accidental legacy prefix too, so `api:api:<uuid>` repairs
-        // itself on the next request instead of becoming a third identity.
-        (format!("api:{}", id.trim_start_matches("api:")), true)
-    } else {
-        (format!("api:{}", uuid::Uuid::now_v7()), false)
+    else {
+        return Ok((uuid::Uuid::now_v7().to_string(), false));
+    };
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Err(ApiError::bad_request(
+            "X-Komo-Session-Id must be a UUID (komo mints one when the header is absent)",
+        ));
     }
+    Ok((id.to_string(), true))
 }
 
 /// Reduce the OpenAI `messages` array to one input string for the turn.
@@ -1223,18 +1274,22 @@ async fn resume_run(
     } else {
         SessionContext::detached(&run.session_id)
     };
+    // A resume is a turn like any other, so it queues behind whatever the
+    // session is already doing rather than running beside it.
+    let claim = state.dispatcher.claim_session(&run.session_id).await;
     // Journal-continue first: the interrupted turn picks up exactly where it
     // stopped, tool rounds already paid for replayed instead of re-run. Only
     // when the run isn't continuable (no journal, transcript already answered)
     // does the digest-primed fresh turn run — yesterday's behavior, verbatim.
-    let (reply, continued) =
-        match with_session(ctx.clone(), state.handler.resume_interrupted(&run)).await? {
-            Some(reply) => (reply, true),
-            None => (
-                with_session(ctx, state.handler.handle(&run.session_id, input)).await?,
-                false,
-            ),
-        };
+    let resumed = match with_session(ctx.clone(), state.handler.resume_interrupted(&run)).await {
+        Ok(Some(reply)) => Ok((reply, true)),
+        Ok(None) => with_session(ctx, state.handler.handle(&run.session_id, input))
+            .await
+            .map(|reply| (reply, false)),
+        Err(error) => Err(error),
+    };
+    claim.release();
+    let (reply, continued) = resumed?;
 
     if let Err(error) = state.actions.runs.mark_resumed(&id).await {
         warn!(%error, run_id = %id, "failed to clear recoverable flag after resume");
@@ -1740,41 +1795,49 @@ mod tests {
     #[test]
     fn resolve_session_is_ephemeral_without_header() {
         let headers = axum::http::HeaderMap::new();
-        let (id, stateful) = resolve_session(&headers);
-        assert!(id.starts_with("api:"));
+        let (id, stateful) = resolve_session(&headers).expect("no header is not an error");
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
         assert!(!stateful);
     }
 
     #[test]
-    fn resolve_session_uses_header_when_present() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("x-komo-session-id", "panel-1".parse().unwrap());
-        let (id, stateful) = resolve_session(&headers);
-        assert_eq!(id, "api:panel-1");
-        assert!(stateful);
-    }
-
-    #[test]
-    fn resolve_session_does_not_double_prefix_a_server_id() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("x-komo-session-id", "api:panel-1".parse().unwrap());
-        let (id, stateful) = resolve_session(&headers);
-        assert_eq!(id, "api:panel-1");
-        assert!(stateful);
-    }
-
-    #[test]
-    fn resolve_session_repairs_repeated_legacy_prefixes() {
+    fn resolve_session_uses_a_uuid_header_verbatim() {
+        // One form, everywhere: what the client sends is the id komo stores and
+        // the id `komo resume` takes. Nothing is added and nothing is stripped.
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             "x-komo-session-id",
-            "api:api:019fad15-8199-7461-9d48-0a6c779f1c8d"
-                .parse()
-                .unwrap(),
+            "019fad15-8199-7461-9d48-0a6c779f1c8d".parse().unwrap(),
         );
-        let (id, stateful) = resolve_session(&headers);
-        assert_eq!(id, "api:019fad15-8199-7461-9d48-0a6c779f1c8d");
+        let (id, stateful) = resolve_session(&headers).expect("a uuid is accepted");
+        assert_eq!(id, "019fad15-8199-7461-9d48-0a6c779f1c8d");
         assert!(stateful);
+    }
+
+    /// The `api:` prefix used to wrap whatever a client sent, which quietly kept
+    /// it inside its own namespace. Without the wrapper the header *is* the
+    /// session id, so a caller that could name anything could address another
+    /// ingress's conversation — and be evaluated against that channel's
+    /// permission scope and write into its memory scope. Requiring a UUID is
+    /// what replaces the wrapper.
+    #[test]
+    fn resolve_session_refuses_an_id_that_is_not_a_uuid() {
+        for forged in [
+            "feishu:oc_abc",
+            "panel-1",
+            "api:019fad15-8199-7461-9d48-0a6c779f1c8d",
+            "../../etc/passwd",
+        ] {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("x-komo-session-id", forged.parse().unwrap());
+            let rejected = resolve_session(&headers);
+            assert!(rejected.is_err(), "{forged} must be refused");
+            assert_eq!(
+                rejected.err().unwrap().status,
+                StatusCode::BAD_REQUEST,
+                "{forged} is the caller's mistake, not a server fault"
+            );
+        }
     }
 
     #[test]

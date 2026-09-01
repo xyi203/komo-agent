@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Notify, oneshot, watch};
 use tracing::{info, warn};
 
 use komo_core::domain::{
@@ -39,6 +39,7 @@ use komo_core::domain::{
     inbox::{InboundOrigin, InboxClaim, InboxRepository},
     pairing::{ApproveOutcome, PairingRepository, PairingStatus},
     repository::SessionRepository,
+    session::{ChannelPeer, Session},
     todo::SessionTodoRepository,
 };
 
@@ -364,7 +365,7 @@ impl Approver for ChatApprover {
             return Decision::Allow;
         }
 
-        let channel = komo_core::domain::policy::channel_of(&ctx.session_id);
+        let channel = ctx.channel_name().to_string();
         if let Err(error) = ctx.sink.send(&prompt(request, &channel)).await {
             warn!(%error, "failed to send approval prompt; denying");
             return Decision::deny();
@@ -532,6 +533,11 @@ pub struct GatewayDispatcher {
     /// its queue holds up to [`QUEUE_CAP`] messages that arrived mid-turn, drained
     /// FIFO as each turn finishes (so a quick follow-up is answered, not dropped).
     inflight: Mutex<HashMap<String, VecDeque<QueuedMessage>>>,
+    /// Raised whenever a session leaves [`inflight`](Self::inflight), so a
+    /// caller parked in [`claim_session`](Self::claim_session) can look again.
+    /// One `Notify` for every session rather than one each: a release is rare,
+    /// waiters are few, and a spurious wake costs one re-check of a `HashMap`.
+    idle: Notify,
 }
 
 /// How many mid-turn messages a session may queue before further ones are
@@ -569,6 +575,7 @@ impl GatewayDispatcher {
             pairings,
             inbox,
             inflight: Mutex::new(HashMap::new()),
+            idle: Notify::new(),
         }
     }
 
@@ -580,6 +587,50 @@ impl GatewayDispatcher {
         self.inflight.lock().unwrap().len()
     }
 
+    /// Claim a session's turn slot for a caller that drives the turn itself,
+    /// waiting while another turn holds it.
+    ///
+    /// A chat channel never needs this: [`spawn_turn`](Self::spawn_turn) leaves
+    /// its message in the queue and returns, and the answer finds its way back
+    /// through a [`ReplySink`] that addresses the whole conversation. An HTTP
+    /// turn can do neither — the caller is holding the connection and is owed
+    /// *its own* reply — so it waits for the slot instead of queueing behind it.
+    ///
+    /// Both routes go through the one `inflight` map, which is what makes "one
+    /// turn per session" true *across* ingresses rather than within each. Two
+    /// turns on one session is not merely untidy: the second assembles its
+    /// history before the first has written a word of its answer, so it starts
+    /// over from the original question and re-runs every tool the first one is
+    /// still paying for.
+    ///
+    /// The wait is deliberately unbounded. A turn can legitimately run for
+    /// minutes, and refusing the message at some deadline would throw away what
+    /// the user typed — strictly worse than making them wait for an answer that
+    /// will have the previous turn's conclusions already in it.
+    pub async fn claim_session(self: &Arc<Self>, session: &str) -> SessionClaim {
+        loop {
+            // Enlisted *before* the map is read: `notified()` does not register
+            // a waiter until it is first polled, so a release landing between
+            // the read and the await would be a wake nobody is listening for.
+            let mut idle = std::pin::pin!(self.idle.notified());
+            idle.as_mut().enable();
+            {
+                let mut inflight = self.inflight.lock().unwrap();
+                if !inflight.contains_key(session) {
+                    inflight.insert(session.to_string(), VecDeque::new());
+                    return SessionClaim {
+                        guard: TurnGuard {
+                            dispatcher: self.clone(),
+                            session: session.to_string(),
+                            armed: true,
+                        },
+                    };
+                }
+            }
+            idle.await;
+        }
+    }
+
     /// Handle one inbound message. Returns promptly: a plain message spawns its
     /// turn and returns, so the caller's receive loop is never blocked.
     ///
@@ -588,13 +639,29 @@ impl GatewayDispatcher {
     /// at-least-once, and the gate has to sit in front of *commands* too — a
     /// redelivered `/approve` would approve a second time, which is worse than
     /// a repeated question.
+    ///
+    /// Takes the *correspondent*, not a session id: a channel knows who wrote,
+    /// and which conversation that is belongs to the store. Resolving it here
+    /// rather than in each channel is what keeps three ingresses from growing
+    /// three copies of "find or open the session".
     pub async fn handle(
         self: &Arc<Self>,
-        session_id: &str,
+        peer: &ChannelPeer,
         origin: InboundOrigin,
         text: String,
         sink: Arc<dyn ReplySink>,
     ) {
+        let session_id = match self.session_for(peer).await {
+            Ok(id) => id,
+            Err(error) => {
+                // Without a session there is nowhere to put the turn, so say so
+                // rather than drop the message silently.
+                warn!(%error, platform = %peer.platform, "could not open a session for this chat");
+                let _ = sink.send("会话打开失败，请稍后再试。").await;
+                return;
+            }
+        };
+        let session_id = session_id.as_str();
         match self.inbox.claim(&origin, session_id, &text).await {
             Ok(InboxClaim::Duplicate) => {
                 info!(
@@ -611,7 +678,7 @@ impl GatewayDispatcher {
                 warn!(%error, "inbox claim failed; handling the message anyway");
             }
         }
-        self.dispatch(session_id, text, sink).await;
+        self.dispatch(session_id, peer, text, sink).await;
         if let Err(error) = self.inbox.complete(&origin).await {
             // The row stays `claimed`. Harmless today (the key already blocks a
             // redelivery); it becomes the signal for crash re-delivery later.
@@ -619,8 +686,36 @@ impl GatewayDispatcher {
         }
     }
 
+    /// The session that answers `peer`, opening one the first time that
+    /// correspondent writes.
+    ///
+    /// A conversation's identity is its session id and nothing else, so the map
+    /// from an address to that id is **stored**, not computed. It used to be
+    /// computed — the session id *was* `feishu:{chat_id}` — which meant a
+    /// conversation could not exist without an address, an address could not
+    /// change, and anything able to name a session id could name a channel.
+    async fn session_for(&self, peer: &ChannelPeer) -> anyhow::Result<String> {
+        if let Some(existing) = self.sessions.find_by_peer(peer).await? {
+            return Ok(existing.id);
+        }
+        let session = Session::new(uuid::Uuid::now_v7().to_string()).with_channel(peer.clone());
+        self.sessions.save(&session).await?;
+        info!(
+            platform = %peer.platform,
+            session = %session.id,
+            "opened a session for a new chat"
+        );
+        Ok(session.id)
+    }
+
     /// Route one already-deduped message.
-    async fn dispatch(self: &Arc<Self>, session_id: &str, text: String, sink: Arc<dyn ReplySink>) {
+    async fn dispatch(
+        self: &Arc<Self>,
+        session_id: &str,
+        peer: &ChannelPeer,
+        text: String,
+        sink: Arc<dyn ReplySink>,
+    ) {
         match classify(&text) {
             Command::Approve(answer) => {
                 let asked = answer.clone();
@@ -677,9 +772,11 @@ impl GatewayDispatcher {
                 let _ = sink.send("已开始新会话，之前的上下文已归档。").await;
             }
             Command::SetHome => {
-                let reply = match self.home.set(session_id).await {
+                // The *address*, not the session: proactive output is delivered
+                // to a correspondent, and a session id names no channel.
+                let reply = match self.home.set(&peer.address()).await {
                     Ok(()) => {
-                        info!(session = %session_id, "home channel set via /sethome");
+                        info!(home = %peer.address(), "home channel set via /sethome");
                         "✅ 已将当前会话设为提醒与通知的接收频道。"
                     }
                     Err(error) => {
@@ -861,6 +958,8 @@ impl GatewayDispatcher {
             // A chat turn is user-driven: policy evaluates it against the
             // channel, and a human is reachable for an approval prompt.
             origin: SessionOrigin::User,
+            // Filled in by `dispatch_turn`'s caller-supplied context below.
+            channel: None,
         };
         tokio::spawn(async move {
             // Armed until normal completion below. If the task is cancelled
@@ -918,6 +1017,10 @@ impl GatewayDispatcher {
             if queue.is_empty() {
                 // Queue drained: the session is now idle.
                 inflight.remove(session);
+                // Whoever is parked in `claim_session` may take it now. Raised
+                // under the lock, so a waiter cannot observe the key gone and
+                // still miss the wake.
+                self.idle.notify_waiters();
                 None
             } else {
                 // Keeps the session marked in-flight for the next turn.
@@ -985,6 +1088,30 @@ impl InterjectSource for QueueInterjector {
 /// resend rather than wait for an answer that isn't coming.
 const QUEUED_MESSAGE_DROPPED: &str = "刚才那条消息没能处理（服务重启或任务中断），请重发。";
 
+/// One self-driven turn's exclusive hold on its session, from
+/// [`GatewayDispatcher::claim_session`].
+///
+/// Release it with [`release`](Self::release) when the turn ends — that is what
+/// hands the session to whatever queued behind it. Dropping it instead (a
+/// panic, a cancelled task) still frees the session, but a queued message dies
+/// with it: there is no turn left to run it on, the same way a chat turn's
+/// [`TurnGuard`] loses its queue on that path.
+pub struct SessionClaim {
+    guard: TurnGuard,
+}
+
+impl SessionClaim {
+    /// The turn is over: drop what it left pending and dispatch whatever queued
+    /// behind it.
+    pub fn release(mut self) {
+        self.guard.armed = false;
+        let dispatcher = self.guard.dispatcher.clone();
+        let session = self.guard.session.clone();
+        drop(self);
+        dispatcher.finish_turn(&session);
+    }
+}
+
 /// Releases a session's turn state on the exit paths a normal completion can't
 /// cover — a panic that escapes the catch, or task cancellation. On drop while
 /// still `armed` it forgets any pending approval and clears the in-flight flag
@@ -1003,14 +1130,16 @@ impl Drop for TurnGuard {
             self.dispatcher.approvals.forget_pending(&self.session);
             self.dispatcher.approvals.release_gate(&self.session);
             self.dispatcher.clarify.clear(&self.session);
-            let dropped: Vec<Arc<dyn ReplySink>> = self
-                .dispatcher
-                .inflight
-                .lock()
-                .unwrap()
-                .remove(&self.session)
-                .map(|queue| queue.into_iter().map(|msg| msg.sink).collect())
-                .unwrap_or_default();
+            let dropped: Vec<Arc<dyn ReplySink>> = {
+                let mut inflight = self.dispatcher.inflight.lock().unwrap();
+                let dropped = inflight
+                    .remove(&self.session)
+                    .map(|queue| queue.into_iter().map(|msg| msg.sink).collect())
+                    .unwrap_or_default();
+                // Same reason as `finish_turn`: the session just became free.
+                self.dispatcher.idle.notify_waiters();
+                dropped
+            };
             // Queued messages can't be dispatched from Drop (no turn to run
             // them on), so they are lost. This path is effectively
             // cancellation-only — gateway shutdown — but the loss must not be
@@ -1191,22 +1320,71 @@ mod tests {
         }
     }
 
-    // The plain-text turn path touches only the handler, approval state, and the
-    // in-flight map — never these repositories — so the fakes are unreachable.
-    struct UnusedSessions;
-    #[async_trait]
-    impl SessionRepository for UnusedSessions {
-        async fn find(&self, _id: &str) -> anyhow::Result<Option<Session>> {
-            unimplemented!()
+    /// Just enough session store for the dispatcher: `handle` now resolves a
+    /// correspondent to its session, so the tests need that mapping to behave —
+    /// open one on first contact, return the same one after.
+    #[derive(Default)]
+    struct MemorySessions {
+        rows: Mutex<Vec<Session>>,
+    }
+
+    impl MemorySessions {
+        /// Pre-open `id` for `peer`, so a test can name the session a message
+        /// will land in before it arrives.
+        fn seeded(id: &str, peer: &ChannelPeer) -> Arc<Self> {
+            let store = Self::default();
+            store
+                .rows
+                .lock()
+                .unwrap()
+                .push(Session::new(id).with_channel(peer.clone()));
+            Arc::new(store)
         }
-        async fn find_windowed(&self, _id: &str, _limit: usize) -> anyhow::Result<Option<Session>> {
-            unimplemented!()
+
+        /// The session ids handed out so far, in order of creation.
+        fn ids(&self) -> Vec<String> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.id.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl SessionRepository for MemorySessions {
+        async fn find_by_peer(&self, channel: &ChannelPeer) -> anyhow::Result<Option<Session>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|s| s.channel.as_ref() == Some(channel))
+                .cloned())
+        }
+        async fn find(&self, id: &str) -> anyhow::Result<Option<Session>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|s| s.id == id)
+                .cloned())
+        }
+        async fn find_windowed(&self, id: &str, _limit: usize) -> anyhow::Result<Option<Session>> {
+            SessionRepository::find(self, id).await
         }
         async fn list(&self) -> anyhow::Result<Vec<Session>> {
-            unimplemented!()
+            Ok(self.rows.lock().unwrap().clone())
         }
-        async fn save(&self, _session: &Session) -> anyhow::Result<()> {
-            unimplemented!()
+        async fn save(&self, session: &Session) -> anyhow::Result<()> {
+            let mut rows = self.rows.lock().unwrap();
+            match rows.iter_mut().find(|s| s.id == session.id) {
+                Some(existing) => *existing = session.clone(),
+                None => rows.push(session.clone()),
+            }
+            Ok(())
         }
         async fn delete_empty_sessions(&self) -> anyhow::Result<usize> {
             unimplemented!()
@@ -1284,17 +1462,31 @@ mod tests {
         clarify: Arc<ClarifyState>,
         inbox: Arc<dyn InboxRepository>,
     ) -> Arc<GatewayDispatcher> {
+        dispatcher_with_sessions(handler, clarify, inbox, Arc::new(MemorySessions::default()))
+    }
+
+    fn dispatcher_with_sessions(
+        handler: Arc<GateHandler>,
+        clarify: Arc<ClarifyState>,
+        inbox: Arc<dyn InboxRepository>,
+        sessions: Arc<dyn SessionRepository>,
+    ) -> Arc<GatewayDispatcher> {
         Arc::new(GatewayDispatcher::new(
             handler,
             Arc::new(ApprovalState::new()),
             clarify,
-            Arc::new(UnusedSessions),
+            sessions,
             Arc::new(UnusedHome),
             Arc::new(UnusedTodos),
             None,
             Arc::new(UnusedPairings),
             inbox,
         ))
+    }
+
+    /// The correspondent the dispatcher tests speak as.
+    fn peer() -> ChannelPeer {
+        ChannelPeer::new("telegram", "1")
     }
 
     /// Dedupe has its own test below; every other test wants each message
@@ -1343,6 +1535,129 @@ mod tests {
         }
     }
 
+    // A conversation's identity is its session id, and the map from a chat
+    // address to that id is stored — so the same correspondent keeps reaching
+    // the same conversation, and a different one never does. This used to be
+    // arithmetic on strings (`feishu:{chat_id}` *was* the session id), which is
+    // why nothing tested it.
+    #[tokio::test]
+    async fn a_correspondent_keeps_reaching_the_same_session() {
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let sessions = Arc::new(MemorySessions::default());
+        let dispatcher = dispatcher_with_sessions(
+            Arc::new(GateHandler {
+                entered: entered_tx,
+                permits: Arc::new(Semaphore::new(10)),
+            }),
+            Arc::new(ClarifyState::new()),
+            Arc::new(AlwaysFreshInbox),
+            sessions.clone(),
+        );
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
+
+        let alice = ChannelPeer::new("feishu", "oc_alice");
+        for text in ["第一句", "第二句"] {
+            dispatcher
+                .handle(&alice, InboundOrigin::local(), text.into(), sink.clone())
+                .await;
+            next_entered(&mut entered_rx).await;
+        }
+        assert_eq!(sessions.ids().len(), 1, "one correspondent, one session");
+
+        // A different chat on the same platform is a different conversation.
+        dispatcher
+            .handle(
+                &ChannelPeer::new("feishu", "oc_bob"),
+                InboundOrigin::local(),
+                "你好".into(),
+                sink,
+            )
+            .await;
+        next_entered(&mut entered_rx).await;
+        let ids = sessions.ids();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+
+        // And the id itself carries nothing: it is a uuid, not an address.
+        for id in ids {
+            assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
+        }
+        // The address lives in a field, where one reader can find it.
+        let stored = sessions.find_by_peer(&alice).await.unwrap().unwrap();
+        assert_eq!(stored.channel.as_ref(), Some(&alice));
+    }
+
+    // An HTTP turn takes the same per-session slot a chat turn takes, so two
+    // clients on one session (a second TUI resuming it, the desktop app beside
+    // the terminal) can never run turns side by side. They used to: the api
+    // channel called the handler directly, and the later turn assembled its
+    // history before the earlier one had written a word of its answer — so it
+    // started over from the original question and re-ran everything the first
+    // was still doing.
+    #[tokio::test]
+    async fn a_second_claim_on_one_session_waits_for_the_first() {
+        let (entered_tx, _entered_rx) = mpsc::unbounded_channel();
+        let dispatcher = dispatcher_with(Arc::new(GateHandler {
+            entered: entered_tx,
+            permits: Arc::new(Semaphore::new(0)),
+        }));
+
+        let first = dispatcher.claim_session("s1").await;
+
+        let mut waiting = {
+            let dispatcher = dispatcher.clone();
+            tokio::spawn(async move { dispatcher.claim_session("s1").await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "a second turn must not start while the first holds the session"
+        );
+
+        // The gate is per session, not global: an unrelated session is free.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), dispatcher.claim_session("s2"))
+                .await
+                .is_ok(),
+            "another session must not be blocked by this one"
+        );
+
+        first.release();
+        let second = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the slot must be handed over once the first turn releases")
+            .expect("the waiting task must not panic");
+        second.release();
+    }
+
+    // The other direction of the same invariant: a chat message that arrives
+    // while a self-driven (HTTP) turn holds the session queues behind it and
+    // runs when it finishes, rather than opening a concurrent turn.
+    #[tokio::test]
+    async fn a_chat_message_arriving_during_a_claimed_turn_runs_after_it() {
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let dispatcher = dispatcher_with(Arc::new(GateHandler {
+            entered: entered_tx,
+            permits: Arc::new(Semaphore::new(1)),
+        }));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
+
+        let claim = dispatcher.claim_session("s1").await;
+        dispatcher
+            .handle(&peer(), InboundOrigin::local(), "看下 A".into(), sink)
+            .await;
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "the chat message must queue, not run beside the claimed turn"
+        );
+
+        claim.release();
+        assert_eq!(next_entered(&mut entered_rx).await, "看下 A");
+    }
+
     // A plain message answers a pending clarify question instead of starting a
     // new turn; once nothing is pending, plain messages dispatch normally.
     #[tokio::test]
@@ -1354,14 +1669,24 @@ mod tests {
             permits: permits.clone(),
         });
         let clarify = Arc::new(ClarifyState::new());
-        let dispatcher = dispatcher_with_clarify(handler, clarify.clone());
+        let dispatcher = dispatcher_with_sessions(
+            handler,
+            clarify.clone(),
+            Arc::new(AlwaysFreshInbox),
+            MemorySessions::seeded("s1", &peer()),
+        );
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
 
         // A turn is suspended on a question.
         let rx = clarify.register("s1", "什么颜色？");
         dispatcher
-            .handle("s1", InboundOrigin::local(), "蓝色的".into(), sink.clone())
+            .handle(
+                &peer(),
+                InboundOrigin::local(),
+                "蓝色的".into(),
+                sink.clone(),
+            )
             .await;
         assert_eq!(rx.await.unwrap(), "蓝色的", "message became the answer");
         assert!(
@@ -1371,7 +1696,7 @@ mod tests {
 
         // With nothing pending, the next message dispatches a turn as usual.
         dispatcher
-            .handle("s1", InboundOrigin::local(), "next".into(), sink.clone())
+            .handle(&peer(), InboundOrigin::local(), "next".into(), sink.clone())
             .await;
         assert_eq!(next_entered(&mut entered_rx).await, "next");
         permits.add_permits(1);
@@ -1393,7 +1718,12 @@ mod tests {
 
         let _rx = clarify.register("s1", "问题？");
         dispatcher
-            .handle("s1", InboundOrigin::local(), "/deny".into(), sink.clone())
+            .handle(
+                &peer(),
+                InboundOrigin::local(),
+                "/deny".into(),
+                sink.clone(),
+            )
             .await;
         assert!(
             clarify.has_pending("s1"),
@@ -1487,13 +1817,13 @@ mod tests {
         let origin = InboundOrigin::new("telegram", "42");
 
         dispatcher
-            .handle("s1", origin.clone(), "hello".into(), sink.clone())
+            .handle(&peer(), origin.clone(), "hello".into(), sink.clone())
             .await;
         assert_eq!(next_entered(&mut entered_rx).await, "hello");
 
         // The same platform message, delivered again.
         dispatcher
-            .handle("s1", origin, "hello".into(), sink.clone())
+            .handle(&peer(), origin, "hello".into(), sink.clone())
             .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -1504,7 +1834,7 @@ mod tests {
         // A genuinely new message still gets through.
         dispatcher
             .handle(
-                "s1",
+                &peer(),
                 InboundOrigin::new("telegram", "43"),
                 "and another".into(),
                 sink,
@@ -1527,19 +1857,19 @@ mod tests {
 
         // m1 dispatches and blocks in the handler.
         dispatcher
-            .handle("s1", InboundOrigin::local(), "m1".into(), sink.clone())
+            .handle(&peer(), InboundOrigin::local(), "m1".into(), sink.clone())
             .await;
         assert_eq!(next_entered(&mut entered_rx).await, "m1");
 
         // m2, m3 queue behind it; m4 overflows the cap and is rejected.
         dispatcher
-            .handle("s1", InboundOrigin::local(), "m2".into(), sink.clone())
+            .handle(&peer(), InboundOrigin::local(), "m2".into(), sink.clone())
             .await;
         dispatcher
-            .handle("s1", InboundOrigin::local(), "m3".into(), sink.clone())
+            .handle(&peer(), InboundOrigin::local(), "m3".into(), sink.clone())
             .await;
         dispatcher
-            .handle("s1", InboundOrigin::local(), "m4".into(), sink.clone())
+            .handle(&peer(), InboundOrigin::local(), "m4".into(), sink.clone())
             .await;
 
         // Everything queued behind m1 runs as ONE turn, in order — a user who
@@ -1566,22 +1896,27 @@ mod tests {
     async fn a_running_turn_takes_queued_messages_for_itself() {
         let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
         let permits = Arc::new(Semaphore::new(0));
-        let dispatcher = dispatcher_with(Arc::new(GateHandler {
-            entered: entered_tx,
-            permits: permits.clone(),
-        }));
+        let dispatcher = dispatcher_with_sessions(
+            Arc::new(GateHandler {
+                entered: entered_tx,
+                permits: permits.clone(),
+            }),
+            Arc::new(ClarifyState::new()),
+            Arc::new(AlwaysFreshInbox),
+            MemorySessions::seeded("s7", &peer()),
+        );
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
 
         dispatcher
-            .handle("s7", InboundOrigin::local(), "m1".into(), sink.clone())
+            .handle(&peer(), InboundOrigin::local(), "m1".into(), sink.clone())
             .await;
         assert_eq!(next_entered(&mut entered_rx).await, "m1");
         dispatcher
-            .handle("s7", InboundOrigin::local(), "m2".into(), sink.clone())
+            .handle(&peer(), InboundOrigin::local(), "m2".into(), sink.clone())
             .await;
         dispatcher
-            .handle("s7", InboundOrigin::local(), "m3".into(), sink.clone())
+            .handle(&peer(), InboundOrigin::local(), "m3".into(), sink.clone())
             .await;
 
         // What the agent loop does between rounds.
@@ -1662,13 +1997,18 @@ mod tests {
         // First turn panics — the catch keeps the task alive and the guard/finish
         // path releases the session.
         dispatcher
-            .handle("s1", InboundOrigin::local(), "boom".into(), sink.clone())
+            .handle(&peer(), InboundOrigin::local(), "boom".into(), sink.clone())
             .await;
         assert_eq!(next_entered(&mut entered_rx).await, "boom");
 
         // A later message must still be handled (session not permanently busy).
         dispatcher
-            .handle("s1", InboundOrigin::local(), "after".into(), sink.clone())
+            .handle(
+                &peer(),
+                InboundOrigin::local(),
+                "after".into(),
+                sink.clone(),
+            )
             .await;
         permits.add_permits(1);
         assert_eq!(next_entered(&mut entered_rx).await, "after");

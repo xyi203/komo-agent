@@ -155,7 +155,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     };
     plugins::run_sweep_phase(&roster, &gate, &mut sweep_reg, &sweep_cx).await?;
 
-    let mut gateway = Gateway::new(dispatcher);
+    let mut gateway = Gateway::new(dispatcher.clone());
     for service in sweep_reg.into_sweeps() {
         gateway = gateway.with_maintenance(service);
     }
@@ -209,6 +209,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         gateway = gateway.add_channel(Box::new(ApiChannel::new(
             api,
             handler.clone(),
+            dispatcher.clone(),
             actions,
             tool_catalog,
             enabled,
