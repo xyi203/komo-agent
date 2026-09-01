@@ -14,7 +14,9 @@
 //! Access control follows hermes-agent's feishu adapter: an `allow_from`
 //! open_id allowlist (empty = open), a `require_mention` gate for group
 //! chats (DMs always bypass), and an optional `home_chat` that receives
-//! proactive output (reminders) via the shared `HomeNotifier`.
+//! proactive output (reminders) via the shared `HomeNotifier`. The mention
+//! gate matches the bot's *own* open_id, resolved once at startup: a group
+//! message that @s somebody else is not addressed to the agent.
 
 use komo_agent::gateway::Channel;
 use komo_agent::interaction::GatewayDispatcher;
@@ -119,6 +121,46 @@ impl FeishuSender {
         Ok(response.tenant_access_token)
     }
 
+    /// The bot's own open_id, which the group mention gate compares each
+    /// mention against. Resolved once at startup, not per message.
+    async fn bot_open_id(&self) -> anyhow::Result<String> {
+        #[derive(Deserialize)]
+        struct InfoResponse {
+            code: i64,
+            #[serde(default)]
+            msg: String,
+            #[serde(default)]
+            bot: BotInfo,
+        }
+
+        #[derive(Deserialize, Default)]
+        struct BotInfo {
+            #[serde(default)]
+            open_id: String,
+        }
+
+        let token = self.tenant_access_token().await?;
+        let response: InfoResponse = self
+            .http
+            .get(format!("{FEISHU_BASE_URL}/open-apis/bot/v3/info"))
+            .bearer_auth(token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if response.code != 0 {
+            anyhow::bail!(
+                "feishu bot info request failed: code {} ({})",
+                response.code,
+                response.msg
+            );
+        }
+        if response.bot.open_id.is_empty() {
+            anyhow::bail!("feishu bot info returned no open_id");
+        }
+        Ok(response.bot.open_id)
+    }
+
     /// Send a plain text message into a chat (works for both p2p and group).
     pub async fn send_text(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
         #[derive(Deserialize)]
@@ -171,8 +213,11 @@ impl ReplySink for FeishuReplySink {
 /// pairing) is the `PairingGuard`'s job, checked in the async consumer.
 #[derive(Clone, Default)]
 struct AdmitPolicy {
-    /// Group messages must carry an @mention (DMs always pass).
+    /// Group messages must @mention the bot itself (DMs always pass).
     require_mention: bool,
+    /// The bot's own open_id, resolved once at serve time. Empty means the
+    /// mention gate cannot match, which fails closed.
+    bot_open_id: String,
 }
 
 pub struct FeishuChannel {
@@ -199,6 +244,7 @@ impl FeishuChannel {
             sender,
             policy: AdmitPolicy {
                 require_mention: config.require_mention,
+                bot_open_id: String::new(),
             },
             guard: PairingGuard::new("feishu", config.allow_from.clone(), pairings),
         }
@@ -216,6 +262,33 @@ impl Channel for FeishuChannel {
         dispatcher: Arc<GatewayDispatcher>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
+        // The mention gate matches against the bot's own open_id; without it a
+        // mention of anyone would admit the message. Keep retrying until it
+        // resolves — the ws connection needs the same network anyway, so
+        // waiting here delays nothing that could otherwise proceed. Nothing
+        // else needs the id, so a gate that is off skips the call entirely.
+        let mut policy = self.policy.clone();
+        if policy.require_mention {
+            let mut backoff = 0usize;
+            policy.bot_open_id = loop {
+                tokio::select! {
+                    _ = shutdown.changed() => return Ok(()),
+                    result = self.sender.bot_open_id() => match result {
+                        Ok(open_id) => break open_id,
+                        Err(error) => {
+                            warn!(%error, "feishu bot info fetch failed; retrying");
+                            tokio::select! {
+                                _ = shutdown.changed() => return Ok(()),
+                                _ = tokio::time::sleep(reconnect_backoff(backoff)) => {}
+                            }
+                            backoff += 1;
+                        }
+                    }
+                }
+            };
+            info!(bot = %policy.bot_open_id, "feishu bot identified");
+        }
+
         let (tx, mut rx) = mpsc::unbounded_channel::<Inbound>();
 
         // The long connection runs on its own thread with a single-threaded
@@ -224,7 +297,7 @@ impl Channel for FeishuChannel {
         let ws_thread = spawn_ws_thread(
             self.sender.app_id.clone(),
             self.sender.app_secret.clone(),
-            self.policy.clone(),
+            policy,
             tx,
             shutdown.clone(),
         );
@@ -304,10 +377,7 @@ fn spawn_ws_thread(
             // receipts and the rest are acked without a handler.
             let dispatcher = match EventDispatcherHandler::builder().register_raw(
                 "im.message.receive_v1",
-                ReceiveHandler {
-                    policy,
-                    events,
-                },
+                ReceiveHandler { policy, events },
             ) {
                 Ok(builder) => builder.build(),
                 Err(error) => {
@@ -417,7 +487,15 @@ struct EventMessage {
     #[serde(default)]
     content: String,
     #[serde(default)]
-    mentions: Option<Vec<serde_json::Value>>,
+    mentions: Option<Vec<EventMention>>,
+}
+
+/// One `@` in the message text. `id` is absent for a mention Feishu cannot
+/// resolve for this app, which can never be the bot itself.
+#[derive(Deserialize)]
+struct EventMention {
+    #[serde(default)]
+    id: Option<SenderId>,
 }
 
 /// Reduce a raw receive event to an `Inbound`, or `None` when the agent
@@ -435,15 +513,19 @@ fn admit(event: ReceiveEvent, policy: &AdmitPolicy) -> Option<Inbound> {
     if message.message_type != "text" {
         return None;
     }
-    // Approximation of hermes' mention gate: we don't know the bot's own
-    // open_id, so any @mention admits the message. The platform-side scope
-    // (`im:message.group_at_msg`) already narrows delivery to @bot messages
-    // for most apps.
-    if message.chat_type == "group"
-        && policy.require_mention
-        && message.mentions.as_ref().is_none_or(|m| m.is_empty())
-    {
-        return None;
+    // Only a mention of the bot itself addresses the agent: a group message
+    // that @s a colleague is delivered to us all the same (the app may hold
+    // `im:message` rather than only `im:message.group_at_msg`), and answering
+    // it talks over the conversation. An unresolved own open_id fails closed.
+    if message.chat_type == "group" && policy.require_mention {
+        let mentions_bot = !policy.bot_open_id.is_empty()
+            && message.mentions.iter().flatten().any(|mention| {
+                mention.id.as_ref().and_then(|id| id.open_id.as_deref())
+                    == Some(policy.bot_open_id.as_str())
+            });
+        if !mentions_bot {
+            return None;
+        }
     }
     let text = strip_mentions(&extract_text(&message.content)?);
     if text.is_empty() {
@@ -487,6 +569,8 @@ fn strip_mentions(text: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    const BOT: &str = "ou_bot";
 
     fn event(overrides: serde_json::Value) -> ReceiveEvent {
         let mut base = json!({
@@ -574,33 +658,51 @@ mod tests {
         assert_eq!(msg.sender_id, "ou_1");
     }
 
+    fn group_mentioning(open_id: serde_json::Value) -> ReceiveEvent {
+        event(json!({
+            "event": { "message": {
+                "chat_type": "group",
+                "content": "{\"text\":\"@_user_1 hi\"}",
+                "mentions": [{
+                    "key": "@_user_1",
+                    "id": { "union_id": "un_b", "user_id": "u_b", "open_id": open_id },
+                    "name": "someone",
+                    "tenant_key": "t"
+                }]
+            } }
+        }))
+    }
+
     #[test]
     fn admit_requires_mention_in_groups_only() {
         let policy = AdmitPolicy {
             require_mention: true,
+            bot_open_id: BOT.to_string(),
         };
         let unmentioned_group = event(json!({
             "event": { "message": { "chat_type": "group" } }
         }));
         assert!(admit(unmentioned_group, &policy).is_none());
 
-        let mentioned_group = event(json!({
-            "event": { "message": {
-                "chat_type": "group",
-                "content": "{\"text\":\"@_user_1 hi\"}",
-                "mentions": [{
-                    "key": "@_user_1",
-                    "id": { "union_id": "un_b", "user_id": "u_b", "open_id": "ou_bot" },
-                    "name": "komo",
-                    "tenant_key": "t"
-                }]
-            } }
-        }));
-        let msg = admit(mentioned_group, &policy).expect("mentioned group message admitted");
+        let msg =
+            admit(group_mentioning(json!(BOT)), &policy).expect("mentioned group message admitted");
         assert_eq!(msg.text, "hi");
 
         // DMs bypass the mention gate entirely.
         assert!(admit(event(json!({})), &policy).is_some());
+    }
+
+    #[test]
+    fn admit_ignores_a_group_mention_of_someone_else() {
+        let policy = AdmitPolicy {
+            require_mention: true,
+            bot_open_id: BOT.to_string(),
+        };
+        // A colleague @s another colleague: delivered to us, not addressed to
+        // us. Answering it talks over the conversation.
+        assert!(admit(group_mentioning(json!("ou_colleague")), &policy).is_none());
+        // A mention Feishu could not resolve is not the bot either.
+        assert!(admit(group_mentioning(json!(null)), &policy).is_none());
     }
 
     #[test]
