@@ -32,6 +32,7 @@ use komo_agent::gateway::Channel;
 use komo_agent::interaction::GatewayDispatcher;
 use komo_agent::pairing::PairingGuard;
 use komo_core::domain::inbox::InboundOrigin;
+use komo_core::domain::session::ChannelPeer;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -313,14 +314,15 @@ impl WeChatChannel {
                     if !admitted {
                         return;
                     }
-                    let session_id = format!("wechat:{user_id}");
                     info!(user = %user_id, "wechat message received");
                     let sink: Arc<dyn ReplySink> = Arc::new(WeChatReplySink {
                         bot: bot.clone(),
                         user_id: user_id.clone(),
                     });
                     let origin = InboundOrigin::new("wechat", message_key);
-                    dispatcher.handle(&session_id, origin, text, sink).await;
+                    dispatcher
+                        .handle(&ChannelPeer::new("wechat", user_id), origin, text, sink)
+                        .await;
                 });
             }))
             .await;

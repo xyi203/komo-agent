@@ -8,7 +8,6 @@
 
 use anyhow::Context;
 use komo_core::domain::episode::{OutcomeAssessment, OutcomeVerdict};
-use komo_core::domain::session::is_subagent_session;
 use komo_services::cron_actions;
 /// Re-exported so every operator-control caller keeps naming one place for
 /// the unknown-job message, wherever the implementation lives.
@@ -16,11 +15,11 @@ pub use komo_services::cron_actions::no_cron_job_message;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::domain::context::SessionOrigin;
 use crate::domain::cron::{CronJob, CronJobRepository, CronJobSpec};
 use crate::domain::home::HomeRepository;
 use crate::domain::memory::{
     DreamVerdict, Memory, MemoryRepository, MemoryScope, MemoryStatus, dream_score, dream_verdict,
-    is_durable_channel,
 };
 use crate::domain::message::Message;
 use crate::domain::pairing::{ApproveOutcome, PairingRepository, PairingRequest, PairingStatus};
@@ -458,12 +457,19 @@ pub async fn apply_memory_transition(
     Ok(TransitionOutcome::Applied(Box::new(memory)))
 }
 
+/// The channel scope komo's local surfaces used to write from, back when a
+/// local conversation was modelled as a chat on an `api` platform whose chat id
+/// was a fresh uuid per conversation. No new memory can carry it — a local turn
+/// has no correspondent at all now — but `memory.db` is durable, so rows written
+/// while it could still exist and still need widening.
+const RETIRED_LOCAL_CHANNEL: &str = "api";
+
 /// Widen every memory stuck in an ephemeral `api` channel scope to `Global`,
 /// returning how many were moved.
 ///
 /// A one-shot repair for memories written before `MemoryContext::write_scope`
 /// learned that `api` chat ids are per-conversation (see
-/// `komo_core::domain::memory::is_durable_channel`). Those memories name a
+/// `RETIRED_LOCAL_CHANNEL`). Those memories name a
 /// conversation that has ended, so no later turn can ever recall them — they
 /// are invisible rather than private, and widening them to `Global` restores
 /// exactly the reach they were meant to have.
@@ -511,7 +517,7 @@ pub async fn repair_memory_scopes(memories: &dyn MemoryRepository) -> anyhow::Re
         let MemoryScope::Channel { platform, .. } = &memory.scope else {
             continue;
         };
-        if is_durable_channel(platform) {
+        if platform != RETIRED_LOCAL_CHANNEL {
             continue;
         }
         memory.scope = MemoryScope::Global;
@@ -572,7 +578,7 @@ pub fn session_summaries(sessions: Vec<Session>) -> Vec<SessionSummary> {
         // purpose is "conversations you can reopen". The work is not hidden — each
         // one is its own ledger run, which is the right lens for it
         // (`komo run list` / `run inspect`).
-        .filter(|s| !is_subagent_session(&s.id))
+        .filter(|s| s.origin != SessionOrigin::Delegate)
         .map(|s| SessionSummary {
             created_at: s.created_at,
             messages: s.messages.len(),
@@ -879,15 +885,16 @@ mod tests {
     #[test]
     fn the_session_list_hides_deleted_and_subagent_sessions() {
         let rows = session_summaries(vec![
-            session("api:real", "active"),
-            session("api:archived", SESSION_STATUS_ARCHIVE),
-            session("api:gone", SESSION_STATUS_DELETED),
+            session("real", "active"),
+            session("archived", SESSION_STATUS_ARCHIVE),
+            session("gone", SESSION_STATUS_DELETED),
             // A `delegate` sub-agent's scratch session: real work, but not a
-            // conversation — it belongs in the run ledger, not this list.
-            session("delegate:019fa7f2-50e7-7f42-9430-ea0e1d88c81e", "active"),
+            // conversation — it belongs in the run ledger, not this list. What
+            // marks it is the record's `origin`, not the shape of its id.
+            session("sub", "active").with_origin(SessionOrigin::Delegate),
         ]);
         let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, ["api:real", "api:archived"]);
+        assert_eq!(ids, ["real", "archived"]);
     }
 
     #[test]

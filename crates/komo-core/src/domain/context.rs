@@ -17,7 +17,9 @@ use crate::domain::approval::{ApprovalRequest, Approver, Decision};
 use crate::domain::cancel::CancelSignal;
 use crate::domain::events::ToolEventSink;
 use crate::domain::gateway::{InterjectSource, ReplySink};
+use crate::domain::policy::LOCAL_CHANNEL;
 use crate::domain::run::RunRepository;
+use crate::domain::session::ChannelPeer;
 
 /// What is driving a turn, as far as **approval** is concerned.
 ///
@@ -30,7 +32,8 @@ use crate::domain::run::RunRepository;
 ///
 /// An enum rather than a `bool` because the callers already differ in more than
 /// attendance: a cron job's turn is scoped to *one job*, the briefing's is not.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SessionOrigin {
     /// A user-driven conversation — chat channel, CLI, TUI, HTTP API. Approval
     /// is evaluated against the session's channel, and a human may be reachable
@@ -41,14 +44,63 @@ pub enum SessionOrigin {
     Cron,
     /// The daily briefing sweep's turn (`BriefingSweep`).
     Briefing,
+    /// A sub-agent's scratch session, spawned by the `delegate` tool.
+    ///
+    /// Only ever the *session record's* value: a delegation deliberately runs
+    /// inside the parent's ambient [`SessionContext`], so the turn's own origin
+    /// is whatever the parent's was. It is here because it answers the same
+    /// question the other three do — what is driving this conversation — and
+    /// the alternative was a second enum overlapping this one three ways.
+    Delegate,
 }
 
 impl SessionOrigin {
     /// Whether no human is behind this turn, so the permission policy must
     /// evaluate it channel-lessly (only an `unattended = true` allow rule
     /// grants; no default and no saved grant ever does).
+    ///
+    /// Matched exhaustively rather than written as "anything but `User`": a
+    /// variant added later must not inherit an attendance answer nobody chose,
+    /// in either direction — too strict silently breaks a sweep, too loose
+    /// silently widens the gate.
     pub fn is_unattended(self) -> bool {
-        !matches!(self, Self::User)
+        match self {
+            Self::User => false,
+            Self::Cron | Self::Briefing => true,
+            // A sub-agent runs inside its parent's turn and inherits its
+            // context, so whoever was reachable for the parent is reachable
+            // for it.
+            Self::Delegate => false,
+        }
+    }
+
+    /// Stable wire form for the session record's column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Cron => "cron",
+            Self::Briefing => "briefing",
+            Self::Delegate => "delegate",
+        }
+    }
+
+    /// Read a stored value back. An unknown string reads as [`Self::User`]:
+    /// this decides display and learning eligibility, never authorization, and
+    /// an unreadable row should look like an ordinary conversation rather than
+    /// vanish from the session list.
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "cron" => Self::Cron,
+            "briefing" => Self::Briefing,
+            "delegate" => Self::Delegate,
+            _ => Self::User,
+        }
+    }
+
+    /// Whether this is one of komo's own scheduled turns. Sweeps restate what
+    /// the agent already knows, so nothing here is a lesson or a name.
+    pub fn is_sweep(self) -> bool {
+        matches!(self, Self::Cron | Self::Briefing)
     }
 }
 
@@ -97,6 +149,15 @@ pub struct SessionContext {
     /// their own variant via [`with_origin`](Self::with_origin), which is what
     /// makes the permission policy treat them as unattended.
     pub origin: SessionOrigin,
+    /// The correspondent this turn is talking to, when there is one. `None` for
+    /// every local surface and for komo's own turns.
+    ///
+    /// Carried on the turn rather than looked up, because the two readers —
+    /// the permission engine's channel scope and the memory writer's scope —
+    /// run per turn and hold no repository handle. It used to be recovered by
+    /// splitting `session_id` on a colon, which made the session id a schema
+    /// and every client that could name its own id able to claim a channel.
+    pub channel: Option<ChannelPeer>,
 }
 
 impl SessionContext {
@@ -115,6 +176,7 @@ impl SessionContext {
             cancel: None,
             interject: None,
             origin: SessionOrigin::User,
+            channel: None,
         }
     }
 
@@ -135,6 +197,7 @@ impl SessionContext {
             cancel: None,
             interject: None,
             origin: SessionOrigin::User,
+            channel: None,
         }
     }
 
@@ -156,6 +219,23 @@ impl SessionContext {
             cancel: None,
             interject: None,
             origin: SessionOrigin::User,
+            channel: None,
+        }
+    }
+
+    /// Declare which correspondent this turn answers. Chat channels call this;
+    /// every local surface leaves it unset.
+    pub fn with_channel(mut self, channel: Option<ChannelPeer>) -> Self {
+        self.channel = channel;
+        self
+    }
+
+    /// The permission channel this turn is evaluated against — the platform it
+    /// arrived on, or `cli` for a local surface that has no correspondent.
+    pub fn channel_name(&self) -> &str {
+        match &self.channel {
+            Some(peer) => &peer.platform,
+            None => LOCAL_CHANNEL,
         }
     }
 

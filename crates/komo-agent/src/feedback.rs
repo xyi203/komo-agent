@@ -19,6 +19,8 @@
 //! `Unknown`, which is what it was already; the cost of a wrong one is komo
 //! believing a broken change worked.
 
+use komo_core::domain::context::SessionOrigin;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,6 +92,8 @@ pub async fn classify(
         status: String::new(),
         model: String::new(),
         effort: String::new(),
+        channel: None,
+        origin: SessionOrigin::User,
     };
 
     let answer = match tokio::time::timeout(CLASSIFY_TIMEOUT, llm.complete(&session)).await {

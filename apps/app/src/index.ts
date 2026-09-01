@@ -12,4 +12,4 @@ export { ConnectGate } from "./features/connect/ConnectGate";
 export { consumeQueryParams, currentGateway } from "./features/connect/gateway-storage";
 
 export type { Gateway, GatewayResolver, KomoClient, KomoConnectResponse } from "./shared/api/types";
-export type { HostTag } from "./shared/lib/session-id";
+export type { HostTag } from "./shared/api/runtime";

@@ -121,7 +121,7 @@ describe("runTurn", () => {
     });
     const seen: ToolActivity[][] = [];
     const result = await runTurn(
-      { session: "api:gui-web-1", message: "hi", mode: "interactive" },
+      { session: "019fad15-8199-7461-9d48-0a6c779f1c8d", message: "hi", mode: "interactive" },
       { onTools: (tools) => seen.push(tools) },
       { client, sleep: controlledClock().sleep },
     );
@@ -131,7 +131,9 @@ describe("runTurn", () => {
     expect(seen.map((t) => t.length)).toEqual([0, 1, 1]);
   });
 
-  it("strips the api: prefix before sending the session header", async () => {
+  it("sends the session id as the header, unchanged", async () => {
+    // One form end to end: the gateway rejects anything that is not a UUID, so
+    // there is nothing to add on the way out or strip on the way back.
     let header = "";
     const client: KomoClient = {
       connect: async () => ({ connected: true }),
@@ -142,12 +144,13 @@ describe("runTurn", () => {
         return { ok: true, reply: "" };
       },
     };
+    const session = "019fad15-8199-7461-9d48-0a6c779f1c8d";
     await runTurn(
-      { session: "api:gui-desktop-9", message: "hi", mode: "trusted" },
+      { session, message: "hi", mode: "trusted" },
       {},
       { client, sleep: controlledClock().sleep },
     );
-    expect(header).toBe("gui-desktop-9");
+    expect(header).toBe(session);
   });
 
   it("surfaces a pending approval while the turn is in flight, then clears it", async () => {
@@ -329,7 +332,7 @@ describe("runTurn", () => {
     });
     const { client, requests } = harness({ onChat: async () => gate });
     const turn = runTurn(
-      { session: "api:gui-web-7", message: "hi", mode: "interactive" },
+      { session: "019fad15-8199-7461-9d48-0a6c779f1c8d", message: "hi", mode: "interactive" },
       {},
       { client, sleep: clock.sleep, signal: controller.signal },
     );
@@ -337,7 +340,7 @@ describe("runTurn", () => {
     controller.abort();
     await flush();
     expect(requests()).toContainEqual({
-      path: "/api/interactions/api%3Agui-web-7/cancel",
+      path: "/api/interactions/019fad15-8199-7461-9d48-0a6c779f1c8d/cancel",
       method: "POST",
     });
     release();

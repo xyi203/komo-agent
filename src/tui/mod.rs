@@ -237,34 +237,31 @@ pub async fn resume(config: ConfigSnapshot, id: &str) -> anyhow::Result<()> {
     .await
 }
 
-/// Resolve an exact id first. API sessions are stored as `api:<client-id>`, but
-/// a UUID alone is the ergonomic form for `komo resume`.
+/// Confirm the id names a session that exists. A session id is a UUID and
+/// nothing else now, so there is no second form to try.
+///
+/// A non-UUID id is refused **here**, not at the first message. Sessions from an
+/// older komo (`feishu:oc_x`, `api:<uuid>`) are still listed and still readable,
+/// but the gateway will not run a turn on one — so opening a chat window that
+/// hydrates fine and then rejects everything typed into it is the worse of the
+/// two failures.
 async fn resolve_resume_id(backend: &Backend, id: &str) -> anyhow::Result<String> {
-    let candidate = (!id.contains(':')).then(|| format!("api:{id}"));
+    if uuid::Uuid::parse_str(id).is_err() {
+        anyhow::bail!(
+            "`{id}` is a session from an older komo and can no longer be continued \
+             (its transcript is still in ~/.komo/sessions/); start a new one with `komo chat`"
+        );
+    }
     let resolved = match backend {
-        Backend::Remote { gateway, .. } => {
-            let sessions = gateway.sessions().await?;
-            sessions
-                .iter()
-                .find(|s| s.id == id)
-                .or_else(|| {
-                    candidate
-                        .as_ref()
-                        .and_then(|candidate| sessions.iter().find(|s| s.id == *candidate))
-                })
-                .map(|s| s.id.clone())
-        }
-        Backend::Local { db, .. } => {
-            if SessionRepository::find(&**db, id).await?.is_some() {
-                Some(id.to_string())
-            } else if let Some(candidate) = candidate
-                && SessionRepository::find(&**db, &candidate).await?.is_some()
-            {
-                Some(candidate)
-            } else {
-                None
-            }
-        }
+        Backend::Remote { gateway, .. } => gateway
+            .sessions()
+            .await?
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.id.clone()),
+        Backend::Local { db, .. } => SessionRepository::find(&**db, id)
+            .await?
+            .map(|session| session.id),
     };
     resolved.ok_or_else(|| anyhow::anyhow!("no session with id `{id}` (see `komo session list`)"))
 }
@@ -372,16 +369,9 @@ async fn drive(
     // before the backend connected has no session to point at (fresh sessions
     // are only created once the boot task lands), so the hint is skipped.
     if let Ok(Some(session_id)) = &result {
-        println!("komo resume {}", resume_command_id(session_id));
+        println!("komo resume {session_id}");
     }
     result.map(|_| ())
-}
-
-/// API-backed TUI sessions are persisted with an internal `api:` namespace.
-/// Keep that storage detail out of the copyable CLI hint; `resolve_resume_id`
-/// expands the bare UUID when the user resumes it.
-fn resume_command_id(session_id: &str) -> &str {
-    session_id.strip_prefix("api:").unwrap_or(session_id)
 }
 
 async fn event_loop(
@@ -742,6 +732,7 @@ fn spawn_turn(
             // loop gives up at its next await.
             cancel: Some(cancels.register(&session_id)),
             interject: None,
+            channel: None,
             origin: SessionOrigin::User,
         }
     });
@@ -783,18 +774,13 @@ fn startup_workspace() -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::resume_command_id;
+    use super::new_session_id;
 
     #[test]
-    fn resume_hint_hides_internal_api_namespace() {
-        assert_eq!(
-            resume_command_id("api:019fb0ce-9f7a-7c23-a87d-dab9df9216d8"),
-            "019fb0ce-9f7a-7c23-a87d-dab9df9216d8"
-        );
-    }
-
-    #[test]
-    fn resume_hint_preserves_non_api_session_ids() {
-        assert_eq!(resume_command_id("telegram:12345"), "telegram:12345");
+    fn a_new_session_id_is_a_bare_uuid() {
+        // The id the TUI prints in its `komo resume` hint is the id the gateway
+        // stores and the id the header carries — one form, nothing to strip.
+        let id = new_session_id();
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
     }
 }

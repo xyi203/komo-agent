@@ -471,7 +471,7 @@ impl Maintenance for CronJobSweep {
             }
 
             let started = std::time::Instant::now();
-            let (title, body, ok, session) = self.execute(&job, now).await;
+            let (title, body, ok, session) = self.execute(&job).await;
             if ok {
                 info!(job = %job.name, kind = job.action.kind(), elapsed_s = started.elapsed().as_secs(), "cron job succeeded");
                 summary.jobs_run += 1;
@@ -508,7 +508,7 @@ impl Maintenance for CronJobSweep {
 impl CronJobSweep {
     /// Dispatch one due job to its action, returning (title, body, success,
     /// ledger session of an agent run — `None` for command jobs).
-    async fn execute(&self, job: &CronJob, now: i64) -> (String, String, bool, Option<String>) {
+    async fn execute(&self, job: &CronJob) -> (String, String, bool, Option<String>) {
         match &job.action {
             CronAction::Command {
                 command,
@@ -531,23 +531,22 @@ impl CronJobSweep {
                 skills,
                 workspace,
             } => {
-                self.execute_cron_agent(job, prompt, skills, workspace.as_deref(), now)
+                self.execute_cron_agent(job, prompt, skills, workspace.as_deref())
                     .await
             }
         }
     }
 
     /// Run an agent-mode job: one unattended turn on the cron runtime, its reply
-    /// delivered. A per-run session (`cron:<name>:<unix>`) keeps each scheduled
-    /// run an isolated, cleanly-ledgered turn — no cross-run contamination — and
-    /// is returned so the job can record where its transcript lives.
+    /// delivered. A per-run session keeps each scheduled run an isolated,
+    /// cleanly-ledgered turn — no cross-run contamination — and its id is
+    /// returned so the job can record where its transcript lives.
     async fn execute_cron_agent(
         &self,
         job: &CronJob,
         prompt: &str,
         skills: &[String],
         workspace: Option<&str>,
-        now: i64,
     ) -> (String, String, bool, Option<String>) {
         let name = &job.name;
         let fail_title = format!("Komo job「{name}」failed");
@@ -560,7 +559,10 @@ impl CronJobSweep {
                 None,
             );
         };
-        let session_id = format!("cron:{name}:{now}");
+        // A fresh session per firing. What used to be encoded in the id
+        // (`cron:{name}:{ts}`) is now the record's own `origin`, set from this
+        // context when the turn opens it.
+        let session_id = uuid::Uuid::now_v7().to_string();
         // Establish the turn's session *here*, marked unattended, rather than
         // letting `handle_input` build a plain detached one: that default is
         // `SessionOrigin::User`, which would hand the policy engine a `cron`
@@ -932,6 +934,8 @@ impl BriefingSweep {
             // conversation's per-session model choice.
             model: String::new(),
             effort: String::new(),
+            channel: None,
+            origin: SessionOrigin::User,
         };
         self.llm.complete(&session).await
     }
@@ -973,7 +977,9 @@ impl Maintenance for BriefingSweep {
         // must never cost the user their briefing.
         let text = match &self.runtime {
             Some(handler) => {
-                let session_id = format!("briefing:{}", chrono::Local::now().format("%Y-%m-%d"));
+                // One session per briefing; running twice in a day is
+                // prevented by the per-day watermark, not by the id.
+                let session_id = uuid::Uuid::now_v7().to_string();
                 // Unattended, for the same reason as the cron sweep above.
                 let session =
                     SessionContext::detached(&session_id).with_origin(SessionOrigin::Briefing);
@@ -1797,10 +1803,13 @@ mod tests {
         );
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.jobs_run, 1);
-        // The turn ran on a per-run cron session, with the skill-load preamble.
+        // The turn ran on a per-run session of its own, with the skill-load
+        // preamble. The session is a plain uuid — what marks it a cron turn is
+        // the context's `origin` (asserted in its own test below), not a shape
+        // spelled into the id.
         let seen = handler.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        assert!(seen[0].0.starts_with("cron:brief:"));
+        assert!(uuid::Uuid::parse_str(&seen[0].0).is_ok(), "{}", seen[0].0);
         assert!(
             seen[0].1.contains("alarmhandler"),
             "skill preamble: {}",
@@ -2612,7 +2621,7 @@ mod tests {
         .unwrap();
         let mems = repo.0.lock().unwrap();
         let promoted = mems.iter().find(|m| m.id == id).unwrap();
-        let ctx = komo_core::domain::memory::MemoryContext::from_session("cli");
+        let ctx = komo_core::domain::memory::MemoryContext::local("s1");
         assert!(
             !promoted.is_pinnable(&ctx, now),
             "auto-promoted memory must not be pinnable"

@@ -49,8 +49,24 @@ const SWEEP_SCAN_CAP: usize = 200;
 /// and each run's session is a "new independent occasion" to the consolidator,
 /// which turns repetition into corroboration. The result is a memory library
 /// that confirms itself on a timer.
-fn exempt_from_learning(session_id: &str) -> bool {
-    session_id.starts_with("briefing:") || session_id.starts_with("cron:")
+///
+/// Read off the session record's `origin`, which the turn stamped when it
+/// opened the session. It used to be a prefix test on the id — a second
+/// representation of the same fact that could disagree with the first, and one
+/// a session could acquire by being named unluckily.
+///
+/// A session that cannot be read is **not** exempt: silently skipping learning
+/// is the failure nobody would notice, while learning from a sweep is one the
+/// dream sweep's evidence counts would eventually show.
+async fn exempt_from_learning(sessions: &Arc<dyn SessionRepository>, session_id: &str) -> bool {
+    match sessions.find_windowed(session_id, 1).await {
+        Ok(Some(session)) => session.origin.is_sweep(),
+        Ok(None) => false,
+        Err(error) => {
+            warn!(%error, session = %session_id, "could not read a session's origin; not exempting");
+            false
+        }
+    }
 }
 
 /// Why a learning pass is being requested.
@@ -147,7 +163,7 @@ impl LearningCoordinator {
                 // whole reason assessments are stored rather than recomputed.
                 self.assess(&run).await;
                 self.absorb_feedback(&run).await;
-                if exempt_from_learning(&run.session_id) {
+                if exempt_from_learning(&self.sessions, &run.session_id).await {
                     // Retire it from the backlog rather than leaving it to be
                     // re-examined and re-declined by every future sweep.
                     self.retire(&[run.id]).await;
@@ -166,7 +182,7 @@ impl LearningCoordinator {
             LearningTrigger::Scheduled => {
                 let pending = self.runs.unlearned(None, SWEEP_SCAN_CAP).await?;
                 for (session_id, runs) in group_by_session(pending) {
-                    if exempt_from_learning(&session_id) {
+                    if exempt_from_learning(&self.sessions, &session_id).await {
                         self.retire(&run_ids(&runs)).await;
                         continue;
                     }
@@ -205,7 +221,7 @@ impl LearningCoordinator {
         let Some(aux) = &self.aux else {
             return;
         };
-        if exempt_from_learning(&run.session_id) {
+        if exempt_from_learning(&self.sessions, &run.session_id).await {
             return;
         }
         let Ok(Some(previous)) = self.runs.previous_in_session(&run.id).await else {
@@ -377,6 +393,7 @@ impl Drop for InFlightGuard<'_> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use komo_core::domain::context::SessionOrigin;
     use komo_core::domain::{
         cancel::CANCELLED_ERROR,
         message::Message,
@@ -506,24 +523,49 @@ mod tests {
 
     struct FakeSessions {
         loads: AtomicUsize,
+        /// Ids the store reports as komo's own scheduled sessions. Named
+        /// explicitly rather than derived from the id: whether a session is a
+        /// sweep is a stored fact now, and a test that spelled it into the id
+        /// would still pass if the code went back to parsing one.
+        sweeps: Vec<String>,
     }
 
     impl FakeSessions {
         fn new() -> Arc<Self> {
+            Self::with_sweeps(Vec::new())
+        }
+
+        fn with_sweeps(sweeps: Vec<&str>) -> Arc<Self> {
             Arc::new(Self {
                 loads: AtomicUsize::new(0),
+                sweeps: sweeps.into_iter().map(str::to_string).collect(),
             })
+        }
+
+        fn origin_of(&self, id: &str) -> SessionOrigin {
+            if self.sweeps.iter().any(|s| s == id) {
+                SessionOrigin::Cron
+            } else {
+                SessionOrigin::User
+            }
         }
     }
 
     #[async_trait]
     impl SessionRepository for FakeSessions {
+        async fn find_by_peer(
+            &self,
+            _channel: &komo_core::domain::session::ChannelPeer,
+        ) -> anyhow::Result<Option<Session>> {
+            Ok(None)
+        }
+
         async fn find(&self, id: &str) -> anyhow::Result<Option<Session>> {
             self.loads.fetch_add(1, Ordering::Relaxed);
-            Ok(Some(Session::new(id)))
+            Ok(Some(Session::new(id).with_origin(self.origin_of(id))))
         }
         async fn find_windowed(&self, id: &str, _limit: usize) -> anyhow::Result<Option<Session>> {
-            let mut s = Session::new(id);
+            let mut s = Session::new(id).with_origin(self.origin_of(id));
             s.messages.push(Message::user("hi"));
             Ok(Some(s))
         }
@@ -605,6 +647,15 @@ mod tests {
         interval: usize,
     ) -> LearningCoordinator {
         LearningCoordinator::new(FakeSessions::new(), runs, reviewer, interval)
+    }
+
+    fn coordinator_with_sweeps(
+        runs: Arc<FakeRuns>,
+        reviewer: Arc<RecordingReviewer>,
+        interval: usize,
+        sweeps: Vec<&str>,
+    ) -> LearningCoordinator {
+        LearningCoordinator::new(FakeSessions::with_sweeps(sweeps), runs, reviewer, interval)
     }
 
     #[tokio::test]
@@ -704,19 +755,24 @@ mod tests {
     #[tokio::test]
     async fn sweep_sessions_are_never_learned_from_but_are_retired() {
         let runs = FakeRuns::new(vec![
-            done("run-1", "briefing:2026-08-20"),
-            done("run-2", "cron:alarm:1755600000"),
-            done("run-3", "feishu:oc_1"),
+            done("run-1", "sweep-a"),
+            done("run-2", "sweep-b"),
+            done("run-3", "a-conversation"),
         ]);
         let reviewer = Arc::new(RecordingReviewer::default());
-        let c = coordinator(runs.clone(), reviewer.clone(), 1);
+        let c = coordinator_with_sweeps(
+            runs.clone(),
+            reviewer.clone(),
+            1,
+            vec!["sweep-a", "sweep-b"],
+        );
 
         let report = c.run(LearningTrigger::Scheduled).await.unwrap();
 
         assert_eq!(report.sessions_learned, 1);
         let calls = reviewer.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "feishu:oc_1");
+        assert_eq!(calls[0].0, "a-conversation");
         assert_eq!(
             runs.marked.lock().unwrap().len(),
             3,
@@ -726,9 +782,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_after_run_trigger_retires_an_exempt_run_without_scanning() {
-        let runs = FakeRuns::new(vec![done("run-1", "cron:alarm:1")]);
+        let runs = FakeRuns::new(vec![done("run-1", "sweep-a")]);
         let reviewer = Arc::new(RecordingReviewer::default());
-        let c = coordinator(runs.clone(), reviewer.clone(), 1);
+        let c = coordinator_with_sweeps(runs.clone(), reviewer.clone(), 1, vec!["sweep-a"]);
 
         let report = c
             .run(LearningTrigger::AfterRun {

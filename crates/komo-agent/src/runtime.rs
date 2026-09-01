@@ -335,7 +335,14 @@ impl AgentRuntime {
         {
             Some(s) => s,
             None => {
-                let s = Session::new(session_id);
+                // First turn on this id: the record inherits what is driving
+                // the turn, so a sweep's session is marked one at creation.
+                // That mark is what later decides how it is titled, whether the
+                // session list shows it, and whether the learning pass may
+                // extract from it — all of which used to be read off a prefix
+                // in the id.
+                let origin = current_session().map(|c| c.origin).unwrap_or_default();
+                let s = Session::new(session_id).with_origin(origin);
                 self.sessions.save(&s).await?;
                 s
             }
@@ -529,7 +536,15 @@ impl AgentRuntime {
         // turn opened, and the session established by the dispatcher / api /
         // handle_input (read once here — the one ambient-to-explicit bridge).
         let context = ToolTurnContext {
-            session: current_session().unwrap_or_else(|| SessionContext::detached(&session.id)),
+            // The stored session is the authority on which correspondent this
+            // conversation answers; an ingress only knows how *it* was
+            // addressed. Filling the address in here — where the record is
+            // already loaded — means every ingress gets the same answer with no
+            // plumbing of its own, and a client free to name a session id can
+            // never name the channel its turn is evaluated against.
+            session: current_session()
+                .unwrap_or_else(|| SessionContext::detached(&session.id))
+                .with_channel(session.channel.clone()),
             run: Some(run),
             // Bound the turn's cumulative tool output (0 = unlimited), so a long
             // tool chain can't quietly overflow the context window.

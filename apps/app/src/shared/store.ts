@@ -12,7 +12,6 @@ import { persist } from "zustand/middleware";
 import type { Mode, WorkspaceInfo } from "./types";
 import { applyTheme, initialTheme, type Theme } from "./lib/theme";
 import { newSessionId } from "./lib/session-id";
-import { hostTag } from "./api/runtime";
 
 /** A session's model choice. Either field empty = fall back to the gateway /
  *  provider default. */
@@ -64,7 +63,7 @@ export const useAppStore = create<AppStore>()(
       // the first message for the workspace, and always for the model.
       startNewSession: () =>
         set((s) => {
-          const session = newSessionId(hostTag());
+          const session = newSessionId();
           return {
             session,
             sessionModels: {

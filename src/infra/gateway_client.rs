@@ -96,15 +96,6 @@ pub fn folder_workspace_path(id: &str) -> Option<std::path::PathBuf> {
     path.is_dir().then_some(path)
 }
 
-/// Convert a persisted API session id into the client-facing header value.
-///
-/// `api:` is Komo's internal channel namespace; callers of the HTTP API only
-/// need to send their UUID. The gateway still accepts the old prefixed form so
-/// previously persisted browser state remains compatible.
-fn api_session_header_value(session_id: &str) -> &str {
-    session_id.trim_start_matches("api:")
-}
-
 pub struct GatewayClient {
     base: String,
     key: String,
@@ -719,7 +710,7 @@ impl GatewayClient {
             .streaming_http
             .post(self.url("/v1/chat/completions"))
             .bearer_auth(&self.key)
-            .header("X-Komo-Session-Id", api_session_header_value(session_id))
+            .header("X-Komo-Session-Id", session_id)
             .header("X-Komo-Trusted", "1");
         let request = if let Some(workspace) = workspace {
             request.header("X-Komo-Workspace", workspace)
@@ -772,21 +763,6 @@ mod workspace_tests {
             Some(dir.canonicalize().unwrap())
         );
         assert_eq!(folder_workspace_path("folder:not-base64"), None);
-    }
-
-    #[test]
-    fn api_session_header_omits_internal_namespace() {
-        assert_eq!(
-            api_session_header_value("api:019fad15-8199-7461-9d48-0a6c779f1c8d"),
-            "019fad15-8199-7461-9d48-0a6c779f1c8d"
-        );
-        // A session accidentally created by an older double-prefixing client
-        // must be sent back as the canonical external UUID too.
-        assert_eq!(
-            api_session_header_value("api:api:019fad15-8199-7461-9d48-0a6c779f1c8d"),
-            "019fad15-8199-7461-9d48-0a6c779f1c8d"
-        );
-        assert_eq!(api_session_header_value("telegram:123"), "telegram:123");
     }
 }
 

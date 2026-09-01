@@ -108,7 +108,7 @@ impl Approver for TuiApprover {
 /// The rule an `always` answer would save, described for the modal.
 fn always_rule(request: &ApprovalRequest) -> Option<String> {
     let session = komo_services::tool_execution::current_session()?;
-    let channel = crate::domain::policy::channel_of(&session.session_id);
+    let channel = session.channel_name().to_string();
     let action = request.action.as_ref()?;
     Some(crate::domain::policy::Rule::narrowest_for(action, &channel)?.describe())
 }

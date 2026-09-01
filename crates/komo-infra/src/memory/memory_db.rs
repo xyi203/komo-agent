@@ -772,7 +772,7 @@ mod tests {
         cand.status = MemoryStatus::Candidate;
         db.save(&cand).await.unwrap();
 
-        let ctx = MemoryContext::from_session("cli");
+        let ctx = MemoryContext::local("s1");
         let pinned = db.pinned(&ctx).await.unwrap();
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0].content, "concise answers");
@@ -812,7 +812,7 @@ mod tests {
         };
         db.save(&other).await.unwrap();
 
-        let ctx = MemoryContext::from_session("cli");
+        let ctx = MemoryContext::local("s1");
         let hits = db
             .recall(&ctx, "what language is the rust project in", 5)
             .await

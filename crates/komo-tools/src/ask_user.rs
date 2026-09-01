@@ -219,6 +219,7 @@ mod tests {
             event_sink: None,
             cancel: None,
             interject: None,
+            channel: None,
             origin: Default::default(),
         };
         ToolContext::new(session, None, Arc::new(DenyAll))

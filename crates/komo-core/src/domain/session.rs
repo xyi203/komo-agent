@@ -1,6 +1,45 @@
 use serde::{Deserialize, Serialize};
 
+use super::context::SessionOrigin;
 use super::message::Message;
+
+/// Where a conversation reaches its correspondent: a chat platform and that
+/// platform's own id for the peer (`feishu` + `oc_abc`).
+///
+/// Deliberately **not** part of the session id. A session id is a handle —
+/// opaque, stable, and the only thing that identifies a conversation; this is an
+/// *address*, and a conversation has one or none. komo used to encode the
+/// address into the handle (`feishu:oc_abc`), which meant every consumer
+/// re-derived it by splitting a string, "no address" could only be expressed as
+/// a missing colon, and a client that chose its own id could claim any channel's
+/// scope by typing one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelPeer {
+    pub platform: String,
+    pub peer_id: String,
+}
+
+impl ChannelPeer {
+    pub fn new(platform: impl Into<String>, peer_id: impl Into<String>) -> Self {
+        Self {
+            platform: platform.into(),
+            peer_id: peer_id.into(),
+        }
+    }
+
+    /// The address as one string, for the surfaces that legitimately key on it:
+    /// a `MemoryScope::Channel` key, the `home_chat` config value, an operator
+    /// display. Not a session id and never parsed back into one.
+    pub fn address(&self) -> String {
+        format!("{}:{}", self.platform, self.peer_id)
+    }
+
+    /// Parse an operator-authored address (`home_chat = "feishu:oc_abc"`).
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (platform, peer_id) = raw.split_once(':')?;
+        (!platform.is_empty() && !peer_id.is_empty()).then(|| Self::new(platform, peer_id))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -32,6 +71,18 @@ pub struct Session {
     /// by the LLM adapter — see `infra::llm::reasoning_params`.
     #[serde(default)]
     pub effort: String,
+    /// The correspondent this conversation talks to, when it has one. `None`
+    /// for every local surface (TUI, desktop, web, CLI) and for komo's own
+    /// sessions — a sweep and a sub-agent answer to nobody.
+    ///
+    /// Creation-locked in practice: a channel looks a session up by this and
+    /// would not find one whose address had changed.
+    #[serde(default)]
+    pub channel: Option<ChannelPeer>,
+    /// What drives this conversation. Decides how it is titled, whether the
+    /// session list shows it, and whether the learning pass may extract from it.
+    #[serde(default)]
+    pub origin: SessionOrigin,
 }
 
 /// Default session status when none is stored (older rows, fresh sessions).
@@ -63,7 +114,21 @@ impl Session {
             status: default_status(),
             model: String::new(),
             effort: String::new(),
+            channel: None,
+            origin: SessionOrigin::User,
         }
+    }
+
+    /// Bind this session to the correspondent it answers.
+    pub fn with_channel(mut self, channel: ChannelPeer) -> Self {
+        self.channel = Some(channel);
+        self
+    }
+
+    /// Declare what drives this session (a sweep, a sub-agent).
+    pub fn with_origin(mut self, origin: SessionOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// The session's model override, or `None` when it runs on the gateway
@@ -105,26 +170,10 @@ impl Session {
             return named.to_string();
         }
         self.opening_message()
-            .and_then(|opening| auto_title(&self.id, opening))
+            .and_then(|opening| auto_title(self.origin, opening))
             .unwrap_or_default()
     }
 }
-
-/// Session-id prefix for a sub-agent turn spawned by the `delegate` tool. In
-/// `domain` because both ends need it and neither owns the other: the tool mints
-/// these ids, and the operator-facing session list filters them back out.
-pub const SUBAGENT_SESSION_PREFIX: &str = "delegate:";
-
-/// Is this a sub-agent's scratch session rather than a real conversation?
-pub fn is_subagent_session(id: &str) -> bool {
-    id.starts_with(SUBAGENT_SESSION_PREFIX)
-}
-
-/// Session-id prefixes whose turns komo writes to itself — a sweep's prompt is
-/// not something a person said. The same two `LearningCoordinator` exempts, for
-/// a related reason: neither a lesson nor a name should come from komo's own
-/// prose.
-const SWEEP_SESSION_PREFIXES: [&str; 2] = ["cron:", "briefing:"];
 
 /// The character budget for a derived title. Generous next to the ~18 CJK
 /// characters a sidebar row shows, because that row truncates in CSS and wider
@@ -140,15 +189,11 @@ pub const AUTO_TITLE_CHARS: usize = 40;
 /// "帮我看一下这个" names nothing. That is why this returns `Option` and the
 /// id- and time-based fallbacks stay.
 ///
-/// `None` for a sweep's session: its id (`cron:<job>:<ts>`) already says
-/// precisely what it is, and the opening line of a generated prompt would only
-/// blur that. `None` for a sub-agent's, which no list shows at all.
-pub fn auto_title(session_id: &str, opening_message: &str) -> Option<String> {
-    if is_subagent_session(session_id)
-        || SWEEP_SESSION_PREFIXES
-            .iter()
-            .any(|prefix| session_id.starts_with(prefix))
-    {
+/// `None` for anything komo wrote to itself — a sweep restates what the agent
+/// already knows and a sub-agent's scratch session appears in no list, so the
+/// opening line of either is a generated prompt, not a name.
+pub fn auto_title(origin: SessionOrigin, opening_message: &str) -> Option<String> {
+    if origin != SessionOrigin::User {
         return None;
     }
     // The first line that carries words. A fence is skipped rather than shown
@@ -184,7 +229,7 @@ mod tests {
     #[test]
     fn a_title_is_the_first_line_a_person_wrote() {
         assert_eq!(
-            auto_title("api:0198f0d1", "帮我查一下订单为什么失败").as_deref(),
+            auto_title(SessionOrigin::User, "帮我查一下订单为什么失败").as_deref(),
             Some("帮我查一下订单为什么失败")
         );
     }
@@ -194,16 +239,23 @@ mod tests {
         // A message that opens by pasting code would otherwise be named after
         // the fence.
         assert_eq!(
-            auto_title("api:x", "\n\n```rust\nfn main() {}\n```\n这段为什么不编译").as_deref(),
+            auto_title(
+                SessionOrigin::User,
+                "\n\n```rust\nfn main() {}\n```\n这段为什么不编译"
+            )
+            .as_deref(),
             Some("fn main() {}")
         );
-        assert_eq!(auto_title("api:x", "   \n\t\n").as_deref(), None);
+        assert_eq!(
+            auto_title(SessionOrigin::User, "   \n\t\n").as_deref(),
+            None
+        );
     }
 
     #[test]
     fn internal_whitespace_collapses_to_single_spaces() {
         assert_eq!(
-            auto_title("api:x", "fix   the\tbuild  please").as_deref(),
+            auto_title(SessionOrigin::User, "fix   the\tbuild  please").as_deref(),
             Some("fix the build please")
         );
     }
@@ -211,32 +263,50 @@ mod tests {
     #[test]
     fn a_long_opening_is_cut_on_a_char_boundary_with_no_dangling_space() {
         let long = "帮".repeat(AUTO_TITLE_CHARS + 10);
-        let title = auto_title("api:x", &long).unwrap();
+        let title = auto_title(SessionOrigin::User, &long).unwrap();
         assert_eq!(title.chars().count(), AUTO_TITLE_CHARS + 1);
         assert!(title.ends_with('…'));
 
         // The cut must not leave the ellipsis floating after a space.
         let spaced = format!("{} tail", "a".repeat(AUTO_TITLE_CHARS - 1));
         assert_eq!(
-            auto_title("api:x", &spaced).unwrap(),
+            auto_title(SessionOrigin::User, &spaced).unwrap(),
             format!("{}…", "a".repeat(AUTO_TITLE_CHARS - 1))
         );
     }
 
     #[test]
-    fn a_sweep_keeps_its_id_instead() {
-        // `cron:alarm:1755600000` says more than the first line of the prompt
-        // komo wrote for itself.
-        assert_eq!(auto_title("cron:alarm:1755600000", "检查告警并汇报"), None);
-        assert_eq!(auto_title("briefing:2026-08-20", "生成今天的简报"), None);
-        assert_eq!(auto_title("delegate:0198f0d1", "去查一下这个"), None);
-        // Don't over-match: a real conversation may start with those words.
-        assert!(auto_title("api:x", "cron: 帮我加个定时任务").is_some());
+    fn komo_never_names_a_session_it_wrote_the_prompt_for() {
+        for origin in [
+            SessionOrigin::Cron,
+            SessionOrigin::Briefing,
+            SessionOrigin::Delegate,
+        ] {
+            assert_eq!(auto_title(origin, "检查告警并汇报"), None, "{origin:?}");
+        }
+        // The gate is the origin, not the words: a real conversation may open
+        // with anything, including what a sweep's prompt would say.
+        assert!(auto_title(SessionOrigin::User, "cron: 帮我加个定时任务").is_some());
+        assert!(auto_title(SessionOrigin::User, "检查告警并汇报").is_some());
+    }
+
+    #[test]
+    fn a_channel_address_round_trips_and_rejects_a_half_one() {
+        let peer = ChannelPeer::new("feishu", "oc_abc");
+        assert_eq!(peer.address(), "feishu:oc_abc");
+        assert_eq!(ChannelPeer::parse("feishu:oc_abc"), Some(peer));
+        // A bare session id is not an address.
+        assert_eq!(
+            ChannelPeer::parse("0198f0d1-9e3a-7c11-8a2b-1c2d3e4f5a6b"),
+            None
+        );
+        assert_eq!(ChannelPeer::parse("feishu:"), None);
+        assert_eq!(ChannelPeer::parse(":oc_abc"), None);
     }
 
     #[test]
     fn display_title_prefers_the_name_a_person_gave() {
-        let mut session = session_saying("api:x", "随便问问");
+        let mut session = session_saying("s", "随便问问");
         assert_eq!(session.display_title(), "随便问问");
         session.title = "订单排查".to_string();
         assert_eq!(session.display_title(), "订单排查");
@@ -244,19 +314,46 @@ mod tests {
 
     #[test]
     fn display_title_is_empty_when_nothing_can_name_the_session() {
-        assert_eq!(Session::new("api:x").display_title(), "");
+        // Nothing said yet.
+        assert_eq!(Session::new("s").display_title(), "");
+        // Said plenty, but komo wrote it.
+        let mut sweep = session_saying("s", "检查告警");
+        sweep.origin = SessionOrigin::Cron;
+        assert_eq!(sweep.display_title(), "");
+    }
+
+    #[test]
+    fn a_sessions_kind_is_a_field_no_reader_has_to_parse() {
+        // The word in a conversation is just a word — what used to be a
+        // substring test on the id is now a value nobody can spell wrong.
+        let talking_about_it = session_saying("s", "帮我看看 delegate 这个工具");
+        assert_eq!(talking_about_it.origin, SessionOrigin::User);
         assert_eq!(
-            session_saying("cron:alarm:1", "检查告警").display_title(),
-            ""
+            Session::new("s")
+                .with_origin(SessionOrigin::Delegate)
+                .origin,
+            SessionOrigin::Delegate
         );
     }
 
     #[test]
-    fn only_the_subagent_prefix_is_filtered() {
-        // Don't over-match: a user conversation may legitimately mention the word.
-        assert!(is_subagent_session("delegate:abc"));
-        assert!(!is_subagent_session("api:delegate-notes"));
-        assert!(!is_subagent_session("telegram:12345"));
-        assert!(!is_subagent_session("cron:nightly:1785228839"));
+    fn an_unknown_stored_origin_reads_as_an_ordinary_conversation() {
+        // It decides display and learning eligibility, never authorization, so
+        // an unreadable row should look like a conversation rather than vanish.
+        assert_eq!(SessionOrigin::parse("wat"), SessionOrigin::User);
+        for origin in [
+            SessionOrigin::User,
+            SessionOrigin::Cron,
+            SessionOrigin::Briefing,
+            SessionOrigin::Delegate,
+        ] {
+            assert_eq!(SessionOrigin::parse(origin.as_str()), origin);
+        }
+        // A sub-agent inherits its parent's attendance; only the sweeps are
+        // unattended.
+        assert!(!SessionOrigin::Delegate.is_unattended());
+        assert!(SessionOrigin::Cron.is_unattended());
+        assert!(SessionOrigin::Briefing.is_unattended());
+        assert!(!SessionOrigin::User.is_unattended());
     }
 }

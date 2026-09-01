@@ -130,9 +130,21 @@ same `operator_control/actions.rs::OperatorActions`**, so business logic can't
 fork — add new operator actions there, not in the CLI or api handlers.
 
 - `komo chat` → `POST /v1/chat/completions` with `X-Komo-Trusted` (loopback
-  only): side-effecting tools auto-approve for the host operator. API sessions
-  are stored as `api:<uuid>` internally, while `X-Komo-Session-Id` carries the
-  bare UUID; the gateway accepts the old prefixed form for compatibility.
+  only): side-effecting tools auto-approve for the host operator.
+  `X-Komo-Session-Id` **must be a UUID** and is the session id verbatim — 400
+  otherwise. It used to be wrapped in an `api:` namespace that every client then
+  stripped back off, but that wrapper was doing one undocumented thing: keeping
+  a caller from addressing another ingress's session and inheriting its
+  permission and memory scope. The UUID requirement is what replaces it.
+- **Every api turn takes the same per-session slot a chat turn takes**
+  (`GatewayDispatcher::claim_session`), so "one turn per session" holds *across*
+  ingresses. Two clients on one session — a second TUI resuming it, the desktop
+  app beside the terminal — used to run concurrent turns, and the later one
+  assembled its history before the earlier had written a word of its answer, so
+  it started over from the original question and re-ran everything still in
+  flight. A chat channel queues; an HTTP caller waits, because it is owed its
+  own reply. The wait is unbounded on purpose: refusing the message at a
+  deadline throws away what the user typed.
 - Cancel: `POST /api/interactions/{session}/cancel` flips the session's
   `CancelSignal`; `run_agent_loop` races every await against it. A running tool
   stops only if it claims `ToolContext::cancelled()` (shell kills its process
@@ -370,13 +382,13 @@ call the same functions, which is what keeps validation from forking.
   **Cancelled turns are audit, not lessons**: the work stopped part-way by the
   user's choice, so its silence is not evidence and its half-done steps are not
   a procedure worth keeping.
-  **Sweep sessions (`briefing:*`, `cron:*`) are exempt** — a sweep restates
+  **Sweep sessions are exempt** (`Session.origin` is `cron`/`briefing`) — a sweep restates
   facts the agent already knows, and each run's session counts as a fresh
   "independent occasion" to the consolidator, so extracting there would let the
   memory library corroborate itself on a timer. The guard lives in
   `LearningCoordinator` (`exempt_from_learning`), covering both triggers.
-- `komo-agent`'s `delegate` — sub-agent as a real agent turn on a `delegate:<uuid>`
-  session; inherits the parent's ambient session context (approvals prompt the
+- `komo-agent`'s `delegate` — sub-agent as a real agent turn on its own session
+  (`Session.origin = delegate`, which is what keeps it out of the session list); inherits the parent's ambient session context (approvals prompt the
   real conversation, cancel propagates); recursion blocked structurally
   (sub-agent tool set has `delegate: None`); each delegation is its own ledger
   run. The unattended cron runtime gets no `delegate`.
@@ -484,11 +496,14 @@ call the same functions, which is what keeps validation from forking.
   `vouched_at()` (last confirmation, else newest evidence, else creation — *not*
   `updated_at`, which is an edit clock), and the block header tells the model to
   confirm a stale memory before letting it drive an action.
-  **Scope**: `write_scope()` only channel-scopes a *durable* channel
-  (`is_durable_channel`). The `api` platform's chat id is per-conversation
-  (TUI/desktop/web all ride it), so channel-scoping there makes a memory
-  unrecallable from the next turn — those writes go `Global`. Memories written
-  before this are repaired by `komo memory repair-scopes`.
+  **Scope**: `write_scope()` channel-scopes a turn that has a correspondent
+  (`SessionContext::channel`, filled from the session record in
+  `run_agent_loop`), else writes `Global`. A local surface (TUI/desktop/web) has
+  no correspondent, so it writes `Global` — it used to be modelled as a chat on
+  an `api` platform whose chat id was a fresh uuid per conversation, which made
+  every automated write unrecallable from the next turn and needed an
+  `is_durable_channel` exception to undo. Memories written before that fix are
+  repaired by `komo memory repair-scopes`.
 - `domain/chunk_index.rs` + `komo-wiki` + `komo-services`' `wiki_indexing` +
   `komo-tools`' `wiki_search` / `wiki_read` / `wiki_index` — semantic search over the note vault
   (`[wiki] vault`), **pulled on demand, never auto-injected** like memory recall:
@@ -635,7 +650,12 @@ call the same functions, which is what keeps validation from forking.
 - `infra/messaging/` — channels: feishu (ws long connection on a dedicated
   thread), telegram (long polling, Markdown with plain-text fallback), wechat
   (iLink, DM-only, shared `WeChatBot` instance, in-memory reply tokens).
-  Session ids: `{platform}:{chat_id}`. Home Assistant is **not** a channel —
+  A channel hands `GatewayDispatcher::handle` a **`ChannelPeer`** (platform +
+  that platform's chat id), never a session id: which conversation that is
+  belongs to the store (`SessionRepository::find_by_peer`, opening one on first
+  contact). Session ids are UUIDs and carry nothing — they used to *be* the
+  address (`feishu:{chat_id}`), which made every consumer re-derive it by
+  splitting a string. Home Assistant is **not** a channel —
   it is reachable only through the `homeassistant` tool (agent pulls on
   demand); recurring device reactions belong in an HA automation written via
   the tool's `save_automation`, not in an event stream that costs an LLM turn
@@ -651,8 +671,8 @@ call the same functions, which is what keeps validation from forking.
   whose three real differences hide among nine identical fields.
 - `tui/` — ratatui chat front end over gateway-or-in-process backends; state +
   key handling terminal-free in `tui/app.rs`. `komo resume <id>` (or the
-  compatible `komo session resume <id>`) re-enters a session; a bare API UUID
-  resolves its internal `api:<uuid>` id and hydrates the transcript. Input:
+  compatible `komo session resume <id>`) re-enters a session by its UUID and
+  hydrates the transcript. Input:
   Enter sends, Shift/Alt-Enter (kitty protocol) or Ctrl-J newline, **Esc stops
   the turn in flight** (nothing when idle — a stop key that sometimes discards the
   draft is worse than one extra keystroke; under the approval modal Esc keeps

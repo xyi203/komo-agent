@@ -1,3 +1,5 @@
+use komo_core::domain::context::SessionOrigin;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -57,6 +59,8 @@ impl ReflectiveReviewer {
             status: String::new(),
             model: String::new(),
             effort: String::new(),
+            channel: None,
+            origin: SessionOrigin::User,
         }
     }
 
@@ -117,7 +121,7 @@ impl Reviewer for ReflectiveReviewer {
             return Ok(ReviewOutcome::default());
         };
 
-        let ctx = MemoryContext::from_session(&session.id);
+        let ctx = MemoryContext::new(&session.id, session.channel.as_ref());
         let mut outcome = ReviewOutcome::default();
 
         // Extraction produces *observations*; deciding what each one means against
@@ -650,6 +654,15 @@ mod tests {
 
     /// Identity and workspace only: the extractor reads episodes, so the
     /// session it is handed carries no transcript.
+    /// A chat session with `id`, answering a correspondent on telegram — the
+    /// channel is a field now, so a test that wants channel scope has to say so
+    /// rather than spell it into the id.
+    fn chat_session(id: &str, peer_id: &str) -> Session {
+        session(id).with_channel(komo_core::domain::session::ChannelPeer::new(
+            "telegram", peer_id,
+        ))
+    }
+
     fn session(id: &str) -> Session {
         Session {
             id: id.to_string(),
@@ -660,6 +673,8 @@ mod tests {
             status: String::new(),
             model: String::new(),
             effort: String::new(),
+            channel: None,
+            origin: SessionOrigin::User,
         }
     }
 
@@ -849,7 +864,7 @@ mod tests {
         let (reviewer, tasks) = reviewer_with(reply);
 
         let outcome = reviewer
-            .review(&session("telegram:42"), &episodes())
+            .review(&chat_session("s42", "42"), &episodes())
             .await
             .unwrap();
         assert_eq!(outcome.tasks_captured.len(), 1);
@@ -858,7 +873,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, TaskStatus::Inbox);
         assert_eq!(rows[0].waiting_on, "Bob");
-        assert_eq!(rows[0].source, "telegram:42");
+        assert_eq!(rows[0].source, "s42");
         assert!(!rows[0].source_message_id.is_empty());
     }
 
@@ -866,7 +881,7 @@ mod tests {
     async fn dedups_commitment_across_repeated_reviews() {
         let reply = r#"{"commitments":[{"title":"send Bob the report"}]}"#;
         let (reviewer, tasks) = reviewer_with(reply);
-        let s = session("telegram:42");
+        let s = chat_session("s42", "42");
 
         reviewer.review(&s, &episodes()).await.unwrap();
         let second = reviewer.review(&s, &episodes()).await.unwrap();
@@ -882,11 +897,11 @@ mod tests {
         let (reviewer, tasks) = reviewer_with(reply);
 
         reviewer
-            .review(&session("telegram:1"), &episodes())
+            .review(&chat_session("s1", "1"), &episodes())
             .await
             .unwrap();
         reviewer
-            .review(&session("telegram:2"), &episodes())
+            .review(&chat_session("s2", "2"), &episodes())
             .await
             .unwrap();
 
@@ -930,7 +945,7 @@ mod tests {
         );
 
         reviewer
-            .review(&session("telegram:42"), &episodes())
+            .review(&chat_session("s42", "42"), &episodes())
             .await
             .unwrap();
 
@@ -958,7 +973,7 @@ mod tests {
             Arc::new(FakeSkills::default()),
             Arc::new(FakeTasks::default()),
         );
-        let s = session("telegram:42");
+        let s = chat_session("s42", "42");
 
         reviewer.review(&s, &episodes()).await.unwrap();
         reviewer.review(&s, &episodes()).await.unwrap();
@@ -981,7 +996,7 @@ mod tests {
             platform: "telegram".into(),
             chat_id: "42".into(),
         };
-        existing.source = "telegram:99".into(); // a different origin session
+        existing.source = "s99".into(); // a different origin session
         memories.save(&existing).await.unwrap();
 
         let reviewer = ReflectiveReviewer::new(
@@ -991,7 +1006,7 @@ mod tests {
             Arc::new(FakeTasks::default()),
         );
         let outcome = reviewer
-            .review(&session("telegram:42"), &episodes())
+            .review(&chat_session("s42", "42"), &episodes())
             .await
             .unwrap();
 
@@ -1022,7 +1037,7 @@ mod tests {
             Arc::new(FakeTasks::default()),
         );
         reviewer
-            .review(&session("telegram:42"), &episodes())
+            .review(&chat_session("s42", "42"), &episodes())
             .await
             .unwrap();
 

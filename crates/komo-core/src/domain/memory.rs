@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use super::session::ChannelPeer;
+
 /// A long-term memory: a durable fact, preference, or note about the user, a
 /// project, a person, or a decision. Memories are governed (status/confidence)
 /// and scoped (where they may surface) so the agent can be injected with a
@@ -604,65 +606,55 @@ impl MemoryScope {
     }
 }
 
-/// Whether a platform's `chat_id` identifies a **durable conversation partner**
-/// (a person or a group that persists across conversations) rather than a
-/// single conversation.
+/// The scopes a memory may be drawn from for the current turn. `Global` is
+/// always allowed; a turn with a correspondent adds that `Channel` and its own
+/// `Session`. Scope is decided here, before any query, so a query can never
+/// widen beyond what the context permits.
 ///
-/// This is what makes `Channel` scope meaningful: it keeps a fact disclosed in
-/// one person's DM from surfacing in someone else's chat, while still letting
-/// that person's own memories follow them across sessions.
-///
-/// The `api` platform breaks that assumption. Its `chat_id` is a per-conversation
-/// uuid (`api:<uuid>`, and `gui-desktop-<uuid>` from the desktop app), so
-/// `Channel` there is a synonym for `Session` — an automated write would be
-/// unrecallable from the very next conversation. Every local surface (TUI,
-/// desktop, web) runs over that one channel and belongs to the single host
-/// operator, so there is no cross-tenant leak to guard against: those writes
-/// belong in `Global`.
-pub fn is_durable_channel(platform: &str) -> bool {
-    platform != "api"
-}
-
-/// The scopes a memory may be drawn from for the current turn, derived from the
-/// session id. `Global` is always allowed; chat sessions add their `Channel`
-/// and `Session` scopes. Scope is decided here, before any query, so a query
-/// can never widen beyond what the context permits.
+/// `Channel` scope is what keeps a fact disclosed in one person's DM from
+/// surfacing in someone else's chat while still following that person across
+/// sessions — which only means anything when the address identifies a **durable
+/// correspondent** rather than one conversation. That used to need a
+/// `is_durable_channel` exception, because the local surfaces were modelled as a
+/// channel (`api:<uuid>`) whose "correspondent" was a fresh uuid per
+/// conversation, so channel-scoping there wrote memories unrecallable from the
+/// next turn. A local turn now simply has no correspondent, and the exception is
+/// gone with the prefix that forced it.
 #[derive(Debug, Clone)]
 pub struct MemoryContext {
     pub allowed_scopes: Vec<MemoryScope>,
 }
 
 impl MemoryContext {
-    /// Derive the allowed scopes from a session id. A chat session id is
-    /// `{platform}:{chat_id}`; a CLI session is an opaque uuid. (Project scope
-    /// for CLI sessions is wired separately once the workspace key is known.)
-    pub fn from_session(session_id: &str) -> Self {
+    /// Derive the allowed scopes for a turn: its session, its correspondent's
+    /// channel when it has one, and always `Global`. (Project scope is wired
+    /// separately once the workspace key is known.)
+    pub fn new(session_id: &str, channel: Option<&ChannelPeer>) -> Self {
         let mut allowed_scopes = vec![MemoryScope::Global];
-        if let Some((platform, chat_id)) = session_id.split_once(':') {
+        if let Some(peer) = channel {
             allowed_scopes.push(MemoryScope::Channel {
-                platform: platform.to_string(),
-                chat_id: chat_id.to_string(),
+                platform: peer.platform.clone(),
+                chat_id: peer.peer_id.clone(),
             });
         }
         allowed_scopes.push(MemoryScope::Session(session_id.to_string()));
         Self { allowed_scopes }
     }
 
-    /// The scope an automated write from this context should carry: the channel
-    /// for a chat session, else global. (Never `Session`, which would make a
-    /// memory unrecallable outside the exact session.)
-    ///
-    /// Only a **durable** channel is used — see [`is_durable_channel`]. On the
-    /// `api` platform the channel *is* the session, so channel-scoping a write
-    /// there is exactly the "unrecallable outside the exact session" failure
-    /// this method exists to avoid.
+    /// A turn with no correspondent — every local surface, and komo's own
+    /// sweeps.
+    pub fn local(session_id: &str) -> Self {
+        Self::new(session_id, None)
+    }
+
+    /// The scope an automated write from this context should carry: the
+    /// correspondent's channel when there is one, else global. (Never
+    /// `Session`, which would make a memory unrecallable outside the exact
+    /// session.)
     pub fn write_scope(&self) -> MemoryScope {
         self.allowed_scopes
             .iter()
-            .find(|s| match s {
-                MemoryScope::Channel { platform, .. } => is_durable_channel(platform),
-                _ => false,
-            })
+            .find(|s| matches!(s, MemoryScope::Channel { .. }))
             .cloned()
             .unwrap_or(MemoryScope::Global)
     }
@@ -1203,13 +1195,13 @@ mod tests {
 
     #[test]
     fn context_from_chat_session_allows_global_channel_session() {
-        let ctx = MemoryContext::from_session("telegram:42");
+        let ctx = MemoryContext::new("s1", Some(&ChannelPeer::new("telegram", "42")));
         assert!(ctx.allows(&MemoryScope::Global));
         assert!(ctx.allows(&MemoryScope::Channel {
             platform: "telegram".into(),
             chat_id: "42".into()
         }));
-        assert!(ctx.allows(&MemoryScope::Session("telegram:42".into())));
+        assert!(ctx.allows(&MemoryScope::Session("s1".into())));
         // A different channel is not allowed.
         assert!(!ctx.allows(&MemoryScope::Channel {
             platform: "feishu".into(),
@@ -1226,7 +1218,7 @@ mod tests {
 
     #[test]
     fn cli_session_context_writes_global() {
-        let ctx = MemoryContext::from_session("0192-uuid");
+        let ctx = MemoryContext::local("0192-uuid");
         assert_eq!(ctx.write_scope(), MemoryScope::Global);
     }
 
@@ -1239,7 +1231,7 @@ mod tests {
 
     #[test]
     fn is_pinnable_requires_pinned_active_confident_identity_kind() {
-        let ctx = MemoryContext::from_session("cli");
+        let ctx = MemoryContext::local("s1");
         let now = 1_000;
         assert!(pinnable_memory().is_pinnable(&ctx, now));
 
@@ -1369,51 +1361,44 @@ mod tests {
         assert!(!RecallQuery::lexical("rust").terms().is_empty());
     }
 
-    /// The api channel mints a chat id per conversation, so channel-scoping an
-    /// automated write there would make it unrecallable from the next turn —
-    /// the reason no memory in a real library had ever been recalled.
+    /// A local surface has no correspondent, so an automated write there is
+    /// global — it must be recallable from the next conversation. A real chat
+    /// channel keeps its scope, which is a privacy boundary.
     #[test]
-    fn api_sessions_write_global_scope_but_chat_channels_keep_theirs() {
+    fn a_turn_without_a_correspondent_writes_global_but_a_chat_keeps_its_channel() {
         assert_eq!(
-            MemoryContext::from_session("api:019fb0ce-9f7a-7c23-a87d-dab9df9216d8").write_scope(),
+            MemoryContext::local("019fb0ce-9f7a-7c23-a87d-dab9df9216d8").write_scope(),
             MemoryScope::Global,
-            "an api chat id names one conversation, not a partner"
+            "a local conversation names no partner to scope to"
         );
         assert_eq!(
-            MemoryContext::from_session("api:gui-desktop-a92b9d36").write_scope(),
-            MemoryScope::Global,
-        );
-        assert_eq!(
-            MemoryContext::from_session("feishu:ou_445299e2").write_scope(),
+            MemoryContext::new("s1", Some(&ChannelPeer::new("feishu", "ou_445299e2")))
+                .write_scope(),
             MemoryScope::Channel {
                 platform: "feishu".into(),
                 chat_id: "ou_445299e2".into(),
             },
             "a real chat channel's scope is a privacy boundary and must survive"
         );
-        assert_eq!(
-            MemoryContext::from_session("cli-uuid").write_scope(),
-            MemoryScope::Global,
-        );
     }
 
     /// A global memory written from one api conversation must be recallable
     /// from the next — the end-to-end shape of the scope fix.
     #[test]
-    fn a_memory_written_in_one_api_conversation_is_recallable_in_the_next() {
+    fn a_memory_written_in_one_local_conversation_is_recallable_in_the_next() {
         let now = 1_000;
-        let write_ctx = MemoryContext::from_session("api:conversation-one");
+        let write_ctx = MemoryContext::local("conversation-one");
         let mut memory = Memory::new(MemoryKind::Fact, "the rust toolchain is pinned");
         memory.scope = write_ctx.write_scope();
 
-        let read_ctx = MemoryContext::from_session("api:conversation-two");
+        let read_ctx = MemoryContext::local("conversation-two");
         let query = RecallQuery::lexical("rust toolchain");
         assert_eq!(select_recall(&[memory], &read_ctx, &query, 5, now).len(), 1,);
     }
 
     #[test]
     fn select_pinned_keeps_only_eligible_and_orders_by_importance() {
-        let ctx = MemoryContext::from_session("cli");
+        let ctx = MemoryContext::local("s1");
         let now = 1_000;
         let mut low = pinnable_memory();
         low.importance = 10;
@@ -1429,7 +1414,7 @@ mod tests {
 
     #[test]
     fn select_recall_ranks_in_scope_matches_and_caps() {
-        let ctx = MemoryContext::from_session("cli");
+        let ctx = MemoryContext::local("s1");
         let now = 1_000;
         let mut hit = Memory::new(MemoryKind::Fact, "the rust toolchain is pinned");
         hit.updated_at = now;
@@ -1835,7 +1820,7 @@ mod tests {
     /// silence it immediately — without anyone unpinning it first.
     #[test]
     fn a_contested_pinned_memory_leaves_the_l1_profile() {
-        let ctx = MemoryContext::from_session("cli");
+        let ctx = MemoryContext::local("s1");
         let now = 1_000;
         let mut m = pinnable_memory();
         assert!(m.is_pinnable(&ctx, now));
@@ -1849,7 +1834,7 @@ mod tests {
     /// injection filter lives with the injector.
     #[test]
     fn recall_scoring_still_returns_a_contested_memory() {
-        let ctx = MemoryContext::from_session("cli");
+        let ctx = MemoryContext::local("s1");
         let now = 1_000;
         let mut m = Memory::new(MemoryKind::Fact, "the rust toolchain is pinned");
         m.contest(now);
@@ -1892,7 +1877,7 @@ mod tests {
 
     #[test]
     fn pinnable_excludes_out_of_scope() {
-        let ctx = MemoryContext::from_session("telegram:42");
+        let ctx = MemoryContext::new("s1", Some(&ChannelPeer::new("telegram", "42")));
         let mut other_channel = pinnable_memory();
         other_channel.scope = MemoryScope::Channel {
             platform: "feishu".into(),

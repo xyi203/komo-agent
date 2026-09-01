@@ -22,6 +22,7 @@ use komo_agent::gateway::Channel;
 use komo_agent::interaction::GatewayDispatcher;
 use komo_agent::pairing::PairingGuard;
 use komo_core::domain::inbox::InboundOrigin;
+use komo_core::domain::session::ChannelPeer;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -320,7 +321,6 @@ impl Channel for FeishuChannel {
                     continue;
                 }
 
-                let session_id = format!("feishu:{}", msg.chat_id);
                 info!(chat = %msg.chat_id, "feishu message received");
                 let sink: Arc<dyn ReplySink> = Arc::new(FeishuReplySink {
                     sender: self.sender.clone(),
@@ -332,7 +332,14 @@ impl Channel for FeishuChannel {
                 // gateway restarts. Both are the inbox's job now — the old
                 // in-process `seen` set survived neither.
                 let origin = InboundOrigin::new("feishu", msg.message_id.clone());
-                dispatcher.handle(&session_id, origin, msg.text, sink).await;
+                dispatcher
+                    .handle(
+                        &ChannelPeer::new("feishu", &msg.chat_id),
+                        origin,
+                        msg.text,
+                        sink,
+                    )
+                    .await;
             }
         };
 

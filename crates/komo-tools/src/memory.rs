@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use komo_services::memory_enrichment::pinned_budget_usage;
 use komo_services::memory_query::MemoryQueryService;
+use komo_services::tool_execution::SessionContext;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -197,7 +198,7 @@ impl Tool for MemoryTool {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         // Scope comes from the *explicit* per-call context (tool trait v2), not
         // the ambient task-local: `memory` was the last tool reading that seam.
-        let scope = memory_context(&tool_ctx.session.session_id);
+        let scope = memory_context(&tool_ctx.session);
 
         match args.action.as_str() {
             "save" => {
@@ -371,11 +372,11 @@ impl Tool for MemoryTool {
     }
 }
 
-/// The memory context for this call, derived from the turn's session id (see
-/// [`MemoryContext::from_session`]: a chat session also gets channel scope, a
-/// CLI one does not). An empty id yields the global-only context.
-fn memory_context(session_id: &str) -> MemoryContext {
-    MemoryContext::from_session(session_id)
+/// The memory context for this call: the turn's own session, plus its
+/// correspondent's channel when the turn has one (a chat turn does, a local one
+/// does not).
+fn memory_context(session: &SessionContext) -> MemoryContext {
+    MemoryContext::new(&session.session_id, session.channel.as_ref())
 }
 
 async fn set_status(

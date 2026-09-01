@@ -310,7 +310,7 @@ mod tests {
     }
 
     fn ctx() -> MemoryContext {
-        MemoryContext::from_session("api:conv-1")
+        MemoryContext::local("s1")
     }
 
     #[tokio::test]

@@ -1,24 +1,17 @@
 import { describe, expect, it } from "vitest";
 
-import { headerFor, newSessionId } from "./session-id";
+import { newSessionId } from "./session-id";
+
+const BARE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 describe("newSessionId", () => {
-  it("tags the host and keeps the api: prefix", () => {
-    expect(newSessionId("desktop")).toMatch(/^api:gui-desktop-[0-9a-f-]{36}$/);
-    expect(newSessionId("web")).toMatch(/^api:gui-web-[0-9a-f-]{36}$/);
+  // The gateway rejects a session header that is not a UUID, so this is the one
+  // shape it will accept — and the same string `komo resume` takes.
+  it("is a bare uuid, with nothing wrapped around it", () => {
+    expect(newSessionId()).toMatch(BARE_UUID);
   });
 
   it("is unique per call", () => {
-    expect(newSessionId("web")).not.toBe(newSessionId("web"));
-  });
-});
-
-describe("headerFor", () => {
-  it("strips the api: prefix the server re-adds", () => {
-    expect(headerFor("api:gui-web-abc")).toBe("gui-web-abc");
-  });
-
-  it("passes through an id that has no prefix", () => {
-    expect(headerFor("feishu:oc_1")).toBe("feishu:oc_1");
+    expect(newSessionId()).not.toBe(newSessionId());
   });
 });

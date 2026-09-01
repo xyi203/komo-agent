@@ -43,6 +43,8 @@
 //! Reopens ADR 0002's "no LLM approver" decision under its own stated trigger
 //! (MCP support landed); see `docs/adr/0003-auto-policy-llm-reviewer.md`.
 
+use komo_core::domain::context::SessionOrigin;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -135,6 +137,8 @@ impl AutoReviewApprover {
             status: String::new(),
             model: String::new(),
             effort: String::new(),
+            channel: None,
+            origin: SessionOrigin::User,
         };
         // One attempt, no retry (fx's `single_transport_attempt`): a retry
         // doubles the operator's wait for a decision that has a good fallback.
@@ -331,6 +335,13 @@ mod tests {
 
     #[async_trait]
     impl SessionRepository for FakeSessions {
+        async fn find_by_peer(
+            &self,
+            _channel: &komo_core::domain::session::ChannelPeer,
+        ) -> anyhow::Result<Option<Session>> {
+            Ok(None)
+        }
+
         async fn find(&self, id: &str) -> anyhow::Result<Option<Session>> {
             let mut s = Session::new(id);
             s.messages = self.messages.clone();

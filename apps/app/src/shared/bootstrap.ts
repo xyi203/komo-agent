@@ -4,7 +4,7 @@
 
 import { installClient } from "./api/runtime";
 import type { KomoClient } from "./api/types";
-import type { HostTag } from "./lib/session-id";
+import type { HostTag } from "./api/runtime";
 import { newSessionId } from "./lib/session-id";
 import { applyTheme } from "./lib/theme";
 import { useAppStore } from "./store";
@@ -24,7 +24,7 @@ export function installHost({
   installClient(client, tag, chooseFolder);
   const store = useAppStore.getState();
   if (!store.session) {
-    const session = newSessionId(tag);
+    const session = newSessionId();
     useAppStore.setState({
       session,
     });

@@ -723,16 +723,17 @@ impl Default for Policy {
     }
 }
 
-/// The channel a session id belongs to: the part before `:` (`feishu:oc_x` →
-/// `feishu`), or `cli` for the REPL's bare uuid session ids. Both the approver
-/// (scoping a rule it saves) and the engine (matching `channels`) key off this,
-/// so it lives here rather than in either caller.
-pub fn channel_of(session_id: &str) -> String {
-    match session_id.split_once(':') {
-        Some((platform, _)) => platform.to_string(),
-        None => "cli".to_string(),
-    }
-}
+/// The channel name a turn with no correspondent is evaluated against: every
+/// local surface — TUI, desktop, web, CLI — is one operator at one machine, so
+/// they share one name rather than each inventing its own.
+///
+/// A turn's channel comes from
+/// [`SessionContext::channel_name`](crate::domain::context::SessionContext::channel_name);
+/// this is what that answers when the turn has no
+/// [`ChannelPeer`](crate::domain::session::ChannelPeer). It used to be derived
+/// by splitting the session id on a colon, which meant a client free to name
+/// its own session was also free to name its own channel.
+pub const LOCAL_CHANNEL: &str = "cli";
 
 pub fn category_str(c: Category) -> &'static str {
     match c {
@@ -1423,11 +1424,21 @@ mod tests {
     }
 
     #[test]
-    fn channel_of_reads_the_session_prefix() {
-        assert_eq!(channel_of("feishu:oc_abc"), "feishu");
-        assert_eq!(channel_of("telegram:123"), "telegram");
-        // A bare uuid session id is the CLI's.
-        assert_eq!(channel_of("0192f0aa-1111-7000-8000-000000000000"), "cli");
+    fn a_turns_channel_is_its_correspondent_or_the_local_one() {
+        use crate::domain::context::SessionContext;
+        use crate::domain::session::ChannelPeer;
+
+        let chat = SessionContext::detached("0192f0aa-1111-7000-8000-000000000000")
+            .with_channel(Some(ChannelPeer::new("feishu", "oc_abc")));
+        assert_eq!(chat.channel_name(), "feishu");
+
+        // No correspondent — TUI, desktop, web, CLI all evaluate as one
+        // operator at one machine. The session id says nothing either way,
+        // which is the point: it is a handle, not a schema.
+        let local = SessionContext::detached("0192f0aa-1111-7000-8000-000000000000");
+        assert_eq!(local.channel_name(), LOCAL_CHANNEL);
+        let looks_like_a_channel = SessionContext::detached("feishu:oc_abc");
+        assert_eq!(looks_like_a_channel.channel_name(), LOCAL_CHANNEL);
     }
 
     #[test]

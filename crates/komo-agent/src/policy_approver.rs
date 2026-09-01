@@ -16,7 +16,7 @@ use tracing::info;
 
 use komo_core::domain::{
     approval::{ApprovalRequest, Approver, Decision, Risk},
-    policy::{Policy, Rule, Verdict, channel_of},
+    policy::{Policy, Rule, Verdict},
 };
 use komo_infra::permissions_store::PermissionsStore;
 use komo_services::tool_execution::{current_job_grants, current_session};
@@ -92,7 +92,7 @@ impl Approver for PolicyApprover {
         // allow` and plain (non-`unattended`) allow rules grant there.
         let channel = current_session()
             .filter(|c| !c.is_unattended())
-            .map(|c| channel_of(&c.session_id));
+            .map(|c| c.channel_name().to_string());
         // The running job's own grants, if this is a scheduled job's turn.
         let grants = current_job_grants();
 

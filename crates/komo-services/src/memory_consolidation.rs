@@ -585,7 +585,7 @@ mod tests {
     }
 
     fn ctx() -> MemoryContext {
-        MemoryContext::from_session("api:conv-1")
+        MemoryContext::local("s1")
     }
 
     /// Nothing related in the library: the observation lands as a candidate,

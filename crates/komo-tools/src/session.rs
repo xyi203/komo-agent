@@ -418,6 +418,13 @@ mod tests {
 
     #[async_trait]
     impl SessionRepository for FakeSessions {
+        async fn find_by_peer(
+            &self,
+            _channel: &komo_core::domain::session::ChannelPeer,
+        ) -> anyhow::Result<Option<Session>> {
+            Ok(None)
+        }
+
         async fn find(&self, _id: &str) -> anyhow::Result<Option<Session>> {
             Ok(None)
         }

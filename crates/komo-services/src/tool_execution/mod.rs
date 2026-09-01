@@ -771,7 +771,7 @@ impl ToolExecutionCore {
         // Size the model's view. Over the cap, the full output is written out and
         // the model gets a head+tail preview naming that file — so this has to
         // run before the step is recorded, which is what carries the path.
-        let bounded = result.map(|out| self.bound(out, name, context, seq_field));
+        let bounded = result.map(|out| self.bound(out, context, seq_field));
 
         // Record the step — best-effort, never affecting the tool's own result.
         // Retries collapse into this one step: the retry is a robustness
@@ -854,7 +854,7 @@ impl ToolExecutionCore {
     /// The store is skipped without a ledger seq (aux sub-agents, sweeps): those
     /// have no run to point an operator back at and no `read`-capable follow-up
     /// turn, so a file on disk nobody will open is just litter.
-    fn bound(&self, out: String, name: &str, context: &ToolTurnContext, seq: i64) -> Bounded {
+    fn bound(&self, out: String, context: &ToolTurnContext, seq: i64) -> Bounded {
         let cap = self.config.max_result_bytes;
         match (&self.output_store, seq >= 0) {
             (Some(store), true) => store.bound(
@@ -867,7 +867,6 @@ impl ToolExecutionCore {
                         .map(|r| r.run_id.as_str())
                         .unwrap_or("run")
                 ),
-                name,
                 out,
                 cap,
             ),

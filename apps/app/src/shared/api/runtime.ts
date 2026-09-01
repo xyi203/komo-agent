@@ -3,11 +3,13 @@
 // models: there is exactly one gateway connection per window, so threading it
 // through every component would be ceremony.
 
-import type { HostTag } from "../lib/session-id";
 import type { FolderPicker } from "../types";
 import type { KomoClient } from "./types";
 
 let client: KomoClient | null = null;
+/** Which shell is running the renderer. */
+export type HostTag = "desktop" | "web";
+
 let tag: HostTag = "web";
 let folderPicker: FolderPicker | null = null;
 

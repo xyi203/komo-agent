@@ -12,6 +12,7 @@ use crate::persistence::{
 
 use komo_core::domain::{
     briefing::BriefingMarkRepository,
+    context::SessionOrigin,
     home::HomeRepository,
     inbox::{InboundOrigin, InboxClaim, InboxRepository},
     message::{Message, Role, ToolEntry},
@@ -22,7 +23,7 @@ use komo_core::domain::{
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
     repository::{MessageRepository, SessionRepository},
     run::{INTERRUPTED_ERROR, MemoryUse, Run, RunRepository, RunStatus, RunStep, parse_run_status},
-    session::Session,
+    session::{ChannelPeer, Session},
     skill::Skill,
     todo::{SessionTodoRepository, TodoItem},
     turn_journal::{JournalEntry, TurnJournalRepository, parse_journal_kind},
@@ -53,6 +54,19 @@ struct SessionRecord {
     /// creation-locked — a conversation may switch models mid-thread.
     model: String,
     effort: String,
+
+    /// The correspondent this conversation answers, split into the chat
+    /// platform and that platform's own id for the peer. Both empty for every
+    /// local surface and for komo's own sessions. Additive columns; a channel
+    /// finds its session by this pair (`find_by_peer`), which is what replaced
+    /// deriving the session id from the address.
+    channel_platform: String,
+    channel_peer_id: String,
+
+    /// What drives this conversation (`user` / `cron` / `briefing` /
+    /// `delegate`). Additive column; decides titling, list visibility and
+    /// learning eligibility. Was encoded in the id as a prefix.
+    origin: String,
 
     #[has_many]
     messages: toasty::Deferred<Vec<MessageRecord>>,
@@ -375,6 +389,15 @@ impl Db {
                 ),
                 ("model", "\"model\" text NOT NULL DEFAULT ''"),
                 ("effort", "\"effort\" text NOT NULL DEFAULT ''"),
+                (
+                    "channel_platform",
+                    "\"channel_platform\" text NOT NULL DEFAULT ''",
+                ),
+                (
+                    "channel_peer_id",
+                    "\"channel_peer_id\" text NOT NULL DEFAULT ''",
+                ),
+                ("origin", "\"origin\" text NOT NULL DEFAULT 'user'"),
             ];
             ensure_columns(p, "session_records", SESSION_COLUMNS).await?;
             // Columns this komo no longer models. `reviewed_through` was the
@@ -594,6 +617,30 @@ impl SessionRepository for Db {
         Ok(Some(session_from_record(record, messages)))
     }
 
+    async fn find_by_peer(&self, channel: &ChannelPeer) -> anyhow::Result<Option<Session>> {
+        // A session with no correspondent stores an empty address, so a query
+        // for one would match every local conversation and hand them each
+        // other's turns. An empty address is not an address.
+        if channel.platform.is_empty() || channel.peer_id.is_empty() {
+            return Ok(None);
+        }
+        let mut conn = self.inner.connection().await?;
+        let rows = toasty::query!(SessionRecord).exec(&mut conn).await?;
+        // Metadata only — a channel asks this on every inbound message just to
+        // learn which conversation it is, and loading a transcript to answer
+        // that would pay a turn's read before the turn starts.
+        let found = rows
+            .into_iter()
+            .filter(|r| {
+                r.channel_platform == channel.platform && r.channel_peer_id == channel.peer_id
+            })
+            // Newest wins. There should only ever be one, but a session the
+            // operator deleted and a channel then recreated would leave two,
+            // and answering with the stale one would strand the conversation.
+            .max_by_key(|r| r.created_at);
+        Ok(found.map(|record| session_from_record(record, Vec::new())))
+    }
+
     async fn list(&self) -> anyhow::Result<Vec<Session>> {
         let mut conn = self.inner.connection().await?;
         let mut rows = toasty::query!(SessionRecord).exec(&mut conn).await?;
@@ -630,6 +677,17 @@ impl SessionRepository for Db {
                 status: session.status.clone(),
                 model: session.model.clone(),
                 effort: session.effort.clone(),
+                channel_platform: session
+                    .channel
+                    .as_ref()
+                    .map(|c| c.platform.clone())
+                    .unwrap_or_default(),
+                channel_peer_id: session
+                    .channel
+                    .as_ref()
+                    .map(|c| c.peer_id.clone())
+                    .unwrap_or_default(),
+                origin: session.origin.as_str().to_string(),
             })
             .exec(&mut conn)
             .await;
@@ -715,6 +773,11 @@ impl SessionRepository for Db {
             // conversation. Rotation carries no learning state: the watermark is
             // per-run and a run keeps the session id it was recorded under, so
             // moving a transcript cannot make an episode look unlearned again.
+            //
+            // The **address does not move**. It names the live conversation with
+            // that correspondent, and there is exactly one; copying it here
+            // would leave two rows answering `find_by_peer`, so the chat's next
+            // message could land in the transcript `/new` just archived.
             toasty::create!(SessionRecord {
                 id: archived_id.clone(),
                 created_at: live.created_at,
@@ -723,6 +786,9 @@ impl SessionRepository for Db {
                 status: live.status.clone(),
                 model: live.model.clone(),
                 effort: live.effort.clone(),
+                channel_platform: String::new(),
+                channel_peer_id: String::new(),
+                origin: live.origin.clone(),
             })
             .exec(&mut tx)
             .await?;
@@ -1732,6 +1798,10 @@ fn session_from_record(record: SessionRecord, messages: Vec<Message>) -> Session
     let status = record.status.clone();
     let model = record.model.clone();
     let effort = record.effort.clone();
+    // Both halves or neither: a half-written address names no correspondent.
+    let channel = (!record.channel_platform.is_empty() && !record.channel_peer_id.is_empty())
+        .then(|| ChannelPeer::new(&record.channel_platform, &record.channel_peer_id));
+    let origin = SessionOrigin::parse(&record.origin);
     Session {
         id,
         workspace,
@@ -1741,6 +1811,8 @@ fn session_from_record(record: SessionRecord, messages: Vec<Message>) -> Session
         status,
         model,
         effort,
+        channel,
+        origin,
     }
 }
 
@@ -1835,6 +1907,108 @@ mod tests {
             }
         }
         out
+    }
+
+    #[tokio::test]
+    async fn rotating_a_chat_leaves_the_address_on_the_live_session() {
+        let db = Db::connect(&sqlite_url("komo_rotate_channel.db"))
+            .await
+            .unwrap();
+        let peer = ChannelPeer::new("feishu", "oc_abc");
+        let live = Session::new("019fad17-0000-7461-9d48-0a6c779f1c8d").with_channel(peer.clone());
+        SessionRepository::save(&db, &live).await.unwrap();
+        MessageRepository::save(&db, &live.id, &Message::user("旧的对话"))
+            .await
+            .unwrap();
+
+        let archived = SessionRepository::rotate(&db, &live.id)
+            .await
+            .unwrap()
+            .expect("something to archive");
+
+        // `/new` archived the transcript; the correspondent still reaches the
+        // live conversation, which is now empty.
+        let found = SessionRepository::find_by_peer(&db, &peer)
+            .await
+            .unwrap()
+            .expect("the chat still has a session");
+        assert_eq!(found.id, live.id, "the address must not follow the archive");
+        assert!(
+            MessageRepository::list_by_session(&db, &live.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !MessageRepository::list_by_session(&db, &archived)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the archived transcript is still readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_correspondent_resolves_to_one_session_and_carries_no_transcript() {
+        let db = Db::connect(&sqlite_url("komo_find_by_peer.db"))
+            .await
+            .unwrap();
+        let alice = ChannelPeer::new("feishu", "oc_alice");
+        let bob = ChannelPeer::new("feishu", "oc_bob");
+        // A platform's ids are its own: the same string on telegram is a
+        // different correspondent.
+        let elsewhere = ChannelPeer::new("telegram", "oc_alice");
+
+        assert!(
+            SessionRepository::find_by_peer(&db, &alice)
+                .await
+                .unwrap()
+                .is_none(),
+            "nobody has written yet"
+        );
+
+        let session =
+            Session::new("019fad15-8199-7461-9d48-0a6c779f1c8d").with_channel(alice.clone());
+        SessionRepository::save(&db, &session).await.unwrap();
+        MessageRepository::save(&db, &session.id, &Message::user("在吗"))
+            .await
+            .unwrap();
+
+        let found = SessionRepository::find_by_peer(&db, &alice)
+            .await
+            .unwrap()
+            .expect("alice's session");
+        assert_eq!(found.id, session.id);
+        assert_eq!(found.channel.as_ref(), Some(&alice));
+        // Metadata only: a channel asks this on every inbound message just to
+        // learn which conversation it is, and loading the transcript to answer
+        // that would pay a turn's read before the turn starts.
+        assert!(
+            found.messages.is_empty(),
+            "find_by_peer must not load the transcript"
+        );
+
+        for stranger in [&bob, &elsewhere] {
+            assert!(
+                SessionRepository::find_by_peer(&db, stranger)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{stranger:?} is a different correspondent"
+            );
+        }
+
+        // A local session has no correspondent at all, and must not answer for
+        // one — an empty address is not an address.
+        SessionRepository::save(&db, &Session::new("019fad16-0000-7461-9d48-0a6c779f1c8d"))
+            .await
+            .unwrap();
+        assert!(
+            SessionRepository::find_by_peer(&db, &ChannelPeer::new("", ""))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

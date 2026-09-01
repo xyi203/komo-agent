@@ -1,3 +1,5 @@
+use komo_core::domain::context::SessionOrigin;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -157,12 +159,10 @@ impl Tool for DelegateTool {
         // Create the sub-session up front carrying the model choice: the turn
         // reads it back off the session row (`infra::llm`), which is the same
         // mechanism a chat session uses — no separate plumbing for sub-agents.
-        let session_id = format!(
-            "{}{}",
-            komo_core::domain::session::SUBAGENT_SESSION_PREFIX,
-            uuid::Uuid::now_v7()
-        );
-        let mut session = Session::new(&session_id);
+        // `origin` is what marks it a sub-agent's scratch session — the session
+        // list filters on that, not on the shape of the id.
+        let session_id = uuid::Uuid::now_v7().to_string();
+        let mut session = Session::new(&session_id).with_origin(SessionOrigin::Delegate);
         session.model = model;
         self.sessions.save(&session).await?;
 

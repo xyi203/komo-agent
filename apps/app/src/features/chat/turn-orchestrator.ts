@@ -22,7 +22,6 @@
 import type { KomoClient, TurnEvent } from "@/shared/api/types";
 import { INTERACTIONS_BACKOFF_MS, POLL } from "@/shared/config";
 import { sleep as realSleep } from "@/shared/lib/async";
-import { headerFor } from "@/shared/lib/session-id";
 import type { Interactions, Mode, PendingApproval } from "@/shared/types";
 import { interactionsPath } from "./api";
 
@@ -160,7 +159,7 @@ export async function runTurn(
   try {
     const res = await resolved.client.chat(
       {
-        header: headerFor(req.session),
+        header: req.session,
         message: req.message,
         mode: req.mode,
         workspace: req.workspace,

@@ -400,7 +400,7 @@ impl ProviderLlm {
         let mut memories = RecalledMemories::default();
         if let Some(enricher) = &self.enricher
             && let Some(injection) = enricher
-                .enrich(&session.id, &prompt, &session.messages[..last_user_idx])
+                .enrich(session, &prompt, &session.messages[..last_user_idx])
                 .await
         {
             if let Some(pinned) = injection.pinned {

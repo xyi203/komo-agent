@@ -22,6 +22,7 @@ use komo_agent::gateway::Channel;
 use komo_agent::interaction::GatewayDispatcher;
 use komo_agent::pairing::PairingGuard;
 use komo_core::domain::inbox::InboundOrigin;
+use komo_core::domain::session::ChannelPeer;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -337,7 +338,6 @@ impl Channel for TelegramChannel {
                 if !admitted {
                     continue;
                 }
-                let session_id = format!("telegram:{}", msg.chat_id);
                 info!(chat = %msg.chat_id, "telegram message received");
                 let sink: Arc<dyn ReplySink> = Arc::new(TelegramReplySink {
                     sender: self.sender.clone(),
@@ -349,7 +349,14 @@ impl Channel for TelegramChannel {
                 // running a turn but before the next poll redelivers the whole
                 // batch. The inbox is what makes that a no-op.
                 let origin = InboundOrigin::new("telegram", msg.message_id.to_string());
-                dispatcher.handle(&session_id, origin, msg.text, sink).await;
+                dispatcher
+                    .handle(
+                        &ChannelPeer::new("telegram", msg.chat_id.to_string()),
+                        origin,
+                        msg.text,
+                        sink,
+                    )
+                    .await;
             }
         }
         info!("telegram channel stopped");

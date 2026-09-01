@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use super::{
     message::{Message, ToolEntry},
-    session::Session,
+    session::{ChannelPeer, Session},
     skill::Skill,
 };
 
@@ -20,6 +20,15 @@ pub trait SessionRepository: Send + Sync {
     /// window (load everything, same as `find`). The returned messages stay in
     /// chronological order.
     async fn find_windowed(&self, id: &str, limit: usize) -> anyhow::Result<Option<Session>>;
+    /// The session that answers a given correspondent, if one exists.
+    ///
+    /// This is the only way a chat channel finds its way back to a
+    /// conversation: an inbound message carries the platform's own chat id, not
+    /// a session id. It used to be answered by *computing* the session id
+    /// (`feishu:{chat_id}`), which made the id a derived value and left no room
+    /// for a conversation to exist without an address — or for two ids to name
+    /// the same one. Metadata only; the transcript is not loaded.
+    async fn find_by_peer(&self, channel: &ChannelPeer) -> anyhow::Result<Option<Session>>;
     /// Return all sessions, ordered by creation time.
     async fn list(&self) -> anyhow::Result<Vec<Session>>;
     /// Persist a session (insert or update).

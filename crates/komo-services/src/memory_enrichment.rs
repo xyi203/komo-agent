@@ -143,11 +143,11 @@ impl MemoryEnricher {
     /// memory change what happens next" are different questions.
     pub async fn enrich(
         &self,
-        session_id: &str,
+        session: &Session,
         user_message: &str,
         history: &[Message],
     ) -> Option<MemoryInjection> {
-        let ctx = MemoryContext::from_session(session_id);
+        let ctx = MemoryContext::new(&session.id, session.channel.as_ref());
 
         // Load the store once and derive both tiers from it — pinned and
         // recall each scanning the whole store would double the per-turn
@@ -699,7 +699,7 @@ mod tests {
         );
         let e = MemoryEnricher::new(store, None, query);
         let injection = e
-            .enrich("api:conv-1", "我平时用什么语言跟你说话", &[])
+            .enrich(&Session::new("s"), "我平时用什么语言跟你说话", &[])
             .await
             .expect("the semantic arm recalls it");
         assert!(
@@ -719,7 +719,7 @@ mod tests {
         contested.contest(1_000);
         let e = enricher(FakeStore::new(vec![contested]), None);
         assert!(
-            e.enrich("cli:s", "where do kanban tasks live?", &[])
+            e.enrich(&Session::new("s"), "where do kanban tasks live?", &[])
                 .await
                 .is_none(),
             "the only match was contested, so nothing is injected"
@@ -732,7 +732,7 @@ mod tests {
         old.supersede("m-new", 1_000);
         let e = enricher(FakeStore::new(vec![old]), None);
         assert!(
-            e.enrich("cli:s", "where do kanban tasks live?", &[])
+            e.enrich(&Session::new("s"), "where do kanban tasks live?", &[])
                 .await
                 .is_none()
         );
@@ -741,7 +741,7 @@ mod tests {
     #[tokio::test]
     async fn empty_store_yields_no_prefix() {
         let e = enricher(FakeStore::new(Vec::new()), None);
-        assert!(e.enrich("cli:s", "hello", &[]).await.is_none());
+        assert!(e.enrich(&Session::new("s"), "hello", &[]).await.is_none());
     }
 
     #[tokio::test]
@@ -749,7 +749,7 @@ mod tests {
         let mut store = FakeStore::new(Vec::new());
         store.fail_list = true;
         let e = enricher(store, None);
-        assert!(e.enrich("cli:s", "hello", &[]).await.is_none());
+        assert!(e.enrich(&Session::new("s"), "hello", &[]).await.is_none());
     }
 
     #[tokio::test]
@@ -759,7 +759,7 @@ mod tests {
         let store = FakeStore::new(library);
         let e = enricher(store, None);
         let injection = e
-            .enrich("cli:s", "where do kanban tasks live?", &[])
+            .enrich(&Session::new("s"), "where do kanban tasks live?", &[])
             .await
             .expect("both tiers inject");
         let pinned = injection.pinned.as_deref().expect("pinned tier present");
@@ -784,7 +784,7 @@ mod tests {
         let store = FakeStore::new(vec![active_fact("m-1", "kanban tasks live in kanban.db")]);
         let used = store.used.clone();
         let e = enricher(store, None);
-        e.enrich("cli:s", "kanban tasks?", &[])
+        e.enrich(&Session::new("s"), "kanban tasks?", &[])
             .await
             .expect("injects");
         // mark_used is spawned off the reply path; give it a beat.
@@ -811,7 +811,7 @@ mod tests {
         });
         let e = enricher(store, Some(aux));
         let injection = e
-            .enrich("cli:s", "kanban tasks?", &[])
+            .enrich(&Session::new("s"), "kanban tasks?", &[])
             .await
             .expect("injects");
         assert!(injection.joined().contains("kanban.db"));
@@ -837,7 +837,7 @@ mod tests {
         });
         let e = enricher(crowded_store(), Some(aux));
         let injection = e
-            .enrich("cli:s", "kanban tasks?", &[])
+            .enrich(&Session::new("s"), "kanban tasks?", &[])
             .await
             .expect("injects");
         let s = injection.joined();
@@ -856,7 +856,7 @@ mod tests {
         });
         let e = enricher(crowded_store(), Some(aux));
         let injection = e
-            .enrich("cli:s", "kanban tasks?", &[])
+            .enrich(&Session::new("s"), "kanban tasks?", &[])
             .await
             .expect("injects");
         let bullets = injection
@@ -874,7 +874,7 @@ mod tests {
         });
         let e = enricher(crowded_store(), Some(aux));
         let injection = e
-            .enrich("cli:s", "kanban tasks?", &[])
+            .enrich(&Session::new("s"), "kanban tasks?", &[])
             .await
             .expect("injects");
         let bullets = injection
