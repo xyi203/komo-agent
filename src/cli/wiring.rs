@@ -134,6 +134,7 @@ impl RuntimeParts<'_> {
             llm: profile.llm,
             sessions: self.db.clone(),
             messages: self.db.clone(),
+            events: self.db.clone(),
             // Every runtime shares the run ledger, which is what makes a
             // delegation, a cron job and a briefing each auditable through
             // `komo run list` alongside ordinary turns.
@@ -457,7 +458,7 @@ pub async fn build(
         // here, not on the returned executor — registering a tool shares the
         // core, and the setters take `Arc::get_mut`.
         if scope == Scope::MAIN {
-            tools = tools.with_transcript(db.clone());
+            tools = tools.with_events(db.clone());
         }
         for tool in registry.tools_for(scope) {
             tools.register(tool.clone());

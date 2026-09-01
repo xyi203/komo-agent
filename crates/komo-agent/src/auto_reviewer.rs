@@ -369,15 +369,6 @@ mod tests {
         async fn list_by_session(&self, _session_id: &str) -> anyhow::Result<Vec<Message>> {
             Ok(self.messages.clone())
         }
-        async fn save(&self, _session_id: &str, _message: &Message) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn cancel_last_turn(&self, _session_id: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn record_interjection(&self, _session_id: &str, _text: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
     }
 
     /// The human behind the reviewer: records whether it was consulted.

@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 
 use super::{
-    message::{Message, ToolEntry},
+    message::Message,
     session::{ChannelPeer, Session},
+    session_event::{SessionEvent, SessionEventKind},
     skill::Skill,
 };
 
@@ -78,43 +79,44 @@ pub trait SessionRepository: Send + Sync {
     }
 }
 
+/// Read the conversation a session holds.
+///
+/// Reading only: everything that *happens* in a session is appended through
+/// [`SessionEventRepository`], and the messages here are one projection of that
+/// log — the one a later turn replays. A caller that wants to record something
+/// records the event, not the message it will eventually project into.
 #[async_trait]
 pub trait MessageRepository: Send + Sync {
-    /// Return all messages for a session, ordered by timestamp.
+    /// Every message a later turn would replay, oldest first.
     async fn list_by_session(&self, session_id: &str) -> anyhow::Result<Vec<Message>>;
-    /// Append a message to a session.
-    async fn save(&self, session_id: &str, message: &Message) -> anyhow::Result<()>;
-    /// Record that the turn in flight was cancelled before it did anything.
-    ///
-    /// The pristine-cancel rollback: a turn cancelled before it produced
-    /// anything should read as if it never happened. **The store records the
-    /// fact and its projection decides what it means** — nothing is deleted, so
-    /// the transcript a reader gets loses the turn while the store still knows
-    /// it happened. Deliberately not a general "edit history" affordance.
-    async fn cancel_last_turn(&self, session_id: &str) -> anyhow::Result<()>;
-    /// Record something the user said while a turn was already running.
-    ///
-    /// What they said belongs to that turn's user input, not to a turn of its
-    /// own: two consecutive user messages is exactly what a transcript may not
-    /// contain (several providers reject it on replay). Recorded separately and
-    /// merged by the projection, for the same reason as
-    /// [`cancel_last_turn`](Self::cancel_last_turn) — a store that only ever
-    /// appends cannot corrupt what it already wrote.
-    async fn record_interjection(&self, session_id: &str, text: &str) -> anyhow::Result<()>;
+}
 
-    /// Record one tool call in the transcript.
-    ///
-    /// Never read back into the model's history — see [`ToolEntry`]. It makes
-    /// the transcript a complete account of the conversation *including the
-    /// work*, which is what an operator reading the file, or a client rendering
-    /// it, actually needs. Best-effort at the call site, like the ledger:
-    /// failing to record what a tool did must not fail the tool.
-    ///
-    /// Default no-op, so a store that keeps only what was said is still a valid
-    /// transcript store.
-    async fn record_tool(&self, _session_id: &str, _entry: &ToolEntry) -> anyhow::Result<()> {
-        Ok(())
-    }
+/// Append to a session's authoritative event log.
+///
+/// One writer per session, and it assigns the sequence numbers — a caller that
+/// numbered its own events is how two ingresses end up committing the same
+/// position.
+///
+/// [`append`](Self::append) buffers. A caller whose next step has an effect
+/// that must be attributable after a crash — dispatching a tool, sending a
+/// provider request — calls [`durable_flush`](Self::durable_flush) first, and
+/// only then acts.
+#[async_trait]
+pub trait SessionEventRepository: Send + Sync {
+    /// Assign and buffer a batch, returning the seqs it was given.
+    async fn append(
+        &self,
+        session_id: &str,
+        kinds: Vec<SessionEventKind>,
+    ) -> anyhow::Result<Vec<u64>>;
+
+    /// Make everything buffered survive a crash. Reaches the filesystem's
+    /// durability boundary — flushing a userspace buffer would make the
+    /// recovery rules claim more than the bytes support.
+    async fn durable_flush(&self, session_id: &str) -> anyhow::Result<()>;
+
+    /// The session's events, oldest first. Empty for a session with no log.
+    async fn events(&self, session_id: &str) -> anyhow::Result<Vec<SessionEvent>>;
 }
 
 #[async_trait]

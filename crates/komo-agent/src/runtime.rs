@@ -6,10 +6,13 @@ use komo_core::domain::{
     hooks::{StepDecision, StepHook, TurnHook},
     llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolOutcome},
     message::{Message, Role},
-    repository::{MessageRepository, SessionRepository},
+    repository::{MessageRepository, SessionEventRepository, SessionRepository},
     run::RecalledMemories,
     run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, tool_digest, truncate},
     session::Session,
+    session_event::{
+        AssistantMessageEvent, MessageSource, SessionEventKind, SurfacePlacement, UserMessageEvent,
+    },
     turn_journal::{JournalEntry, JournalKind, TurnJournal, TurnJournalRepository},
 };
 use std::future::Future;
@@ -50,6 +53,9 @@ pub struct AgentRuntime {
     pub llm: Arc<dyn LlmClient>,
     pub sessions: Arc<dyn SessionRepository>,
     pub messages: Arc<dyn MessageRepository>,
+    /// The session's authoritative event log. Everything a turn does is
+    /// appended here; `messages` is one projection of it.
+    pub events: Arc<dyn SessionEventRepository>,
     /// Run ledger: every turn is recorded here, with one step per tool call
     /// (captured by the tool executor). See `domain/run.rs`, roadmap §7.
     pub runs: Arc<dyn RunRepository>,
@@ -351,7 +357,21 @@ impl AgentRuntime {
         let resume_entries = match kind {
             TurnKind::Fresh { user_input } => {
                 let user_msg = Message::user(&user_input);
-                self.messages.save(session_id, &user_msg).await?;
+                self.record(
+                    session_id,
+                    vec![
+                        SessionEventKind::TurnStarted {
+                            turn_id: run.run_id.clone(),
+                        },
+                        SessionEventKind::UserMessage(UserMessageEvent {
+                            turn_id: run.run_id.clone(),
+                            content: user_input.clone(),
+                            source: MessageSource::User,
+                            surface: SurfacePlacement::append(),
+                        }),
+                    ],
+                )
+                .await;
                 session.messages.push(user_msg);
                 None
             }
@@ -399,7 +419,7 @@ impl AgentRuntime {
                 // A cancel that landed before the turn did anything is recorded
                 // as such instead of leaving a tombstone: the transcript then
                 // reads as if the turn never happened, while the log still
-                // knows it did (`fold` in `message_log`).
+                // knows it did (the surface fold in `domain::session_event`).
                 // "Did anything" means a tool ran — the only way a cancelled
                 // turn can have effects worth remembering. Without this, a user
                 // who sends a message and immediately stops it is left with a
@@ -409,15 +429,15 @@ impl AgentRuntime {
                 // (Never on a resume: the trailing user message there belongs
                 // to the interrupted turn, not to this continuation.)
                 if is_fresh && is_cancelled(&error) && probe.steps_count() == 0 {
-                    match self.messages.cancel_last_turn(session_id).await {
-                        Ok(()) => return Err(error),
-                        // Recording it failed — fall through and leave the
-                        // tombstone, which at least keeps the transcript
-                        // alternating.
-                        Err(rewind_err) => {
-                            warn!(%rewind_err, "failed to record a pristine cancel (non-fatal)")
-                        }
-                    }
+                    self.record_durable(
+                        session_id,
+                        vec![SessionEventKind::TurnCancelled {
+                            turn_id: probe.run_id.clone(),
+                            pristine: true,
+                        }],
+                    )
+                    .await;
+                    return Err(error);
                 }
                 let note = if is_cancelled(&error) {
                     CANCELLED_REPLY.to_string()
@@ -427,13 +447,30 @@ impl AgentRuntime {
                         truncate(&format!("{error:#}"), 400)
                     )
                 };
-                if let Err(save_err) = self
-                    .messages
-                    .save(session_id, &Message::assistant(&note))
-                    .await
-                {
-                    warn!(%save_err, "failed to persist failed-turn placeholder (non-fatal)");
-                }
+                let ended = if is_cancelled(&error) {
+                    SessionEventKind::TurnCancelled {
+                        turn_id: probe.run_id.clone(),
+                        pristine: false,
+                    }
+                } else {
+                    SessionEventKind::TurnFailed {
+                        turn_id: probe.run_id.clone(),
+                        error: truncate(&format!("{error:#}"), 400),
+                    }
+                };
+                self.record_durable(
+                    session_id,
+                    vec![
+                        SessionEventKind::AssistantMessage(AssistantMessageEvent {
+                            turn_id: probe.run_id.clone(),
+                            content: note,
+                            tool_note: String::new(),
+                            surface: SurfacePlacement::append(),
+                        }),
+                        ended,
+                    ],
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -446,10 +483,16 @@ impl AgentRuntime {
         // turn instead. Best-effort: the model already acted on them, so a
         // failure here costs the *next* turn context, not this one's answer.
         if !interjections.is_empty() {
-            let extra = interjections.join("\n");
-            if let Err(error) = self.messages.record_interjection(session_id, &extra).await {
-                warn!(%error, "failed to record a mid-turn interjection (non-fatal)");
-            }
+            self.record(
+                session_id,
+                vec![SessionEventKind::UserMessage(UserMessageEvent {
+                    turn_id: probe.run_id.clone(),
+                    content: interjections.join("\n"),
+                    source: MessageSource::Injected,
+                    surface: SurfacePlacement::append(),
+                })],
+            )
+            .await;
         }
 
         // Fold this turn's tool activity into a note on the assistant message, so
@@ -470,8 +513,22 @@ impl AgentRuntime {
             },
         };
 
-        let assistant_msg = Message::assistant(&reply).with_tool_note(tool_note);
-        self.messages.save(session_id, &assistant_msg).await?;
+        let assistant_msg = Message::assistant(&reply).with_tool_note(&tool_note);
+        self.record_durable(
+            session_id,
+            vec![
+                SessionEventKind::AssistantMessage(AssistantMessageEvent {
+                    turn_id: probe.run_id.clone(),
+                    content: reply.clone(),
+                    tool_note,
+                    surface: SurfacePlacement::append(),
+                }),
+                SessionEventKind::TurnCompleted {
+                    turn_id: probe.run_id.clone(),
+                },
+            ],
+        )
+        .await;
         session.messages.push(assistant_msg);
 
         // Lifecycle hooks: the turn delivered. Failed/cancelled turns never
@@ -481,6 +538,25 @@ impl AgentRuntime {
         }
 
         Ok((reply, usage, memories))
+    }
+
+    /// Append this turn's events, best-effort. A record that fails to land must
+    /// never fail the turn it describes.
+    async fn record(&self, session_id: &str, kinds: Vec<SessionEventKind>) {
+        if let Err(error) = self.events.append(session_id, kinds).await {
+            warn!(%error, "failed to append session events (non-fatal)");
+        }
+    }
+
+    /// Append and make durable. Every way a turn can end goes through here:
+    /// past this point the turn is over, so whatever it recorded has to have
+    /// survived — including the ways that end badly. A failed turn whose events
+    /// were only buffered reads afterwards as a turn that never happened.
+    async fn record_durable(&self, session_id: &str, kinds: Vec<SessionEventKind>) {
+        self.record(session_id, kinds).await;
+        if let Err(error) = self.events.durable_flush(session_id).await {
+            warn!(%error, "failed to make a finished turn durable (non-fatal)");
+        }
     }
 
     /// Await `work`, unless the turn is cancelled first.
@@ -790,6 +866,34 @@ fn stop_reply(stopped: &str, current: &str, narration: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Append one message as an event and make it durable — what a turn does,
+    /// condensed for a fixture that only cares that the message is there.
+    async fn say(db: &Db, session_id: &str, message: Message) {
+        use komo_core::domain::session_event::{
+            AssistantMessageEvent, MessageSource, SurfacePlacement, UserMessageEvent,
+        };
+        let kind = match message.role {
+            Role::Assistant => SessionEventKind::AssistantMessage(AssistantMessageEvent {
+                turn_id: "t".into(),
+                content: message.content,
+                tool_note: message.tool_note,
+                surface: SurfacePlacement::append(),
+            }),
+            _ => SessionEventKind::UserMessage(UserMessageEvent {
+                turn_id: "t".into(),
+                content: message.content,
+                source: MessageSource::User,
+                surface: SurfacePlacement::append(),
+            }),
+        };
+        SessionEventRepository::append(db, session_id, vec![kind])
+            .await
+            .unwrap();
+        SessionEventRepository::durable_flush(db, session_id)
+            .await
+            .unwrap();
+    }
     use super::*;
     use komo_infra::persistence::db::Db;
     use komo_tools::time::TimeTool;
@@ -1000,6 +1104,7 @@ mod tests {
             }),
             sessions: db.clone(),
             messages: db.clone(),
+            events: db.clone(),
             runs: db.clone(),
             tool_executor: executor,
             max_turns,
@@ -1414,6 +1519,7 @@ mod tests {
             llm: Arc::new(FailingLlm),
             sessions: db.clone(),
             messages: db.clone(),
+            events: db.clone(),
             runs: db.clone(),
             tool_executor: ToolExecutor::new(
                 komo_services::tool_execution::ToolExecutionConfig::default(),
@@ -1952,9 +2058,7 @@ mod tests {
         SessionRepository::save(&**db, &Session::new(session_id))
             .await
             .unwrap();
-        MessageRepository::save(&**db, session_id, &Message::user("do the thing"))
-            .await
-            .unwrap();
+        say(db, session_id, Message::user("do the thing")).await;
         let run = Run::start(session_id, "do the thing");
         RunRepository::start(&**db, &run).await.unwrap();
         for seq in 0..count {
@@ -1993,6 +2097,7 @@ mod tests {
             }),
             sessions: db.clone(),
             messages: db.clone(),
+            events: db.clone(),
             runs: db.clone(),
             tool_executor: ToolExecutor::new(
                 komo_services::tool_execution::ToolExecutionConfig::default(),
@@ -2059,9 +2164,7 @@ mod tests {
         let original = seed_interrupted(&db, "cli:rs2", 1).await;
         // The reply actually landed (crash in the gap before the ledger
         // closed) — the transcript ends on an assistant message.
-        MessageRepository::save(&*db, "cli:rs2", &Message::assistant("already delivered"))
-            .await
-            .unwrap();
+        say(&db, "cli:rs2", Message::assistant("already delivered")).await;
 
         let (rt, _) = scripted_runtime(
             db.clone(),

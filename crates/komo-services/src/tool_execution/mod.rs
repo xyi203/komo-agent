@@ -38,10 +38,12 @@ use komo_core::domain::catalog::{CatalogSnapshot, ToolCatalog};
 use komo_core::domain::events::TurnEvent;
 use komo_core::domain::hooks::{HookDecision, ToolHook};
 use komo_core::domain::llm::{ToolCallReq, ToolOutcome};
-use komo_core::domain::message::ToolEntry;
 use komo_core::domain::policy::{Access, Category, Policy};
-use komo_core::domain::repository::MessageRepository;
+use komo_core::domain::repository::SessionEventRepository;
 use komo_core::domain::run::{RunStep, STEP_FIELD_CAP, truncate};
+use komo_core::domain::session_event::{
+    SessionEventKind, ToolCallSettledEvent, ToolCallStartedEvent, ToolOutcome as SettledOutcome,
+};
 use komo_core::domain::tool::{Tool, ToolError};
 
 /// Live `TurnEvent` args/result use the **ledger's** cap, not a smaller one of
@@ -197,10 +199,10 @@ pub struct ToolExecutionCore {
     /// Tool hooks, run around every call in registration order (first `Deny`
     /// wins). Registered during wiring; a pinned executor carries the same set.
     hooks: Vec<Arc<dyn ToolHook>>,
-    /// Where a tool call is recorded in the session's transcript, so the file
+    /// Where a tool call is recorded in the session's event log, so the log
     /// holds the work and not only what was said. `None` (tests, aux executors)
     /// ⇒ nothing is recorded, which is what the transcript looked like before.
-    transcript: Option<Arc<dyn MessageRepository>>,
+    events: Option<Arc<dyn SessionEventRepository>>,
 }
 
 impl ToolExecutor {
@@ -219,7 +221,7 @@ impl ToolExecutor {
                 approver: Arc::new(DenyAllApprover),
                 output_store: None,
                 hooks: Vec::new(),
-                transcript: None,
+                events: None,
             }),
         }
     }
@@ -246,7 +248,7 @@ impl ToolExecutor {
                 approver: self.core.approver.clone(),
                 output_store: self.core.output_store.clone(),
                 hooks: self.core.hooks.clone(),
-                transcript: self.core.transcript.clone(),
+                events: self.core.events.clone(),
             }),
         }
     }
@@ -293,10 +295,10 @@ impl ToolExecutor {
     /// Install the transcript a tool call is recorded in. Absent ⇒ calls are
     /// not recorded there, which is every aux executor: their sessions are
     /// synthetic and a file per one-shot turn is litter.
-    pub fn with_transcript(mut self, transcript: Arc<dyn MessageRepository>) -> Self {
+    pub fn with_events(mut self, events: Arc<dyn SessionEventRepository>) -> Self {
         let core = Arc::get_mut(&mut self.core)
             .expect("set the transcript during wiring, before the executor is shared");
-        core.transcript = Some(transcript);
+        core.events = Some(events);
         self
     }
 
@@ -391,6 +393,41 @@ impl ToolExecutor {
             .map(|call| context.spin.observe(&call.name, &call.args))
             .collect();
 
+        // Every call in the round is dispatched at once below, so the whole
+        // round's intent is one append and **one** durable flush — not an fsync
+        // per call. Written before anything runs, because "the tool never
+        // started" and "it started and we lost the answer" need different
+        // answers on recovery and are otherwise indistinguishable.
+        //
+        // Best-effort like the ledger, with one difference: a failed flush
+        // means the round's intent did not survive, so recovery will read those
+        // calls as never-dispatched. Logged loudly for that reason.
+        if let (Some(events), Some(run)) = (&self.core.events, &context.run) {
+            let started: Vec<SessionEventKind> = calls
+                .iter()
+                .take(MAX_CALLS_PER_ROUND)
+                .enumerate()
+                .map(|(i, call)| {
+                    SessionEventKind::ToolCallStarted(ToolCallStartedEvent {
+                        turn_id: run.run_id.clone(),
+                        call_id: call.call_id.clone().unwrap_or_else(|| call.id.clone()),
+                        call_index: i as u32,
+                        tool: call.name.clone(),
+                        args: catalog
+                            .get(&call.name)
+                            .map(|tool| tool.redact_args(&call.args))
+                            .unwrap_or_else(|| call.args.clone()),
+                    })
+                })
+                .collect();
+            let session = context.session.session_id.clone();
+            if let Err(error) = events.append(&session, started).await {
+                warn!(%error, "failed to record the round's dispatch intent (non-fatal)");
+            } else if let Err(error) = events.durable_flush(&session).await {
+                warn!(%error, "the round's dispatch intent is not durable; a crash now would read these calls as never started");
+            }
+        }
+
         let catalog = &catalog;
         let futures = calls.iter().zip(&verdicts).enumerate().map(
             |(i, (call, verdict))| async move {
@@ -433,7 +470,13 @@ impl ToolExecutor {
                     match catalog.get(&call.name) {
                         Some(tool) => match self
                             .core
-                            .execute(tool.clone(), call.args.clone(), context)
+                            .execute(
+                                tool.clone(),
+                                call.args.clone(),
+                                context,
+                                call.call_id.as_deref().unwrap_or(&call.id),
+                                i as u32,
+                            )
                             .await
                         {
                             Ok((out, view)) => {
@@ -520,6 +563,8 @@ impl ToolExecutionCore {
         tool: Arc<dyn Tool>,
         input: String,
         context: &ToolTurnContext,
+        call_id: &str,
+        call_index: u32,
     ) -> anyhow::Result<(String, serde_json::Value)> {
         let name = tool.name();
 
@@ -810,29 +855,36 @@ impl ToolExecutionCore {
                 warn!(%error, tool = name, "failed to record run step (non-fatal)");
             }
 
-            // The same call, in the session's own file. Written from the step's
-            // values rather than the raw ones so the transcript inherits the
-            // ledger's redaction and cap — a file an operator opens must not be
-            // the one place a secret survives. Best-effort, like the step: the
-            // record of the work must never cost the work.
-            if let Some(transcript) = &self.transcript {
-                let entry = ToolEntry {
-                    name: name.to_string(),
-                    args: step.args.clone(),
-                    result: if step.ok {
-                        step.result.clone()
+            // Settled, in the session's own log — **per call**, the moment it
+            // settles. Not once per round: a round of three that crashes with
+            // two finished has two real results, and a single batched record
+            // written at the end would report all three as lost. Written from
+            // the step's values so the log inherits the ledger's redaction and
+            // cap. Best-effort, like the step: the record of the work must
+            // never cost the work.
+            if let (Some(events), Some(run)) = (&self.events, &context.run) {
+                let settled = SessionEventKind::ToolCallSettled(ToolCallSettledEvent {
+                    turn_id: run.run_id.clone(),
+                    call_id: call_id.to_string(),
+                    call_index,
+                    outcome: if step.uncertain {
+                        SettledOutcome::Uncertain
+                    } else if step.ok {
+                        SettledOutcome::Succeeded
                     } else {
-                        step.error.clone()
+                        SettledOutcome::Failed
                     },
-                    ok: step.ok,
+                    result: step.result.clone(),
+                    error: step.error.clone(),
                     elapsed_ms,
-                    timestamp: ended_at,
-                };
-                if let Err(error) = transcript
-                    .record_tool(&context.session.session_id, &entry)
+                    structured: step.structured.clone(),
+                    output_paths: step.output_paths.clone(),
+                });
+                if let Err(error) = events
+                    .append(&context.session.session_id, vec![settled])
                     .await
                 {
-                    warn!(%error, tool = name, "failed to record the tool call in the transcript (non-fatal)");
+                    warn!(%error, tool = name, "failed to record the settled call (non-fatal)");
                 }
             }
         }

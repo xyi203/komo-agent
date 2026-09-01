@@ -6,8 +6,8 @@ use toasty_driver_turso::Turso;
 use tracing::info;
 
 use crate::persistence::{
-    DEFAULT_POOL_SIZE, drop_retired_columns, ensure_columns, ensure_table, message_log::MessageLog,
-    prepare_turso_path, turso_marker_path, with_write_retry,
+    DEFAULT_POOL_SIZE, drop_retired_columns, ensure_columns, ensure_table, prepare_turso_path,
+    session_event_store::SessionEventStore, turso_marker_path, with_write_retry,
 };
 
 use komo_core::domain::{
@@ -15,15 +15,16 @@ use komo_core::domain::{
     context::SessionOrigin,
     home::HomeRepository,
     inbox::{InboundOrigin, InboxClaim, InboxRepository},
-    message::{Message, Role, ToolEntry},
+    message::Message,
     pairing::{
         APPROVE_LOCKOUT_SECS, APPROVE_MAX_FAILURES, ApproveOutcome, PAIRING_CODE_TTL_SECS,
         PairingRepository, PairingRequest, PairingStatus, parse_pairing_status, verify_code,
     },
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
-    repository::{MessageRepository, SessionRepository},
+    repository::{MessageRepository, SessionEventRepository, SessionRepository},
     run::{INTERRUPTED_ERROR, MemoryUse, Run, RunRepository, RunStatus, RunStep, parse_run_status},
     session::{ChannelPeer, Session},
+    session_event::{SESSION_EVENT_VERSION, SessionEvent, SessionEventKind, SessionHeader},
     skill::Skill,
     todo::{SessionTodoRepository, TodoItem},
     turn_journal::{JournalEntry, TurnJournalRepository, parse_journal_kind},
@@ -67,40 +68,6 @@ struct SessionRecord {
     /// `delegate`). Additive column; decides titling, list visibility and
     /// learning eligibility. Was encoded in the id as a prefix.
     origin: String,
-
-    #[has_many]
-    messages: toasty::Deferred<Vec<MessageRecord>>,
-}
-
-/// Transcripts as they were stored before they became files.
-///
-/// Nothing writes here any more — `MessageRepository` is the log
-/// (`super::message_log`). The model stays declared so `connect` can read an
-/// upgrading komo's rows once and move them out; a db whose table is empty has
-/// nothing left to migrate, which is why the migration needs no marker.
-#[derive(Debug, toasty::Model)]
-struct MessageRecord {
-    // UUIDv7 string key (time-ordered) rather than `#[auto]` autoincrement:
-    // Turso's MVCC concurrent-write mode rejects AUTOINCREMENT. Assigned at
-    // insert (`MessageRepository::save`).
-    #[key]
-    id: String,
-
-    #[index]
-    session_id: String,
-
-    #[belongs_to(key = session_id, references = id)]
-    session_record: toasty::Deferred<SessionRecord>,
-
-    role: String,
-    content: String,
-    timestamp: i64,
-
-    /// The turn's tool-activity digest for an assistant message (`domain/run.rs
-    /// ::tool_digest`), carried into later turns' model history. Empty = none,
-    /// which is also what a row written before the column reads as. Additive
-    /// column (see `MESSAGE_COLUMNS`).
-    tool_note: String,
 }
 
 #[derive(Debug, toasty::Model)]
@@ -212,7 +179,7 @@ struct RunRecord {
 /// `seq` orders steps within a run.
 #[derive(Debug, toasty::Model)]
 struct RunStepRecord {
-    // UUIDv7 string key (see `MessageRecord`): MVCC rejects AUTOINCREMENT.
+    // UUIDv7 string key: MVCC rejects AUTOINCREMENT.
     // Assigned at insert (`RunRepository::append_step`).
     #[key]
     id: String,
@@ -254,7 +221,7 @@ struct RunStepRecord {
 /// is JSON owned by the writer in `komo-agent`'s llm layer.
 #[derive(Debug, toasty::Model)]
 struct TurnJournalRecord {
-    // UUIDv7 string key (see `MessageRecord`): MVCC rejects AUTOINCREMENT.
+    // UUIDv7 string key: MVCC rejects AUTOINCREMENT.
     #[key]
     id: String,
 
@@ -354,11 +321,10 @@ const BRIEFING_MARK_KEY: &str = "briefing_last_handled";
 /// use [`with_write_retry`] for MVCC commit conflicts.
 pub struct Db {
     inner: Arc<toasty::Db>,
-    /// Transcripts, which are files rather than rows — see
-    /// [`message_log`](super::message_log) for why. Session *metadata* is still
-    /// a row here: it is updated (title, status, model, watermark), and a log is
-    /// the wrong shape for a value that changes.
-    messages: MessageLog,
+    /// The session event logs — files rather than rows, one directory per
+    /// session. Session *metadata* is still a row here: it is updated (title,
+    /// status, model), and a log is the wrong shape for a value that changes.
+    events: SessionEventStore,
 }
 
 impl Db {
@@ -408,9 +374,6 @@ impl Db {
             // Same repair as memory.db's `recall_query_hashes`.
             const SESSION_RETIRED: &[&str] = &["reviewed_through"];
             drop_retired_columns(p, "session_records", SESSION_RETIRED).await?;
-            const MESSAGE_COLUMNS: &[(&str, &str)] =
-                &[("tool_note", "\"tool_note\" text NOT NULL DEFAULT ''")];
-            ensure_columns(p, "message_records", MESSAGE_COLUMNS).await?;
             const RUN_COLUMNS: &[(&str, &str)] = &[
                 (
                     "recoverable",
@@ -455,7 +418,6 @@ impl Db {
         let db = toasty::Db::builder()
             .models(toasty::models!(
                 SessionRecord,
-                MessageRecord,
                 SkillRecord,
                 ReminderRecord,
                 SessionTodoRecord,
@@ -492,83 +454,13 @@ impl Db {
                 .unwrap_or_else(|| PathBuf::from(".")),
             None => std::env::temp_dir().join(format!("komo-mem-{}", uuid::Uuid::now_v7())),
         };
-        let messages = MessageLog::open(&transcript_home)?;
+        let events = SessionEventStore::new(&transcript_home);
 
         let this = Self {
             inner: Arc::new(db),
-            messages,
+            events,
         };
-        // Move any transcript still in the table out to its file. One-time and
-        // idempotent, the same shape as the legacy-SQLite staging above: a komo
-        // that upgrades keeps its conversations without the operator being told
-        // to delete anything.
-        if !is_new {
-            this.migrate_messages_to_log().await?;
-        }
         Ok(this)
-    }
-
-    /// Move transcripts out of `message_records` and into their files, once.
-    ///
-    /// Runs on every connect to an existing db and does nothing when the table
-    /// is already empty, so there is no marker to keep in sync — the table being
-    /// empty *is* the marker. Rows are deleted only after their file is written,
-    /// so an interrupted migration re-runs rather than losing a transcript.
-    async fn migrate_messages_to_log(&self) -> anyhow::Result<()> {
-        let mut conn = self.inner.connection().await?;
-        let Ok(rows) = toasty::query!(MessageRecord).exec(&mut conn).await else {
-            // No such table: a db from before messages were rows at all.
-            return Ok(());
-        };
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        // Group by session, preserving the id order the table used for ordering
-        // (UUIDv7, millisecond-precise) — that order becomes the file's order,
-        // which is what the log uses from then on.
-        let mut by_session: std::collections::BTreeMap<String, Vec<MessageRecord>> =
-            std::collections::BTreeMap::new();
-        for row in rows {
-            by_session
-                .entry(row.session_id.clone())
-                .or_default()
-                .push(row);
-        }
-
-        let mut moved = 0usize;
-        for (session_id, mut rows) in by_session {
-            // A transcript already on disk means a previous run got this far;
-            // appending again would duplicate it.
-            if !self.messages.is_empty(&session_id).await? {
-                continue;
-            }
-            rows.sort_by(|a, b| a.id.cmp(&b.id));
-            for row in &rows {
-                self.messages
-                    .append(
-                        &session_id,
-                        &Message {
-                            role: parse_role(&row.role),
-                            content: row.content.clone(),
-                            timestamp: row.timestamp,
-                            tool_note: row.tool_note.clone(),
-                        },
-                    )
-                    .await?;
-            }
-            moved += rows.len();
-            for row in rows {
-                row.delete().exec(&mut conn).await?;
-            }
-        }
-        if moved > 0 {
-            info!(
-                messages = moved,
-                "moved transcripts out of state.db into ~/.komo/sessions"
-            );
-        }
-        Ok(())
     }
 }
 
@@ -597,7 +489,7 @@ impl SessionRepository for Db {
         let Ok(record) = SessionRecord::get_by_id(&mut conn, id).await else {
             return Ok(None);
         };
-        let messages = self.messages.list(id).await?;
+        let messages = self.events.messages(id).await?;
         Ok(Some(session_from_record(record, messages)))
     }
 
@@ -610,10 +502,11 @@ impl SessionRepository for Db {
         let Ok(record) = SessionRecord::get_by_id(&mut conn, id).await else {
             return Ok(None);
         };
-        // The window is the tail of the file. What the table needed a UUIDv7 key
-        // to reconstruct — the order of two messages written inside one second —
-        // the log gets from the order they were appended in.
-        let messages = self.messages.window(id, limit).await?;
+        // Derived from the event log's conversation surface. A window cannot be
+        // taken from the file's tail the way a message log's could: a compaction
+        // near the end can replace a range that began far earlier, so the last N
+        // events do not determine the last N messages.
+        let messages = self.events.windowed(id, limit).await?;
         Ok(Some(session_from_record(record, messages)))
     }
 
@@ -648,7 +541,7 @@ impl SessionRepository for Db {
 
         let mut sessions = Vec::with_capacity(rows.len());
         for record in rows {
-            let messages = self.messages.list(&record.id).await?;
+            let messages = self.events.messages(&record.id).await?;
             sessions.push(session_from_record(record, messages));
         }
         Ok(sessions)
@@ -718,7 +611,7 @@ impl SessionRepository for Db {
 
         let mut removed = 0usize;
         for record in rows {
-            if self.messages.is_empty(&record.id).await? {
+            if self.events.messages(&record.id).await?.is_empty() {
                 // No transcript file to remove — that is what empty means here.
                 record.delete().exec(&mut conn).await?;
                 removed += 1;
@@ -732,71 +625,35 @@ impl SessionRepository for Db {
     }
 
     async fn rotate(&self, session_id: &str) -> anyhow::Result<Option<String>> {
-        // Nothing to archive if the session is absent or already empty. Checked
-        // before anything moves, because the transcript move below is not part
-        // of the transaction that follows it.
-        {
+        // `/new` used to move the transcript to an archived id and leave the
+        // live id empty, because the chat's session id *was* its address and so
+        // could not change. It is a UUID now and the address is a field, which
+        // makes the whole move unnecessary: retiring a conversation is dropping
+        // its correspondent. The session keeps its id, its log and its history;
+        // it simply stops answering for that chat, and the next message from
+        // the peer opens a new one (`find_by_peer` finds none).
+        //
+        // Nothing moves, so there is no half-done state to reason about — the
+        // whole rotation is one row update.
+        with_write_retry(|| async {
             let mut conn = self.inner.connection().await?;
-            if SessionRecord::get_by_id(&mut conn, session_id)
-                .await
-                .is_err()
-                || self.messages.is_empty(session_id).await?
-            {
-                return Ok(None);
-            }
-        }
-        // The transcript moves *first*, and deliberately. The two steps cannot
-        // be made atomic — one is a rename, the other a database transaction —
-        // so the question is which half-done state is safer. This order leaves,
-        // at worst, a transcript filed under an id with no metadata row: `/new`
-        // did what the user asked (the conversation is cleared) and the history
-        // is recoverable by hand. The other order leaves the live conversation
-        // still readable after `/new` said it was archived, which is the failure
-        // that lies to the user.
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let archived_id = format!("{session_id}#{now}");
-        self.messages.rename(session_id, &archived_id).await?;
-
-        // Wrapped in with_write_retry: a transaction that loses an MVCC commit
-        // rolls back cleanly, so re-running the whole closure never
-        // double-applies.
-        let archived_id = with_write_retry(|| async {
-            let archived_id = archived_id.clone();
-            let mut conn = self.inner.connection().await?;
-            let mut tx = conn.transaction().await?;
-            let Ok(live) = SessionRecord::get_by_id(&mut tx, session_id).await else {
+            let Ok(mut record) = SessionRecord::get_by_id(&mut conn, session_id).await else {
                 return Ok(None);
             };
-
-            // Give the moved transcript a session row, preserving the original's
-            // start time; the live row stays and is now empty for the next
-            // conversation. Rotation carries no learning state: the watermark is
-            // per-run and a run keeps the session id it was recorded under, so
-            // moving a transcript cannot make an episode look unlearned again.
-            //
-            // The **address does not move**. It names the live conversation with
-            // that correspondent, and there is exactly one; copying it here
-            // would leave two rows answering `find_by_peer`, so the chat's next
-            // message could land in the transcript `/new` just archived.
-            toasty::create!(SessionRecord {
-                id: archived_id.clone(),
-                created_at: live.created_at,
-                workspace: live.workspace.clone(),
-                title: live.title.clone(),
-                status: live.status.clone(),
-                model: live.model.clone(),
-                effort: live.effort.clone(),
-                channel_platform: String::new(),
-                channel_peer_id: String::new(),
-                origin: live.origin.clone(),
-            })
-            .exec(&mut tx)
-            .await?;
-            tx.commit().await?;
-            Ok(Some(archived_id))
+            // A session with no correspondent has nothing to be retired *from*:
+            // a local surface rotates by minting a new id client-side.
+            if record.channel_platform.is_empty() && record.channel_peer_id.is_empty() {
+                return Ok(None);
+            }
+            record
+                .update()
+                .channel_platform(String::new())
+                .channel_peer_id(String::new())
+                .exec(&mut conn)
+                .await?;
+            Ok(Some(session_id.to_string()))
         })
-        .await?;
-        Ok(archived_id)
+        .await
     }
 
     async fn set_title(&self, session_id: &str, title: &str) -> anyhow::Result<()> {
@@ -865,9 +722,6 @@ impl SessionRepository for Db {
             let Ok(record) = SessionRecord::get_by_id(&mut tx, session_id).await else {
                 return Ok(false);
             };
-            for msg in record.messages().exec(&mut tx).await? {
-                msg.delete().exec(&mut tx).await?;
-            }
             record.delete().exec(&mut tx).await?;
             tx.commit().await?;
             Ok(true)
@@ -880,27 +734,60 @@ impl SessionRepository for Db {
 
 #[async_trait]
 impl MessageRepository for Db {
-    // Every method here is the log's; the table is gone. What used to be a
-    // query with an index, an ORDER BY and a UUIDv7 key is a file read — see
-    // `super::message_log` for why that trade is worth making.
     async fn list_by_session(&self, session_id: &str) -> anyhow::Result<Vec<Message>> {
-        self.messages.list(session_id).await
+        Ok(self.events.messages(session_id).await?)
+    }
+}
+
+// ── SessionEventRepository ────────────────────────────────────────────────────
+
+#[async_trait]
+impl SessionEventRepository for Db {
+    async fn append(
+        &self,
+        session_id: &str,
+        kinds: Vec<SessionEventKind>,
+    ) -> anyhow::Result<Vec<u64>> {
+        // The header is only consulted when the log does not exist yet, so this
+        // describes a session at its first event and never overwrites identity.
+        let header = self.session_header(session_id).await;
+        Ok(self.events.append(session_id, header, kinds).await?)
     }
 
-    async fn save(&self, session_id: &str, message: &Message) -> anyhow::Result<()> {
-        self.messages.append(session_id, message).await
+    async fn durable_flush(&self, session_id: &str) -> anyhow::Result<()> {
+        if let Some(log) = self.events.existing(session_id).await? {
+            log.durable_flush().await?;
+        }
+        Ok(())
     }
 
-    async fn cancel_last_turn(&self, session_id: &str) -> anyhow::Result<()> {
-        self.messages.record_cancelled_turn(session_id).await
+    async fn events(&self, session_id: &str) -> anyhow::Result<Vec<SessionEvent>> {
+        Ok(self.events.events(session_id).await?)
     }
+}
 
-    async fn record_interjection(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
-        self.messages.record_interjection(session_id, text).await
-    }
-
-    async fn record_tool(&self, session_id: &str, entry: &ToolEntry) -> anyhow::Result<()> {
-        self.messages.append_tool(session_id, entry).await
+impl Db {
+    /// Identity for a log being materialized: taken from the session row when
+    /// there is one, so a session's origin and workspace reach its log without
+    /// every caller having to carry them.
+    async fn session_header(&self, session_id: &str) -> SessionHeader {
+        let row = SessionRepository::find_windowed(self, session_id, 1)
+            .await
+            .ok()
+            .flatten();
+        SessionHeader {
+            session_id: session_id.to_string(),
+            origin: row
+                .as_ref()
+                .map(|s| s.origin.as_str().to_string())
+                .unwrap_or_else(|| SessionOrigin::User.as_str().to_string()),
+            workspace: row.as_ref().and_then(|s| {
+                Some(s.workspace.clone())
+                    .filter(|w| w != komo_core::domain::session::DEFAULT_WORKSPACE)
+            }),
+            created_at: time::OffsetDateTime::now_utc(),
+            format_version: SESSION_EVENT_VERSION,
+        }
     }
 }
 
@@ -1781,15 +1668,6 @@ fn step_from_record(record: RunStepRecord) -> RunStep {
     }
 }
 
-fn parse_role(s: &str) -> Role {
-    match s {
-        "system" => Role::System,
-        "assistant" => Role::Assistant,
-        "tool" => Role::Tool,
-        _ => Role::User,
-    }
-}
-
 fn session_from_record(record: SessionRecord, messages: Vec<Message>) -> Session {
     let id = record.id.clone();
     let workspace = record.workspace.clone();
@@ -1861,6 +1739,36 @@ fn reminder_from_record(record: ReminderRecord) -> Reminder {
 
 #[cfg(test)]
 mod tests {
+    use komo_core::domain::message::Role;
+
+    /// Append one message as an event and make it durable — what a turn does,
+    /// condensed for a fixture that only cares that the message is there.
+    async fn say(db: &Db, session_id: &str, message: &Message) {
+        let kind = match message.role {
+            Role::Assistant => SessionEventKind::AssistantMessage(
+                komo_core::domain::session_event::AssistantMessageEvent {
+                    turn_id: "t".into(),
+                    content: message.content.clone(),
+                    tool_note: message.tool_note.clone(),
+                    surface: komo_core::domain::session_event::SurfacePlacement::append(),
+                },
+            ),
+            _ => {
+                SessionEventKind::UserMessage(komo_core::domain::session_event::UserMessageEvent {
+                    turn_id: "t".into(),
+                    content: message.content.clone(),
+                    source: komo_core::domain::session_event::MessageSource::User,
+                    surface: komo_core::domain::session_event::SurfacePlacement::append(),
+                })
+            }
+        };
+        SessionEventRepository::append(db, session_id, vec![kind])
+            .await
+            .unwrap();
+        SessionEventRepository::durable_flush(db, session_id)
+            .await
+            .unwrap();
+    }
     use super::*;
     use komo_core::domain::reminder::ReminderStatus;
 
@@ -1910,45 +1818,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotating_a_chat_leaves_the_address_on_the_live_session() {
-        let db = Db::connect(&sqlite_url("komo_rotate_channel.db"))
-            .await
-            .unwrap();
-        let peer = ChannelPeer::new("feishu", "oc_abc");
-        let live = Session::new("019fad17-0000-7461-9d48-0a6c779f1c8d").with_channel(peer.clone());
-        SessionRepository::save(&db, &live).await.unwrap();
-        MessageRepository::save(&db, &live.id, &Message::user("旧的对话"))
-            .await
-            .unwrap();
-
-        let archived = SessionRepository::rotate(&db, &live.id)
-            .await
-            .unwrap()
-            .expect("something to archive");
-
-        // `/new` archived the transcript; the correspondent still reaches the
-        // live conversation, which is now empty.
-        let found = SessionRepository::find_by_peer(&db, &peer)
-            .await
-            .unwrap()
-            .expect("the chat still has a session");
-        assert_eq!(found.id, live.id, "the address must not follow the archive");
-        assert!(
-            MessageRepository::list_by_session(&db, &live.id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            !MessageRepository::list_by_session(&db, &archived)
-                .await
-                .unwrap()
-                .is_empty(),
-            "the archived transcript is still readable"
-        );
-    }
-
-    #[tokio::test]
     async fn a_correspondent_resolves_to_one_session_and_carries_no_transcript() {
         let db = Db::connect(&sqlite_url("komo_find_by_peer.db"))
             .await
@@ -1970,9 +1839,7 @@ mod tests {
         let session =
             Session::new("019fad15-8199-7461-9d48-0a6c779f1c8d").with_channel(alice.clone());
         SessionRepository::save(&db, &session).await.unwrap();
-        MessageRepository::save(&db, &session.id, &Message::user("在吗"))
-            .await
-            .unwrap();
+        say(&db, &session.id, &Message::user("在吗")).await;
 
         let found = SessionRepository::find_by_peer(&db, &alice)
             .await
@@ -2589,9 +2456,7 @@ mod tests {
         SessionRepository::save(&db, &Session::with_workspace("first", "beta"))
             .await
             .unwrap();
-        MessageRepository::save(&db, "first", &Message::user("hello"))
-            .await
-            .unwrap();
+        say(&db, "first", &Message::user("hello")).await;
         SessionRepository::save(&db, &second).await.unwrap();
 
         let rows = SessionRepository::list(&db).await.unwrap();
@@ -2611,9 +2476,7 @@ mod tests {
         // Session with messages — must survive.
         let keep = Session::new("keep");
         SessionRepository::save(&db, &keep).await.unwrap();
-        MessageRepository::save(&db, "keep", &Message::user("hello"))
-            .await
-            .unwrap();
+        say(&db, "keep", &Message::user("hello")).await;
 
         // Empty session — must be pruned.
         let drop = Session::new("drop");
@@ -2639,9 +2502,7 @@ mod tests {
 
         let s = Session::new("only");
         SessionRepository::save(&db, &s).await.unwrap();
-        MessageRepository::save(&db, "only", &Message::user("hi"))
-            .await
-            .unwrap();
+        say(&db, "only", &Message::user("hi")).await;
 
         let removed = SessionRepository::delete_empty_sessions(&db).await.unwrap();
         assert_eq!(removed, 0);
@@ -2860,42 +2721,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_archives_transcript_and_empties_live_session() {
+    async fn rotate_retires_a_chat_session_by_dropping_its_correspondent() {
+        // `/new` used to move the transcript to an archived id and leave the
+        // live id empty, because a chat's session id *was* its address. The id
+        // is a UUID now and the address is a field, so retiring a conversation
+        // is dropping the correspondent — nothing moves.
         let db = Db::connect(&sqlite_url("komo_rotate_test.db"))
             .await
             .unwrap();
-        let sid = "telegram:rot";
-        SessionRepository::save(&db, &Session::new(sid))
+        let peer = ChannelPeer::new("telegram", "rot");
+        let sid = "019fad18-0000-7461-9d48-0a6c779f1c8d";
+        SessionRepository::save(&db, &Session::new(sid).with_channel(peer.clone()))
             .await
             .unwrap();
-        MessageRepository::save(&db, sid, &Message::user("hi"))
-            .await
-            .unwrap();
-        MessageRepository::save(&db, sid, &Message::assistant("hello"))
-            .await
-            .unwrap();
+        say(&db, sid, &Message::user("hi")).await;
+        say(&db, sid, &Message::assistant("hello")).await;
 
-        let archived = SessionRepository::rotate(&db, sid)
-            .await
-            .unwrap()
-            .expect("a non-empty session rotates");
-        assert_ne!(archived, sid);
+        assert_eq!(
+            SessionRepository::rotate(&db, sid).await.unwrap(),
+            Some(sid.to_string())
+        );
 
-        // Live session is now empty; the archive holds the transcript.
-        assert!(
+        // The conversation keeps its id and every word of it.
+        assert_eq!(
             MessageRepository::list_by_session(&db, sid)
                 .await
                 .unwrap()
-                .is_empty()
+                .len(),
+            2
         );
-        let archived_msgs = MessageRepository::list_by_session(&db, &archived)
+        // But it no longer answers for that chat, so the peer's next message
+        // opens a fresh session.
+        assert!(
+            SessionRepository::find_by_peer(&db, &peer)
+                .await
+                .unwrap()
+                .is_none(),
+            "a retired session must not keep answering for its correspondent"
+        );
+        // Rotating it again finds nothing left to retire.
+        assert_eq!(SessionRepository::rotate(&db, sid).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn rotate_is_a_no_op_for_a_session_with_no_correspondent() {
+        // A local surface rotates by minting a new id client-side; there is no
+        // address to drop, so the store has nothing to do.
+        let db = Db::connect(&sqlite_url("komo_rotate_local.db"))
             .await
             .unwrap();
-        assert_eq!(archived_msgs.len(), 2);
-        assert_eq!(archived_msgs[0].content, "hi");
-
-        // Rotating an empty session is a no-op.
-        assert!(SessionRepository::rotate(&db, sid).await.unwrap().is_none());
+        let sid = "019fad19-0000-7461-9d48-0a6c779f1c8d";
+        SessionRepository::save(&db, &Session::new(sid))
+            .await
+            .unwrap();
+        say(&db, sid, &Message::user("hi")).await;
+        assert_eq!(SessionRepository::rotate(&db, sid).await.unwrap(), None);
+        assert_eq!(
+            MessageRepository::list_by_session(&db, sid)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2970,7 +2857,7 @@ mod tests {
                 timestamp: 1_000,
                 tool_note: String::new(),
             };
-            MessageRepository::save(&db, sid, &msg).await.unwrap();
+            say(&db, sid, &msg).await;
         }
 
         // Window of 3 keeps the three most recent, still chronological.
@@ -3010,99 +2897,20 @@ mod tests {
     /// An upgrading komo keeps its conversations: rows in the old table are
     /// moved into the log on connect, and the rows go away only once the file
     /// holds them. Re-connecting must not duplicate what it already moved.
-    #[tokio::test]
-    async fn transcripts_in_the_old_table_move_into_the_log_once() {
-        let home = std::env::temp_dir().join("komo-test-msg-migration");
-        std::fs::remove_dir_all(&home).ok();
-        std::fs::create_dir_all(&home).expect("test home");
-        let path = home.join("state.db");
-
-        // Seed a db shaped like one written before transcripts were files.
-        {
-            let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-                .build()
-                .await
-                .unwrap();
-            let conn = db.connect().unwrap();
-            conn.execute(
-                "CREATE TABLE \"session_records\" (\"id\" TEXT NOT NULL, \"created_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
-                (),
-            )
-            .await
-            .unwrap();
-            conn.execute(
-                "CREATE TABLE \"message_records\" (\"id\" TEXT NOT NULL, \"session_id\" TEXT NOT NULL, \"role\" TEXT NOT NULL, \"content\" TEXT NOT NULL, \"timestamp\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
-                (),
-            )
-            .await
-            .unwrap();
-            conn.execute(
-                "INSERT INTO \"session_records\" VALUES ('cli:old', 100)",
-                (),
-            )
-            .await
-            .unwrap();
-            // Ids out of insertion order on purpose: the table's order was its
-            // UUIDv7 key, and that order is what the file must inherit.
-            for (id, role, body) in [
-                ("m2", "assistant", "hi there"),
-                ("m1", "user", "hello"),
-                ("m3", "user", "again"),
-            ] {
-                conn.execute(
-                    &format!(
-                        "INSERT INTO \"message_records\" VALUES ('{id}', 'cli:old', '{role}', '{body}', 100)"
-                    ),
-                    (),
-                )
-                .await
-                .unwrap();
-            }
-        }
-        std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
-
-        let url = format!("turso:{}", path.display());
-        let db = Db::connect(&url).await.unwrap();
-        let moved: Vec<String> = MessageRepository::list_by_session(&db, "cli:old")
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|m| m.content)
-            .collect();
-        assert_eq!(moved, ["hello", "hi there", "again"], "in key order");
-        assert_eq!(
-            moved.iter().filter(|c| c.as_str() != "hi there").count(),
-            2,
-            "both user turns moved out of the table"
-        );
-        drop(db);
-
-        // Connecting again finds an empty table and leaves the file alone.
-        let db = Db::connect(&url).await.unwrap();
-        assert_eq!(
-            MessageRepository::list_by_session(&db, "cli:old")
-                .await
-                .unwrap()
-                .len(),
-            3,
-            "a second connect must not duplicate the transcript"
-        );
-    }
 
     #[tokio::test]
     async fn adds_missing_session_columns_in_place() {
-        // Its own home: `connect` now moves transcripts out of the table into
-        // `<home>/sessions`, so a shared directory would carry a previous run's
-        // migrated messages into this one.
+        // Its own home, so a shared directory cannot carry a previous run's
+        // session logs into this one.
         let home = std::env::temp_dir().join("komo-test-db-addcol");
         std::fs::remove_dir_all(&home).ok();
         std::fs::create_dir_all(&home).expect("test home");
         let path = home.join("state.db");
 
-        // 1. Seed a turso file with the OLD session_records shape (no
-        //    the added columns) plus its messages table, then drop the handle.
-        //    (connect skips push_schema for an existing file, so every table a
-        //    session query touches must pre-exist, as it would in a real old db.)
+        // 1. Seed a turso file with the OLD session_records shape (without the
+        //    added columns), then drop the handle. (connect skips push_schema
+        //    for an existing file, so every table a session query touches must
+        //    pre-exist, as it would in a real old db.)
         {
             let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
                 .build()
@@ -3118,21 +2926,7 @@ mod tests {
             .await
             .unwrap();
             conn.execute(
-                "CREATE TABLE \"message_records\" (\
-                 \"id\" TEXT NOT NULL, \"session_id\" TEXT NOT NULL, \"role\" TEXT NOT NULL, \
-                 \"content\" TEXT NOT NULL, \"timestamp\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
-                (),
-            )
-            .await
-            .unwrap();
-            conn.execute(
                 "INSERT INTO \"session_records\" VALUES ('cli:old', 100)",
-                (),
-            )
-            .await
-            .unwrap();
-            conn.execute(
-                "INSERT INTO \"message_records\" VALUES ('m1', 'cli:old', 'user', 'hello', 100)",
                 (),
             )
             .await
@@ -3146,8 +2940,7 @@ mod tests {
             .await
             .unwrap();
         let session = SessionRepository::find(&db, "cli:old").await.unwrap();
-        let session = session.expect("pre-migration session survives");
-        assert_eq!(session.messages.len(), 1, "transcript intact");
+        let session = session.expect("the pre-column session survives");
 
         // 3. An added column is fully usable: it reads as its default and is
         //    writable straight away.
@@ -3160,30 +2953,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(retitled.title, "old chat");
-
-        // 4. Same contract for `message_records.tool_note`: a pre-migration row
-        //    reads as "no note", and the column is writable straight away.
-        assert!(
-            session.messages[0].tool_note.is_empty(),
-            "a pre-column message has no tool note"
-        );
-        MessageRepository::save(
-            &db,
-            "cli:old",
-            &Message::assistant("done").with_tool_note("[tools used] read foo"),
-        )
-        .await
-        .unwrap();
-        // Located by content, not position: the seeded legacy row's key is the
-        // literal `m1`, which sorts *after* a UUIDv7 id.
-        let messages = MessageRepository::list_by_session(&db, "cli:old")
-            .await
-            .unwrap();
-        let saved = messages
-            .iter()
-            .find(|m| m.content == "done")
-            .expect("the note-bearing message round-trips");
-        assert!(saved.tool_note.contains("read foo"));
     }
 
     /// A state.db whose `push_schema` ran while `reviewed_through` was still a
