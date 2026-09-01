@@ -27,7 +27,6 @@ use komo_core::domain::{
     session_event::{SESSION_EVENT_VERSION, SessionEvent, SessionEventKind, SessionHeader},
     skill::Skill,
     todo::{SessionTodoRepository, TodoItem},
-    turn_journal::{JournalEntry, TurnJournalRepository, parse_journal_kind},
 };
 
 // ── toasty models (infra-internal) ───────────────────────────────────────────
@@ -216,37 +215,6 @@ struct RunStepRecord {
     output_paths: String,
 }
 
-/// One turn-journal row (`domain/turn_journal.rs`): the persisted twin of an
-/// in-flight turn's provider-level state, keyed to its ledger run. `payload`
-/// is JSON owned by the writer in `komo-agent`'s llm layer.
-#[derive(Debug, toasty::Model)]
-struct TurnJournalRecord {
-    // UUIDv7 string key: MVCC rejects AUTOINCREMENT.
-    #[key]
-    id: String,
-
-    #[index]
-    run_id: String,
-
-    seq: i64,
-    kind: String, // "envelope" | "assistant" | "results"
-    payload: String,
-    created_at: i64,
-}
-
-/// The exact DDL `push_schema` emits for [`TurnJournalRecord`], for creating
-/// the table in place on a db file that predates it (`push_schema` only runs
-/// for new files, and is not idempotent — but deleting state.db to pick up a
-/// new table would throw away every chat transcript). Byte-parity with
-/// `push_schema`'s output is locked by `journal_table_ddl_matches_push_schema`.
-const JOURNAL_TABLE: &str = "turn_journal_records";
-const JOURNAL_TABLE_DDL: &[&str] = &[
-    "CREATE TABLE \"turn_journal_records\" (\"id\" TEXT NOT NULL, \"run_id\" TEXT NOT NULL, \
-     \"seq\" BIGINT NOT NULL, \"kind\" TEXT NOT NULL, \"payload\" TEXT NOT NULL, \
-     \"created_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
-    "CREATE INDEX \"index_turn_journal_records_by_run_id\" ON \"turn_journal_records\" (\"run_id\")",
-];
-
 /// One inbound message the gateway has seen (`domain/inbox.rs`). The key is
 /// `<platform>:<message_id>` rather than the UUIDv7 used everywhere else in
 /// this file: dedupe wants the collision, and the primary key is what makes
@@ -405,7 +373,6 @@ impl Db {
                 ("output_paths", "\"output_paths\" text NOT NULL DEFAULT ''"),
             ];
             ensure_columns(p, "run_step_records", STEP_COLUMNS).await?;
-            ensure_table(p, JOURNAL_TABLE, JOURNAL_TABLE_DDL).await?;
             ensure_table(p, INBOX_TABLE, INBOX_TABLE_DDL).await?;
             ensure_table(p, RUN_MEMORY_TABLE, RUN_MEMORY_TABLE_DDL).await?;
         }
@@ -426,7 +393,6 @@ impl Db {
                 SettingRecord,
                 RunRecord,
                 RunStepRecord,
-                TurnJournalRecord,
                 InboxRecord,
                 RunMemoryRecord
             ))
@@ -789,6 +755,30 @@ impl Db {
             format_version: SESSION_EVENT_VERSION,
         }
     }
+}
+
+fn run_from_record(record: RunRecord) -> anyhow::Result<Run> {
+    Ok(Run {
+        id: record.id,
+        session_id: record.session_id,
+        input: record.input,
+        plan: record.plan,
+        status: parse_run_status(&record.status)?,
+        final_output: record.final_output,
+        error: record.error,
+        recoverable: record.recoverable,
+        started_at: record.started_at,
+        ended_at: (record.ended_at != 0).then_some(record.ended_at),
+        tokens_in: record.tokens_in,
+        tokens_out: record.tokens_out,
+        tokens_cached: record.tokens_cached,
+        resumed_from: (!record.resumed_from.is_empty()).then_some(record.resumed_from),
+        // A malformed cell reads as "none recorded": the ledger is an audit
+        // record, and one bad row must not fail the read of a whole run.
+        memories: serde_json::from_str(&record.memories).unwrap_or_default(),
+        learned: record.learned,
+        outcome: record.outcome,
+    })
 }
 
 // ── ReminderRepository ────────────────────────────────────────────────────────
@@ -1309,13 +1299,6 @@ impl RunRepository for Db {
                 for link in links {
                     link.delete().exec(&mut tx).await?;
                 }
-                let journal_run_id = run.id.clone();
-                let journal = toasty::query!(TurnJournalRecord FILTER .run_id == #journal_run_id)
-                    .exec(&mut tx)
-                    .await?;
-                for row in journal {
-                    row.delete().exec(&mut tx).await?;
-                }
                 run.delete().exec(&mut tx).await?;
             }
             tx.commit().await?;
@@ -1554,94 +1537,6 @@ impl InboxRepository for Db {
     }
 }
 
-// ── TurnJournalRepository ─────────────────────────────────────────────────────
-
-#[async_trait]
-impl TurnJournalRepository for Db {
-    async fn append(&self, run_id: &str, entry: &JournalEntry) -> anyhow::Result<()> {
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            toasty::create!(TurnJournalRecord {
-                id: uuid::Uuid::now_v7().to_string(),
-                run_id: run_id.to_string(),
-                seq: entry.seq,
-                kind: entry.kind.as_str().to_string(),
-                payload: entry.payload.clone(),
-                created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
-            })
-            .exec(&mut conn)
-            .await?;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn load(&self, run_id: &str) -> anyhow::Result<Vec<JournalEntry>> {
-        let mut conn = self.inner.connection().await?;
-        let rows = toasty::query!(TurnJournalRecord FILTER .run_id == #run_id)
-            .exec(&mut conn)
-            .await?;
-        let mut entries = rows
-            .into_iter()
-            .map(|row| {
-                Ok(JournalEntry {
-                    seq: row.seq,
-                    kind: parse_journal_kind(&row.kind)?,
-                    payload: row.payload,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        entries.sort_by_key(|e| e.seq);
-        Ok(entries)
-    }
-
-    async fn delete(&self, run_id: &str) -> anyhow::Result<usize> {
-        // Transactional for the same reason as `prune`: a run's journal rows
-        // drop together or not at all — a half-deleted journal would rebuild
-        // into a corrupt history instead of failing cleanly.
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            let mut tx = conn.transaction().await?;
-            let rows = toasty::query!(TurnJournalRecord FILTER .run_id == #run_id)
-                .exec(&mut tx)
-                .await?;
-            let count = rows.len();
-            for row in rows {
-                row.delete().exec(&mut tx).await?;
-            }
-            tx.commit().await?;
-            Ok(count)
-        })
-        .await
-    }
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-fn run_from_record(record: RunRecord) -> anyhow::Result<Run> {
-    Ok(Run {
-        id: record.id,
-        session_id: record.session_id,
-        input: record.input,
-        plan: record.plan,
-        status: parse_run_status(&record.status)?,
-        final_output: record.final_output,
-        error: record.error,
-        recoverable: record.recoverable,
-        started_at: record.started_at,
-        ended_at: (record.ended_at != 0).then_some(record.ended_at),
-        tokens_in: record.tokens_in,
-        tokens_out: record.tokens_out,
-        tokens_cached: record.tokens_cached,
-        resumed_from: (!record.resumed_from.is_empty()).then_some(record.resumed_from),
-        // A malformed cell reads as "none recorded": the ledger is an audit
-        // record, and one bad row must not fail the read of a whole run.
-        memories: serde_json::from_str(&record.memories).unwrap_or_default(),
-        learned: record.learned,
-        outcome: record.outcome,
-    })
-}
-
 fn step_from_record(record: RunStepRecord) -> RunStep {
     RunStep {
         run_id: record.run_id,
@@ -1782,12 +1677,6 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
         std::fs::create_dir_all(&home).expect("test home");
         format!("turso:{}", home.join("state.db").display())
-    }
-
-    /// Every `CREATE …` statement sqlite_master holds for `turn_journal_records`,
-    /// ordered by object name so the comparison is deterministic.
-    async fn journal_schema_sql(path: &std::path::Path) -> Vec<String> {
-        table_schema_sql(path, "turn_journal_records").await
     }
 
     /// Every `CREATE …` statement sqlite_master holds for one table.
@@ -2071,99 +1960,6 @@ mod tests {
         assert_eq!(table_schema_sql(&old, INBOX_TABLE).await, reference);
     }
 
-    #[tokio::test]
-    async fn journal_table_ddl_matches_push_schema() {
-        // A fresh file gets the table from push_schema — the reference shape.
-        let fresh = std::env::temp_dir().join("komo_journal_ddl_fresh.db");
-        crate::persistence::reset_test_db(&fresh);
-        let db = Db::connect(&format!("turso:{}", fresh.display()))
-            .await
-            .unwrap();
-        drop(db);
-        let reference = journal_schema_sql(&fresh).await;
-        assert!(!reference.is_empty(), "push_schema created the table");
-
-        // An "old" file: connect, drop the journal objects to simulate a db
-        // created before the table existed, then reconnect — ensure_table must
-        // recreate them with byte-identical DDL.
-        let old = std::env::temp_dir().join("komo_journal_ddl_old.db");
-        crate::persistence::reset_test_db(&old);
-        let db = Db::connect(&format!("turso:{}", old.display()))
-            .await
-            .unwrap();
-        drop(db);
-        {
-            let raw = turso::Builder::new_local(old.to_string_lossy().as_ref())
-                .build()
-                .await
-                .unwrap();
-            let conn = raw.connect().unwrap();
-            conn.pragma_update("journal_mode", "'mvcc'").await.ok();
-            conn.execute("DROP TABLE \"turn_journal_records\"", ())
-                .await
-                .unwrap();
-        }
-        let db = Db::connect(&format!("turso:{}", old.display()))
-            .await
-            .unwrap();
-        drop(db);
-        assert_eq!(journal_schema_sql(&old).await, reference);
-    }
-
-    #[tokio::test]
-    async fn turn_journal_roundtrips_ordered_and_deletes_whole() {
-        use komo_core::domain::turn_journal::{JournalEntry, JournalKind, TurnJournalRepository};
-        let db = Db::connect(&sqlite_url("komo_turn_journal_test.db"))
-            .await
-            .unwrap();
-
-        let entry = |seq: i64, kind: JournalKind, payload: &str| JournalEntry {
-            seq,
-            kind,
-            payload: payload.to_string(),
-        };
-        // Append out of seq order; `load` must return them sorted.
-        for e in [
-            entry(1, JournalKind::Assistant, r#"{"blocks":[]}"#),
-            entry(0, JournalKind::Envelope, r#"{"version":1}"#),
-            entry(2, JournalKind::Results, r#"{"outcomes":[]}"#),
-        ] {
-            TurnJournalRepository::append(&db, "run-j1", &e)
-                .await
-                .unwrap();
-        }
-        // A second run's rows must not bleed in.
-        TurnJournalRepository::append(&db, "run-j2", &entry(0, JournalKind::Envelope, "{}"))
-            .await
-            .unwrap();
-
-        let loaded = TurnJournalRepository::load(&db, "run-j1").await.unwrap();
-        assert_eq!(loaded.len(), 3);
-        assert_eq!(
-            loaded.iter().map(|e| e.seq).collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
-        assert_eq!(loaded[0].kind, JournalKind::Envelope);
-        assert_eq!(loaded[2].payload, r#"{"outcomes":[]}"#);
-
-        let removed = TurnJournalRepository::delete(&db, "run-j1").await.unwrap();
-        assert_eq!(removed, 3);
-        assert!(
-            TurnJournalRepository::load(&db, "run-j1")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        // The other run's journal survives.
-        assert_eq!(
-            TurnJournalRepository::load(&db, "run-j2")
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
     /// The link from an answer back to the memories that shaped it. Stored as
     /// ids so the ledger cannot drift from what a memory now says, and kept
     /// even when the memory is later edited or archived — the turn was still
@@ -2346,21 +2142,6 @@ mod tests {
             )
             .await
             .unwrap();
-            // A journal row per run: pruning a run must take its journal too.
-            use komo_core::domain::turn_journal::{
-                JournalEntry, JournalKind, TurnJournalRepository,
-            };
-            TurnJournalRepository::append(
-                &db,
-                id,
-                &JournalEntry {
-                    seq: 0,
-                    kind: JournalKind::Envelope,
-                    payload: "{}".into(),
-                },
-            )
-            .await
-            .unwrap();
         }
 
         // Cutoff drops run-a (100) and run-b (200), keeps run-c (300).
@@ -2373,21 +2154,6 @@ mod tests {
         // Steps of pruned runs are gone; the survivor's step stays.
         assert!(RunRepository::steps(&db, "run-a").await.unwrap().is_empty());
         assert_eq!(RunRepository::steps(&db, "run-c").await.unwrap().len(), 1);
-        // Same for the journals.
-        use komo_core::domain::turn_journal::TurnJournalRepository;
-        assert!(
-            TurnJournalRepository::load(&db, "run-a")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            TurnJournalRepository::load(&db, "run-c")
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
 
         // Nothing older than the floor → no-op.
         assert_eq!(RunRepository::prune(&db, 0).await.unwrap(), 0);

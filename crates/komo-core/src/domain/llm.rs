@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::session::Session;
-use super::turn_journal::{JournalEntry, TurnJournal};
+use super::session_event::{SessionEvent, TurnRecorder};
 
 /// One model round-trip's outcome inside komo's own tool loop. The loop lives
 /// in `AgentRuntime` (not rig — roadmap §7), so it can insert control points
@@ -171,7 +171,7 @@ pub trait LlmClient: Send + Sync {
     /// (the default one-shot driver does).
     ///
     /// `journal` is the turn journal to record this turn's provider-level state
-    /// into (see `domain::turn_journal`); `None` for callers that don't keep
+    /// into (see `domain::session_event::TurnRecorder`); `None` for callers that don't keep
     /// one (aux paths, tests). Backends without provider-shaped state ignore it.
     ///
     /// The default is a single-shot driver wrapping [`complete`](LlmClient::complete):
@@ -182,18 +182,19 @@ pub trait LlmClient: Send + Sync {
         &self,
         session: &Session,
         _deltas: Option<Arc<dyn DeltaSink>>,
-        _journal: Option<Arc<dyn TurnJournal>>,
+        _recorder: Option<Arc<dyn TurnRecorder>>,
     ) -> anyhow::Result<Box<dyn TurnDriver>> {
         let reply = self.complete(session).await?;
         Ok(Box::new(OneShotDriver(Some(reply))))
     }
 
-    /// Reopen an interrupted turn from its journal rows, returning a driver
-    /// that continues from exactly where the turn stopped (same model, same
-    /// prompt bytes, tool rounds already paid for replayed from the journal
-    /// instead of re-run).
+    /// Reopen an interrupted turn from its session's events, returning a driver
+    /// that continues from exactly where the turn stopped: same model, same
+    /// prompt bytes, and the tool rounds already paid for replayed from the log
+    /// rather than re-run.
     ///
-    /// `journal` records the *continuation* under its own run, so a second
+    /// `events` is the session's whole log and `turn_id` names the interrupted
+    /// turn within it. `recorder` records the *continuation*, so a second
     /// interruption resumes from the continuation rather than from scratch.
     ///
     /// Default: unsupported — the caller falls back to the digest-primed fresh
@@ -202,11 +203,12 @@ pub trait LlmClient: Send + Sync {
     async fn resume_turn(
         &self,
         _session: &Session,
-        _entries: &[JournalEntry],
+        _events: &[SessionEvent],
+        _turn_id: &str,
         _deltas: Option<Arc<dyn DeltaSink>>,
-        _journal: Option<Arc<dyn TurnJournal>>,
+        _recorder: Option<Arc<dyn TurnRecorder>>,
     ) -> anyhow::Result<Box<dyn TurnDriver>> {
-        anyhow::bail!("this backend cannot resume a turn from a journal")
+        anyhow::bail!("this backend cannot resume a turn from its session log")
     }
 }
 

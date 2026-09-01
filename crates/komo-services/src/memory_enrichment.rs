@@ -619,7 +619,7 @@ mod tests {
             &self,
             _session: &Session,
             _deltas: Option<Arc<dyn DeltaSink>>,
-            _journal: Option<Arc<dyn komo_core::domain::turn_journal::TurnJournal>>,
+            _recorder: Option<Arc<dyn komo_core::domain::session_event::TurnRecorder>>,
         ) -> anyhow::Result<Box<dyn TurnDriver>> {
             struct Dead;
             #[async_trait]

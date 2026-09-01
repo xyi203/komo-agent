@@ -11,13 +11,13 @@ use komo_core::domain::{
     run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, tool_digest, truncate},
     session::Session,
     session_event::{
-        AssistantMessageEvent, MessageSource, SessionEventKind, SurfacePlacement, UserMessageEvent,
+        AssistantMessageEvent, MessageSource, SessionEvent, SessionEventKind, SurfacePlacement,
+        TurnRecorder, UserMessageEvent,
     },
-    turn_journal::{JournalEntry, JournalKind, TurnJournal, TurnJournalRepository},
 };
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
@@ -79,11 +79,6 @@ pub struct AgentRuntime {
     /// touched it, so `komo run rollback` can put them back. `None` = this
     /// runtime's file changes are final.
     pub checkpoint: Option<Arc<dyn CheckpointStore>>,
-    /// Turn-journal store: each turn's provider-level state, persisted so an
-    /// interrupted turn can be continued (`resume_interrupted`) instead of
-    /// re-run. `None` — aux runtimes (delegate/cron/briefing) — journals
-    /// nothing: their turns are re-dispatched whole, never resumed.
-    pub journal: Option<Arc<dyn TurnJournalRepository>>,
     /// Turn lifecycle observers (see `domain::hooks`). Registered at wiring,
     /// awaited serially — a hook is a fast observer, never a worker. Empty for
     /// every runtime without plugins contributing one.
@@ -94,42 +89,50 @@ pub struct AgentRuntime {
     pub step_hooks: Vec<Arc<dyn StepHook>>,
 }
 
-/// Binds one turn's journal writes to its ledger run: assigns `seq`, and disarms
-/// itself after the first failed write — the journal buys resumability, and a
-/// broken store must cost exactly that, not per-round latency or the turn.
-struct RunJournal {
-    repo: Arc<dyn TurnJournalRepository>,
-    run_id: String,
-    seq: AtomicI64,
+/// Records one turn's events into its session's log, disarming itself after the
+/// first failed write — recording buys resumability, and a broken store must
+/// cost exactly that, not per-round latency and not the turn.
+struct RunRecorder {
+    events: Arc<dyn SessionEventRepository>,
+    session_id: String,
+    turn_id: String,
     broken: AtomicBool,
 }
 
-impl RunJournal {
-    fn new(repo: Arc<dyn TurnJournalRepository>, run_id: &str) -> Arc<Self> {
+impl RunRecorder {
+    fn new(events: Arc<dyn SessionEventRepository>, session_id: &str, turn_id: &str) -> Arc<Self> {
         Arc::new(Self {
-            repo,
-            run_id: run_id.to_string(),
-            seq: AtomicI64::new(0),
+            events,
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
             broken: AtomicBool::new(false),
         })
     }
 }
 
 #[async_trait]
-impl TurnJournal for RunJournal {
-    async fn record(&self, kind: JournalKind, payload: String) {
+impl TurnRecorder for RunRecorder {
+    fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    async fn record(&self, kinds: Vec<SessionEventKind>) {
         if self.broken.load(Ordering::Relaxed) {
             return;
         }
-        let entry = JournalEntry {
-            seq: self.seq.fetch_add(1, Ordering::Relaxed),
-            kind,
-            payload,
-        };
-        if let Err(error) = self.repo.append(&self.run_id, &entry).await {
-            warn!(%error, run_id = %self.run_id,
-                "turn journal write failed; journaling disabled for this turn");
+        if let Err(error) = self.events.append(&self.session_id, kinds).await {
+            warn!(%error, turn_id = %self.turn_id,
+                "turn event write failed; recording disabled for this turn");
             self.broken.store(true, Ordering::Relaxed);
+        }
+    }
+
+    async fn durable(&self) {
+        if self.broken.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(error) = self.events.durable_flush(&self.session_id).await {
+            warn!(%error, turn_id = %self.turn_id, "turn events are not durable");
         }
     }
 }
@@ -167,12 +170,12 @@ impl AgentRuntime {
     /// caller falls back to the digest-primed fresh turn. `Err` = the
     /// continuation was attempted and genuinely failed.
     pub async fn resume_interrupted(&self, original: &Run) -> anyhow::Result<Option<String>> {
-        let Some(repo) = self.journal.as_ref() else {
-            return Ok(None);
-        };
-        let entries = repo.load(&original.id).await?;
-        if entries.is_empty() {
-            info!(run_id = %original.id, "no turn journal; falling back to digest resume");
+        let events = self.events.events(&original.session_id).await?;
+        if !events
+            .iter()
+            .any(|e| e.turn_id_of_work() == Some(original.id.as_str()))
+        {
+            info!(run_id = %original.id, "the session log has nothing for this turn; falling back to digest resume");
             return Ok(None);
         }
         // A continuation appends an assistant reply with no new user message,
@@ -196,7 +199,13 @@ impl AgentRuntime {
 
         let mut run = Run::start(&original.session_id, &original.input);
         run.resumed_from = Some(original.id.clone());
-        let turn = self.run_ledgered(run, TurnKind::Resume { entries });
+        let turn = self.run_ledgered(
+            run,
+            TurnKind::Resume {
+                events,
+                turn_id: original.id.clone(),
+            },
+        );
         // Same ambient-context bridge as `handle_input`: session-scoped tools
         // and the approvers read the turn's session from the task-local.
         let reply = if current_session().is_none() {
@@ -295,26 +304,6 @@ impl AgentRuntime {
             });
         }
 
-        // Journal lifecycle: a delivered or deliberately-stopped turn has
-        // nothing left to resume, so its rows go; a *failed* turn keeps them
-        // (they are the debugging record of what the model actually saw, and
-        // the seed of a future failed-turn resume). A continuation that
-        // delivered also clears the original's rows — the interruption it was
-        // covering is over. Best-effort like every ledger interaction.
-        let stopped_clean = matches!(run.status, RunStatus::Done) || run.error == CANCELLED_ERROR;
-        if stopped_clean && let Some(repo) = &self.journal {
-            if let Err(error) = repo.delete(&run.id).await {
-                warn!(%error, run_id = %run.id, "failed to clear turn journal (non-fatal)");
-            }
-            if matches!(run.status, RunStatus::Done)
-                && let Some(original) = &run.resumed_from
-                && let Err(error) = repo.delete(original).await
-            {
-                warn!(%error, run_id = %original,
-                    "failed to clear the resumed run's turn journal (non-fatal)");
-            }
-        }
-
         outcome
     }
 
@@ -375,7 +364,7 @@ impl AgentRuntime {
                 session.messages.push(user_msg);
                 None
             }
-            TurnKind::Resume { entries } => {
+            TurnKind::Resume { events, turn_id } => {
                 // A continuation appends an assistant reply without a new user
                 // message, so the transcript must still end on the interrupted
                 // turn's user message. Ending on an assistant means the reply
@@ -385,7 +374,7 @@ impl AgentRuntime {
                     session.messages.last().map(|m| m.role == Role::User) == Some(true),
                     "transcript already ends in a reply — nothing to resume"
                 );
-                Some(entries)
+                Some((events, turn_id))
             }
         };
         let is_fresh = resume_entries.is_none();
@@ -593,7 +582,7 @@ impl AgentRuntime {
         &self,
         session: &Session,
         run: RunContext,
-        resume: Option<Vec<JournalEntry>>,
+        resume: Option<(Vec<SessionEvent>, String)>,
     ) -> anyhow::Result<TurnOutcome> {
         // Pin the tool catalog for this turn. The model is handed one set of
         // schemas below; a plugin mounting or unmounting mid-turn must not
@@ -602,12 +591,12 @@ impl AgentRuntime {
         // mutation is not lost — the next turn pins the new set.
         let tools = self.tool_executor.pin();
 
-        // This turn's journal writer, bound to its ledger run — the loop and
-        // the driver stay run-id-free.
-        let journal: Option<Arc<dyn TurnJournal>> = self
-            .journal
-            .as_ref()
-            .map(|repo| RunJournal::new(repo.clone(), &run.run_id) as Arc<dyn TurnJournal>);
+        // This turn's event recorder, bound to its ledger run — the loop and
+        // the driver stay run-id-free. A run *is* a turn in komo, so the run id
+        // is the turn id the events carry.
+        let recorder: Option<Arc<dyn TurnRecorder>> = Some({
+            RunRecorder::new(self.events.clone(), &session.id, &run.run_id) as Arc<dyn TurnRecorder>
+        });
         // The executor gets the turn's context explicitly: the run handle this
         // turn opened, and the session established by the dispatcher / api /
         // handle_input (read once here — the one ambient-to-explicit bridge).
@@ -645,10 +634,10 @@ impl AgentRuntime {
             .map(|sink| Arc::new(StreamingDeltas(sink)) as Arc<dyn DeltaSink>);
 
         let mut driver = match &resume {
-            None => self.llm.begin_turn(session, deltas, journal).await?,
-            Some(entries) => {
+            None => self.llm.begin_turn(session, deltas, recorder).await?,
+            Some((events, turn_id)) => {
                 self.llm
-                    .resume_turn(session, entries, deltas, journal)
+                    .resume_turn(session, events, turn_id, deltas, recorder)
                     .await?
             }
         };
@@ -821,8 +810,11 @@ enum TurnKind {
     /// An ordinary user turn: persist the input, open a fresh driver.
     Fresh { user_input: String },
     /// A continuation of an interrupted turn: the user message is already in
-    /// the transcript, and the driver reopens from these journal rows.
-    Resume { entries: Vec<JournalEntry> },
+    /// the conversation, and the driver reopens from the session's own events.
+    Resume {
+        events: Vec<SessionEvent>,
+        turn_id: String,
+    },
 }
 
 /// What one pass of the agent loop produced.
@@ -933,7 +925,7 @@ mod tests {
             &self,
             _session: &Session,
             _deltas: Option<Arc<dyn DeltaSink>>,
-            _journal: Option<Arc<dyn TurnJournal>>,
+            _recorder: Option<Arc<dyn TurnRecorder>>,
         ) -> anyhow::Result<Box<dyn TurnDriver>> {
             // One turn per test, so hand the whole script to the driver.
             let steps = std::mem::take(&mut *self.script.lock().unwrap());
@@ -946,12 +938,17 @@ mod tests {
         async fn resume_turn(
             &self,
             session: &Session,
-            entries: &[JournalEntry],
+            events: &[SessionEvent],
+            turn_id: &str,
             deltas: Option<Arc<dyn DeltaSink>>,
-            journal: Option<Arc<dyn TurnJournal>>,
+            recorder: Option<Arc<dyn TurnRecorder>>,
         ) -> anyhow::Result<Box<dyn TurnDriver>> {
-            self.resumed_entries.lock().unwrap().replace(entries.len());
-            self.begin_turn(session, deltas, journal).await
+            let of_turn = events
+                .iter()
+                .filter(|e| e.turn_id_of_work() == Some(turn_id))
+                .count();
+            self.resumed_entries.lock().unwrap().replace(of_turn);
+            self.begin_turn(session, deltas, recorder).await
         }
     }
 
@@ -1111,7 +1108,6 @@ mod tests {
             history_window: 0,
             learning: None,
             checkpoint: None,
-            journal: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
         };
@@ -1502,7 +1498,7 @@ mod tests {
             &self,
             _session: &Session,
             _deltas: Option<Arc<dyn DeltaSink>>,
-            _journal: Option<Arc<dyn TurnJournal>>,
+            _recorder: Option<Arc<dyn TurnRecorder>>,
         ) -> anyhow::Result<Box<dyn TurnDriver>> {
             anyhow::bail!("provider down")
         }
@@ -1528,7 +1524,6 @@ mod tests {
             history_window: 0,
             learning: None,
             checkpoint: None,
-            journal: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
         };
@@ -2050,40 +2045,50 @@ mod tests {
         assert_eq!(steps.len(), 2);
     }
 
-    /// Stage an interrupted turn: a session whose transcript ends on the user
+    /// Stage an interrupted turn: a session whose conversation ends on the user
     /// message (the crash landed before any reply), its failed ledger run, and
-    /// `count` journal rows. Returns the original run.
-    async fn seed_interrupted(db: &Arc<Db>, session_id: &str, count: i64) -> Run {
-        use komo_core::domain::turn_journal::{JournalEntry, JournalKind, TurnJournalRepository};
+    /// the turn's recorded events. Returns the original run.
+    async fn seed_interrupted(db: &Arc<Db>, session_id: &str, rounds: u32) -> Run {
+        use komo_core::domain::session_event::{
+            AssistantRoundEvent, HeaderReason, RequestHeaderEvent,
+        };
         SessionRepository::save(&**db, &Session::new(session_id))
             .await
             .unwrap();
         say(db, session_id, Message::user("do the thing")).await;
         let run = Run::start(session_id, "do the thing");
         RunRepository::start(&**db, &run).await.unwrap();
-        for seq in 0..count {
-            TurnJournalRepository::append(
-                &**db,
-                &run.id,
-                &JournalEntry {
-                    seq,
-                    kind: if seq == 0 {
-                        JournalKind::Envelope
-                    } else {
-                        JournalKind::Assistant
-                    },
-                    payload: "{}".into(),
-                },
-            )
+        let mut kinds = vec![SessionEventKind::RequestHeader(RequestHeaderEvent {
+            reason: HeaderReason::Initial,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            effort: String::new(),
+            system: "You are komo.".into(),
+            tools: vec![],
+            extra: None,
+        })];
+        for round in 0..rounds {
+            kinds.push(SessionEventKind::AssistantRound(AssistantRoundEvent {
+                turn_id: run.id.clone(),
+                round,
+                response_id: format!("resp-{round}"),
+                blocks: serde_json::json!([]),
+                tokens_in: 0,
+                tokens_out: 0,
+                tokens_cached: 0,
+            }));
+        }
+        SessionEventRepository::append(&**db, session_id, kinds)
             .await
             .unwrap();
-        }
+        SessionEventRepository::durable_flush(&**db, session_id)
+            .await
+            .unwrap();
         run
     }
 
     #[tokio::test]
     async fn resume_interrupted_continues_without_a_new_user_message() {
-        use komo_core::domain::turn_journal::TurnJournalRepository;
         let db = Arc::new(Db::connect(&sqlite_url("komo_rt_resume.db")).await.unwrap());
         let original = seed_interrupted(&db, "cli:rs1", 2).await;
 
@@ -2106,7 +2111,6 @@ mod tests {
             history_window: 0,
             learning: None,
             checkpoint: None,
-            journal: Some(db.clone()),
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
         };
@@ -2138,20 +2142,12 @@ mod tests {
             .expect("a continuation run linked to the original");
         assert_eq!(continuation.status, RunStatus::Done);
 
-        // Delivered ⇒ both journals cleared: the continuation's own, and the
-        // original's (the interruption it covered is over).
-        assert!(
-            TurnJournalRepository::load(&*db, &original.id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            TurnJournalRepository::load(&*db, &continuation.id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        // The turn's events live with the session, not with the run: nothing to
+        // clear, and the conversation keeps the continuation's reply.
+        let messages = MessageRepository::list_by_session(&*db, &original.session_id)
+            .await
+            .unwrap();
+        assert_eq!(messages.last().unwrap().role, Role::Assistant);
     }
 
     #[tokio::test]
@@ -2172,10 +2168,7 @@ mod tests {
             vec![],
             30,
         );
-        let rt = AgentRuntime {
-            journal: Some(db.clone()),
-            ..rt
-        };
+        let rt = AgentRuntime { ..rt };
 
         let outcome = rt.resume_interrupted(&original).await.unwrap();
         assert!(outcome.is_none(), "must decline, not continue");
@@ -2200,10 +2193,7 @@ mod tests {
         // the write failed) — the caller must fall back to the digest path.
         let original = seed_interrupted(&db, "cli:rs3", 0).await;
         let (rt, _) = scripted_runtime(db.clone(), vec![], vec![], 30);
-        let rt = AgentRuntime {
-            journal: Some(db.clone()),
-            ..rt
-        };
+        let rt = AgentRuntime { ..rt };
         let outcome = rt.resume_interrupted(&original).await.unwrap();
         assert!(
             outcome.is_none(),

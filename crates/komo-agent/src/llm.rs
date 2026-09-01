@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::warn;
 
@@ -17,7 +16,10 @@ use komo_core::domain::{
     message::{Message, Role},
     run::RecalledMemories,
     session::Session,
-    turn_journal::{JOURNAL_VERSION, JournalEntry, JournalKind, TurnJournal},
+    session_event::{
+        AssistantRoundEvent, HeaderReason, MessageSource, RequestHeaderEvent, SessionEvent,
+        SessionEventKind, SurfacePlacement, TurnRecorder, UserMessageEvent, fold_request_header,
+    },
 };
 use komo_provider::{
     AssistantBlock, Auth, Completion, Delta, Endpoint, LlmError, LlmErrorKind, ProviderClient,
@@ -231,32 +233,36 @@ impl LlmClient for RoutingLlm {
         &self,
         session: &Session,
         deltas: Option<Arc<dyn DeltaSink>>,
-        journal: Option<Arc<dyn TurnJournal>>,
+        recorder: Option<Arc<dyn TurnRecorder>>,
     ) -> anyhow::Result<Box<dyn TurnDriver>> {
         self.route(session)
-            .begin_turn(session, deltas, journal)
+            .begin_turn(session, deltas, recorder)
             .await
     }
 
     async fn resume_turn(
         &self,
         session: &Session,
-        entries: &[JournalEntry],
+        events: &[SessionEvent],
+        turn_id: &str,
         deltas: Option<Arc<dyn DeltaSink>>,
-        journal: Option<Arc<dyn TurnJournal>>,
+        recorder: Option<Arc<dyn TurnRecorder>>,
     ) -> anyhow::Result<Box<dyn TurnDriver>> {
-        // Route on the *journal's* provider, not the session's current model
-        // override: the interrupted turn ran on whatever the envelope says, and
-        // continuing it on a different backend would replay one provider's
-        // opaque state (reasoning blobs, item ids) into another. No backend for
-        // that provider anymore ⇒ error out, and the caller falls back to the
-        // digest-primed fresh turn.
-        let envelope = JournalEnvelope::parse(entries)?;
-        let provider = Provider::parse(&envelope.provider)?;
-        let backend = self.backend(provider).with_context(|| {
-            format!("no configured backend for provider `{}`", envelope.provider)
-        })?;
-        backend.resume_turn(session, entries, deltas, journal).await
+        // Route on the provider the *interrupted turn* recorded, not the
+        // session's current model override: continuing on a different backend
+        // would replay one provider's opaque state (reasoning blobs, item ids)
+        // into another. No backend for that provider anymore ⇒ error out, and
+        // the caller falls back to the digest-primed fresh turn.
+        let last_seq = events.last().map(|e| e.seq).unwrap_or(0);
+        let header = fold_request_header(events, last_seq)
+            .context("the interrupted turn recorded no request header")?;
+        let provider = Provider::parse(&header.provider)?;
+        let backend = self
+            .backend(provider)
+            .with_context(|| format!("no configured backend for provider `{}`", header.provider))?;
+        backend
+            .resume_turn(session, events, turn_id, deltas, recorder)
+            .await
     }
 }
 
@@ -535,7 +541,7 @@ impl LlmClient for ProviderLlm {
         &self,
         session: &Session,
         deltas: Option<Arc<dyn DeltaSink>>,
-        journal: Option<Arc<dyn TurnJournal>>,
+        recorder: Option<Arc<dyn TurnRecorder>>,
     ) -> anyhow::Result<Box<dyn TurnDriver>> {
         let (preamble, prompt, history, memories) = self.assemble(session).await?;
         let turn_loop = TurnLoop {
@@ -546,7 +552,7 @@ impl LlmClient for ProviderLlm {
             tools: self.tool_schemas(),
             history,
             start: TurnStart::Prompt(Turn::user(prompt)),
-            journal,
+            recorder,
             provider_name: self.provider.name(),
             timeout: self.timeout,
             usage: TokenUsage::default(),
@@ -555,18 +561,19 @@ impl LlmClient for ProviderLlm {
             deltas,
             rounds: 0,
         };
-        turn_loop.journal_envelope().await;
+        turn_loop.record_header(HeaderReason::Initial).await;
         Ok(Box::new(turn_loop))
     }
 
     async fn resume_turn(
         &self,
-        _session: &Session,
-        entries: &[JournalEntry],
+        session: &Session,
+        events: &[SessionEvent],
+        turn_id: &str,
         deltas: Option<Arc<dyn DeltaSink>>,
-        journal: Option<Arc<dyn TurnJournal>>,
+        recorder: Option<Arc<dyn TurnRecorder>>,
     ) -> anyhow::Result<Box<dyn TurnDriver>> {
-        let rebuilt = rebuild_from_journal(entries)?;
+        let rebuilt = rebuild_from_events(session, events, turn_id)?;
         let turn_loop = TurnLoop {
             client: self.client.clone(),
             turn: TurnModel {
@@ -577,11 +584,11 @@ impl LlmClient for ProviderLlm {
             tools: self.tool_schemas(),
             history: rebuilt.history,
             start: rebuilt.start,
-            journal,
+            recorder,
             provider_name: self.provider.name(),
             timeout: self.timeout,
             usage: TokenUsage::default(),
-            // A resumed turn rebuilds its prompt from the journal rather than
+            // A resumed turn reopens the recorded prompt rather than
             // assembling one, so there is no fresh enrichment to report; the
             // interrupted run's row already holds what was injected.
             memories: RecalledMemories::default(),
@@ -591,7 +598,7 @@ impl LlmClient for ProviderLlm {
         };
         // The continuation journals itself from its rebuilt state, so a second
         // interruption resumes from here rather than replaying this rebuild.
-        turn_loop.journal_envelope().await;
+        turn_loop.record_header(HeaderReason::Resume).await;
         Ok(Box::new(turn_loop))
     }
 }
@@ -606,77 +613,135 @@ struct RebuiltTurn {
     start: TurnStart,
 }
 
-/// Fold journal rows back into the state the turn died with. A pure fold over
-/// stored values — the same shapes `TurnLoop` pushed live, never re-derived —
-/// which is what makes rebuild == live an invariant a test can lock.
-fn rebuild_from_journal(entries: &[JournalEntry]) -> anyhow::Result<RebuiltTurn> {
-    let envelope = JournalEnvelope::parse(entries)?;
-    let mut history = envelope.history;
-    for entry in &entries[1..] {
-        match entry.kind {
-            JournalKind::Assistant => {
-                let completion: Completion = serde_json::from_str(&entry.payload)
-                    .context("parsing a journaled assistant round")?;
-                history.push(Turn::Assistant {
-                    id: completion.id,
-                    blocks: completion.blocks,
-                });
+/// Rebuild the state an interrupted turn died with, from its session's events.
+///
+/// The history is **derived**, not stored: `session.messages` is the
+/// conversation projected out of the same log, and resume's own precondition is
+/// that it still ends on the interrupted turn's user message. Only what a later
+/// request cannot re-derive — the model settings and the rendered prompt — was
+/// snapshotted, in `request/header`.
+///
+/// Rounds are replayed in `seq` order, but each round's **results are ordered by
+/// `call_index`**, never by the seq their settle landed on: a round runs
+/// concurrently, so settle order is completion order, and rebuilding in it would
+/// hand the provider a different request than the live turn sent.
+fn rebuild_from_events(
+    session: &Session,
+    events: &[SessionEvent],
+    turn_id: &str,
+) -> anyhow::Result<RebuiltTurn> {
+    let last_seq = events.last().map(|e| e.seq).unwrap_or(0);
+    let header = fold_request_header(events, last_seq)
+        .context("the interrupted turn recorded no request header")?
+        .clone();
+
+    let mut history: Vec<Turn> = session.messages.iter().flat_map(to_turns).collect();
+
+    // One round's calls: what was dispatched, and what came back.
+    struct Round {
+        id: String,
+        blocks: Vec<AssistantBlock>,
+        dispatched: Vec<(u32, String)>,
+        settled: std::collections::HashMap<String, String>,
+    }
+    let mut rounds: Vec<Round> = Vec::new();
+    for event in events
+        .iter()
+        .filter(|e| e.turn_id_of_work() == Some(turn_id))
+    {
+        match &event.kind {
+            SessionEventKind::AssistantRound(round) => rounds.push(Round {
+                id: round.response_id.clone(),
+                blocks: serde_json::from_value(round.blocks.clone())
+                    .context("parsing a recorded assistant round")?,
+                dispatched: Vec::new(),
+                settled: std::collections::HashMap::new(),
+            }),
+            SessionEventKind::ToolCallStarted(call) => {
+                if let Some(round) = rounds.last_mut() {
+                    round
+                        .dispatched
+                        .push((call.call_index, call.call_id.clone()));
+                }
             }
-            JournalKind::Results => {
-                let turn: Turn = serde_json::from_str(&entry.payload)
-                    .context("parsing a journaled results turn")?;
-                history.push(turn);
+            SessionEventKind::ToolCallSettled(call) => {
+                if let Some(round) = rounds.last_mut() {
+                    let text = if call.error.is_empty() {
+                        call.result.clone()
+                    } else {
+                        call.error.clone()
+                    };
+                    round.settled.insert(call.call_id.clone(), text);
+                }
             }
-            JournalKind::Envelope => {
-                anyhow::bail!("turn journal holds a second envelope")
+            SessionEventKind::UserMessage(m) if m.source == MessageSource::Injected => {
+                // Recorded when it entered history mid-turn; it belongs after
+                // the results of the round it interrupted.
+                if let Some(Turn::User(blocks)) = history.last_mut() {
+                    blocks.push(UserBlock::Text(format!(
+                        "{INTERJECTION_PREFIX}{}",
+                        m.content
+                    )));
+                }
             }
+            _ => {}
         }
     }
 
-    // Where did the interruption land? The trailing turn decides how to pick
-    // up; the note-synthesis case is the one that needs care — the tools are
-    // NOT re-run (a mutation cannot be assumed idempotent), the model is told
-    // the result was lost and decides whether to re-issue.
+    let mut lost_calls = false;
+    for round in &rounds {
+        history.push(Turn::Assistant {
+            id: (!round.id.is_empty()).then(|| round.id.clone()),
+            blocks: round.blocks.clone(),
+        });
+        if round.dispatched.is_empty() {
+            continue;
+        }
+        let mut ordered = round.dispatched.clone();
+        ordered.sort_by_key(|(index, _)| *index);
+        let results: Vec<UserBlock> = ordered
+            .iter()
+            .map(|(_, call_id)| {
+                let text = round.settled.get(call_id).cloned().unwrap_or_else(|| {
+                    lost_calls = true;
+                    INTERRUPTED_RESULT_NOTE.clone()
+                });
+                UserBlock::ToolResult {
+                    id: call_id.clone(),
+                    call_id: Some(call_id.clone()),
+                    text,
+                }
+            })
+            .collect();
+        history.push(Turn::User(results));
+    }
+
+    // Where did the interruption land? A round whose calls all settled and that
+    // produced no further round is a turn that had answered and only failed to
+    // land it; anything else continues.
     let start = match history.last() {
-        None => anyhow::bail!("turn journal rebuilt an empty history"),
-        Some(Turn::Assistant { blocks, .. }) => {
-            let lost_calls: Vec<UserBlock> = blocks
+        None => anyhow::bail!("nothing to resume: the turn recorded no history"),
+        Some(Turn::Assistant { blocks, .. }) if !lost_calls => {
+            let text = blocks
                 .iter()
                 .filter_map(|block| match block {
-                    AssistantBlock::ToolCall { id, call_id, .. } => Some(UserBlock::ToolResult {
-                        id: id.clone(),
-                        call_id: call_id.clone(),
-                        text: INTERRUPTED_RESULT_NOTE.clone(),
-                    }),
+                    AssistantBlock::Text(t) => Some(t.as_str()),
                     _ => None,
                 })
-                .collect();
-            if lost_calls.is_empty() {
-                // The turn had already answered; it just never landed.
-                let text = blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        AssistantBlock::Text(t) => Some(t.as_str()),
-                        _ => None,
-                    })
-                    .collect::<String>();
-                anyhow::ensure!(
-                    !text.trim().is_empty(),
-                    "interrupted turn ended on an empty assistant round"
-                );
-                TurnStart::Final(text)
-            } else {
-                history.push(Turn::User(lost_calls));
-                TurnStart::Continue
-            }
+                .collect::<String>();
+            anyhow::ensure!(
+                !text.trim().is_empty(),
+                "interrupted turn ended on an empty assistant round"
+            );
+            TurnStart::Final(text)
         }
-        Some(Turn::User(_)) => TurnStart::Continue,
+        _ => TurnStart::Continue,
     };
 
     Ok(RebuiltTurn {
-        model: envelope.model,
-        preamble: envelope.preamble,
-        extra: envelope.extra,
+        model: header.model,
+        preamble: header.system,
+        extra: header.extra,
         history,
         start,
     })
@@ -687,52 +752,6 @@ fn rebuild_from_journal(entries: &[JournalEntry]) -> anyhow::Result<RebuiltTurn>
 /// text sits next to a pile of results and reads as more data.
 const INTERJECTION_PREFIX: &str = "The user sent this while you were working — \
      take it into account before your next step:\n";
-
-// ── turn journal payloads ─────────────────────────────────────────────────────
-//
-// The journal's row shapes. Owned here — the one writer and the one reader are
-// both this file — and kept as exactly what `TurnLoop.history` stores, so a
-// rebuild is a fold, not a re-derivation:
-//   envelope   = model settings + the full history the turn opened with
-//   assistant  = the round's `Completion`, verbatim
-//   results    = the user `Turn` fed back (tool results + any interjection)
-// Bump `JOURNAL_VERSION` when any of these change shape.
-
-/// Seq-0 row: everything needed to re-issue this turn's requests byte-for-byte
-/// (the preamble and prompt are *not* re-assembled on resume — memory recall,
-/// AGENTS.md and the clock have all moved on, and the prefix cache is keyed on
-/// the original bytes).
-#[derive(Serialize, Deserialize)]
-struct JournalEnvelope {
-    version: u32,
-    provider: String,
-    model: String,
-    preamble: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    extra: Option<Value>,
-    history: Vec<Turn>,
-}
-
-impl JournalEnvelope {
-    /// Parse the envelope off a journal's rows, refusing anything this build
-    /// doesn't understand — the caller falls back to the digest-primed resume.
-    fn parse(entries: &[JournalEntry]) -> anyhow::Result<Self> {
-        let first = entries.first().context("empty turn journal")?;
-        anyhow::ensure!(
-            first.kind == JournalKind::Envelope,
-            "turn journal does not start with an envelope (found {:?})",
-            first.kind
-        );
-        let envelope: JournalEnvelope =
-            serde_json::from_str(&first.payload).context("parsing journal envelope")?;
-        anyhow::ensure!(
-            envelope.version == JOURNAL_VERSION,
-            "turn journal version {} is not this build's {JOURNAL_VERSION}",
-            envelope.version
-        );
-        Ok(envelope)
-    }
-}
 
 /// What a tool call whose result was lost to the interruption gets fed back as
 /// on resume. The tools themselves are never re-run here: a mutation cannot be
@@ -775,7 +794,7 @@ struct TurnLoop {
     /// Journal for this turn's provider-level state, written in lockstep with
     /// `history` (envelope at construction, one row per round-trip and one per
     /// results feed-back). `None` — every aux path — journals nothing.
-    journal: Option<Arc<dyn TurnJournal>>,
+    recorder: Option<Arc<dyn TurnRecorder>>,
     /// This backend's provider, as recorded in the journal envelope.
     provider_name: &'static str,
     /// Per-round completion timeout (see [`ProviderLlm::timeout`]).
@@ -809,37 +828,44 @@ struct TurnLoop {
 const OVERFLOW_TOOL_RESULT_KEEP: usize = 4 * 1024;
 
 impl TurnLoop {
-    /// Serialize and record one journal row; a failure to serialize only warns
-    /// (the journal is a resumability aid — it must never fail the turn, and
-    /// the write side's own failure handling lives in the `TurnJournal` impl).
-    async fn journal_write(&self, kind: JournalKind, payload: &impl Serialize) {
-        let Some(journal) = &self.journal else {
-            return;
-        };
-        match serde_json::to_string(payload) {
-            Ok(json) => journal.record(kind, json).await,
-            Err(error) => warn!(%error, ?kind, "failed to serialize a turn-journal payload"),
+    /// Record this turn's events. Best-effort by contract: recording buys
+    /// resumability, and a broken store must cost exactly that.
+    async fn record(&self, kinds: Vec<SessionEventKind>) {
+        if let Some(recorder) = &self.recorder {
+            recorder.record(kinds).await;
         }
     }
 
-    /// Record the envelope: the state this turn opens with, sufficient to
-    /// re-issue its requests byte-for-byte. Called once at construction —
-    /// including on a resumed turn, whose envelope is the *rebuilt* history, so
-    /// a second interruption resumes from the continuation, not from scratch.
-    async fn journal_envelope(&self) {
-        let mut history = self.history.clone();
-        if let TurnStart::Prompt(prompt) = &self.start {
-            history.push(prompt.clone());
-        }
-        let envelope = JournalEnvelope {
-            version: JOURNAL_VERSION,
+    fn turn_id(&self) -> String {
+        self.recorder
+            .as_ref()
+            .map(|r| r.turn_id().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Record the request envelope — model settings, the rendered system
+    /// prompt, the assembled tool schemas.
+    ///
+    /// Deliberately **not** the history: that is derived from the session's own
+    /// events, so copying it here would put a rendered prompt and every tool
+    /// schema into the log once per round. Only the parts a later request
+    /// cannot re-derive are stored, and only when they change — an unchanged
+    /// envelope is inherited (`header_snapshot_reason`).
+    ///
+    /// A resumed turn always writes one, identical or not: the boundary between
+    /// the interrupted loop and the one that picked it up has to be visible in
+    /// the log rather than inferred from a gap.
+    async fn record_header(&self, reason: HeaderReason) {
+        self.record(vec![SessionEventKind::RequestHeader(RequestHeaderEvent {
+            reason,
             provider: self.provider_name.to_string(),
             model: self.turn.model.clone(),
-            preamble: self.turn.preamble.clone(),
+            effort: String::new(),
+            system: self.turn.preamble.clone(),
+            tools: self.tools.iter().map(|t| t.name.clone()).collect(),
             extra: self.turn.extra.clone(),
-            history,
-        };
-        self.journal_write(JournalKind::Envelope, &envelope).await;
+        })])
+        .await;
     }
 
     /// Send one round-trip: complete over `history`, then commit the assistant
@@ -898,8 +924,18 @@ impl TurnLoop {
             turn_output = self.usage.output,
             "model round completed"
         );
-        self.journal_write(JournalKind::Assistant, &completion)
-            .await;
+        self.record(vec![SessionEventKind::AssistantRound(
+            AssistantRoundEvent {
+                turn_id: self.turn_id(),
+                round: self.rounds as u32,
+                response_id: completion.id.clone().unwrap_or_default(),
+                blocks: serde_json::to_value(&completion.blocks).unwrap_or(Value::Null),
+                tokens_in: completion.usage.input,
+                tokens_out: completion.usage.output,
+                tokens_cached: completion.usage.cached_input,
+            },
+        )])
+        .await;
         let step = blocks_to_step(&completion.blocks);
         self.history.push(Turn::Assistant {
             id: completion.id,
@@ -1098,17 +1134,28 @@ impl TurnDriver for TurnLoop {
         // message as a plain text block — after the results, so the model reads
         // the outcome first and the new instruction last (the position it acts
         // on). Labelled, or a bare sentence next to tool output reads as data.
+        let interjected_text = interjected.clone();
         if let Some(text) = interjected {
             blocks.push(UserBlock::Text(format!("{INTERJECTION_PREFIX}{text}")));
         }
         if blocks.is_empty() {
             anyhow::bail!("no tool results to send back");
         }
-        let turn = Turn::User(blocks);
-        // Journaled as the exact `Turn` entering history, so a rebuild is a
-        // fold of stored values — never a re-derivation that could drift.
-        self.journal_write(JournalKind::Results, &turn).await;
-        self.run(turn).await
+        // The tool results are already in the log — the executor appends one
+        // `tool/call-settled` as each call settles. What is *not* yet there is
+        // anything the user said mid-turn: record it at the moment it enters
+        // history, not at turn end, or a turn that fails after acting on it
+        // loses it entirely.
+        if let Some(text) = interjected_text {
+            self.record(vec![SessionEventKind::UserMessage(UserMessageEvent {
+                turn_id: self.turn_id(),
+                content: text,
+                source: MessageSource::Injected,
+                surface: SurfacePlacement::append(),
+            })])
+            .await;
+        }
+        self.run(Turn::User(blocks)).await
     }
 
     fn usage(&self) -> TokenUsage {
@@ -1599,42 +1646,46 @@ mod tests {
         async fn resume_turn(
             &self,
             _session: &Session,
-            _entries: &[JournalEntry],
+            _events: &[SessionEvent],
+            _turn_id: &str,
             _deltas: Option<Arc<dyn DeltaSink>>,
-            _journal: Option<Arc<dyn TurnJournal>>,
+            _recorder: Option<Arc<dyn TurnRecorder>>,
         ) -> anyhow::Result<Box<dyn TurnDriver>> {
             // Reports which backend the router picked, via the error text.
             anyhow::bail!("resumed-on:{}", self.0)
         }
     }
 
-    // ── turn journal: rebuild ────────────────────────────────────────────────
+    use komo_core::domain::session_event::{
+        ToolCallSettledEvent, ToolCallStartedEvent, ToolOutcome as SettledOutcome,
+    };
 
-    fn entry(seq: i64, kind: JournalKind, payload: impl ToString) -> JournalEntry {
-        JournalEntry {
-            seq,
-            kind,
-            payload: payload.to_string(),
-        }
+    // ── rebuilding an interrupted turn from its events ───────────────────────
+
+    fn at(text: &str) -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).unwrap()
     }
 
-    fn envelope_entry(history: Vec<Turn>) -> JournalEntry {
-        let envelope = JournalEnvelope {
-            version: JOURNAL_VERSION,
-            provider: "openai".into(),
-            model: "gpt-test".into(),
-            preamble: "SYSTEM".into(),
-            extra: Some(json!({ "prompt_cache_key": "komo:s" })),
-            history,
-        };
-        entry(
-            0,
-            JournalKind::Envelope,
-            serde_json::to_string(&envelope).unwrap(),
+    fn ev(seq: u64, kind: SessionEventKind) -> SessionEvent {
+        SessionEvent::new(seq, at("2026-09-01T10:00:00Z"), kind)
+    }
+
+    fn header_event(seq: u64) -> SessionEvent {
+        ev(
+            seq,
+            SessionEventKind::RequestHeader(RequestHeaderEvent {
+                reason: HeaderReason::Initial,
+                provider: "openai".into(),
+                model: "gpt-test".into(),
+                effort: String::new(),
+                system: "SYSTEM".into(),
+                tools: vec![],
+                extra: Some(json!({ "prompt_cache_key": "komo:s" })),
+            }),
         )
     }
 
-    fn assistant_completion(text: &str, call: Option<&str>) -> Completion {
+    fn round_event(seq: u64, text: &str, calls: &[&str]) -> SessionEvent {
         let mut blocks = vec![AssistantBlock::Reasoning(komo_provider::types::Reasoning {
             id: Some("rs".into()),
             summary: vec![],
@@ -1643,181 +1694,202 @@ mod tests {
         if !text.is_empty() {
             blocks.push(AssistantBlock::Text(text.into()));
         }
-        if let Some(name) = call {
+        for name in calls {
             blocks.push(AssistantBlock::ToolCall {
                 id: format!("item-{name}"),
                 call_id: Some(format!("call-{name}")),
-                name: name.into(),
+                name: (*name).into(),
                 args: "{}".into(),
             });
         }
-        Completion {
-            id: Some("msg".into()),
-            blocks,
-            usage: Default::default(),
-        }
+        ev(
+            seq,
+            SessionEventKind::AssistantRound(AssistantRoundEvent {
+                turn_id: "t1".into(),
+                round: 0,
+                response_id: "msg".into(),
+                blocks: serde_json::to_value(&blocks).unwrap(),
+                tokens_in: 0,
+                tokens_out: 0,
+                tokens_cached: 0,
+            }),
+        )
     }
 
-    /// The model-visible ⟺ logged lock: a rebuild is a pure fold of the stored
-    /// rows, and must land byte-identically on what the live loop would have
-    /// held — envelope history, then alternating assistant/results pushes.
-    #[test]
-    fn rebuild_folds_journal_rows_into_the_exact_live_history() {
-        let opening = vec![Turn::assistant("earlier reply"), Turn::user("do the thing")];
-        let round1 = assistant_completion("let me check", Some("shell"));
-        let results1 = Turn::User(vec![UserBlock::ToolResult {
-            id: "item-shell".into(),
-            call_id: Some("call-shell".into()),
-            text: "file contents here".into(),
-        }]);
-        let entries = vec![
-            envelope_entry(opening.clone()),
-            entry(
-                1,
-                JournalKind::Assistant,
-                serde_json::to_string(&round1).unwrap(),
-            ),
-            entry(
-                2,
-                JournalKind::Results,
-                serde_json::to_string(&results1).unwrap(),
-            ),
-        ];
+    fn started_event(seq: u64, name: &str, index: u32) -> SessionEvent {
+        ev(
+            seq,
+            SessionEventKind::ToolCallStarted(ToolCallStartedEvent {
+                turn_id: "t1".into(),
+                call_id: format!("call-{name}"),
+                call_index: index,
+                tool: name.into(),
+                args: "{}".into(),
+            }),
+        )
+    }
 
-        let rebuilt = rebuild_from_journal(&entries).unwrap();
-        // Exactly what TurnLoop.history held when the process died: the
-        // opening history + the committed assistant turn + the fed-back
-        // results, block for block.
-        let mut expected = opening;
-        expected.push(Turn::Assistant {
-            id: round1.id.clone(),
-            blocks: round1.blocks.clone(),
-        });
-        expected.push(results1);
-        assert_eq!(rebuilt.history, expected);
+    fn settled_event(seq: u64, name: &str, index: u32, result: &str) -> SessionEvent {
+        ev(
+            seq,
+            SessionEventKind::ToolCallSettled(ToolCallSettledEvent {
+                turn_id: "t1".into(),
+                call_id: format!("call-{name}"),
+                call_index: index,
+                outcome: SettledOutcome::Succeeded,
+                result: result.into(),
+                error: String::new(),
+                elapsed_ms: 1,
+                structured: Value::Null,
+                output_paths: vec![],
+            }),
+        )
+    }
+
+    fn asked(text: &str) -> Session {
+        let mut session = Session::new("s");
+        session.messages.push(Message::user(text));
+        session
+    }
+
+    #[test]
+    fn a_rebuild_replays_the_rounds_and_their_results() {
+        let session = asked("go");
+        let events = vec![
+            header_event(0),
+            round_event(1, "", &["read"]),
+            started_event(2, "read", 0),
+            settled_event(3, "read", 0, "file contents"),
+        ];
+        let rebuilt = rebuild_from_events(&session, &events, "t1").unwrap();
+        // The envelope came from the header, not from a stored copy of history.
         assert_eq!(rebuilt.model, "gpt-test");
         assert_eq!(rebuilt.preamble, "SYSTEM");
+        assert!(rebuilt.extra.is_some());
+        // user → assistant round → its results.
+        assert_eq!(rebuilt.history.len(), 3);
+        assert!(matches!(rebuilt.history[1], Turn::Assistant { .. }));
         assert!(matches!(rebuilt.start, TurnStart::Continue));
     }
 
     #[test]
-    fn rebuild_after_lost_tool_round_synthesizes_interrupted_results() {
-        // Died while the tools ran: journal ends on an assistant round with
-        // calls. The rebuild must feed back a lost-result note per call — and
-        // never re-run the tools itself.
-        let round = assistant_completion("checking", Some("shell"));
-        let entries = vec![
-            envelope_entry(vec![Turn::user("hi")]),
-            entry(
-                1,
-                JournalKind::Assistant,
-                serde_json::to_string(&round).unwrap(),
-            ),
+    fn results_rebuild_in_call_order_not_in_the_order_they_settled() {
+        // A round runs concurrently, so settle order is completion order.
+        // Rebuilding in it would hand the provider a different request than the
+        // live turn sent — and `rebuild == live` is the whole point.
+        let session = asked("go");
+        let events = vec![
+            header_event(0),
+            round_event(1, "", &["a", "b", "c"]),
+            started_event(2, "a", 0),
+            started_event(3, "b", 1),
+            started_event(4, "c", 2),
+            settled_event(5, "c", 2, "third"),
+            settled_event(6, "a", 0, "first"),
+            settled_event(7, "b", 1, "second"),
         ];
-        let rebuilt = rebuild_from_journal(&entries).unwrap();
-        assert!(matches!(rebuilt.start, TurnStart::Continue));
-        match rebuilt.history.last().unwrap() {
-            Turn::User(blocks) => match &blocks[..] {
-                [UserBlock::ToolResult { id, call_id, text }] => {
-                    assert_eq!(id, "item-shell");
-                    assert_eq!(call_id.as_deref(), Some("call-shell"));
-                    assert_eq!(text, &*INTERRUPTED_RESULT_NOTE);
-                }
-                other => panic!("expected one synthesized result, got {other:?}"),
-            },
-            other => panic!("expected a user turn, got {other:?}"),
-        }
-        // The advice must be the one the executor gives for the same situation:
-        // the call went out and nobody knows whether it landed. Telling the
-        // model to just re-issue it here — at the *most* dangerous moment, after
-        // a crash mid-mutation — is what this used to do.
-        assert!(
-            INTERRUPTED_RESULT_NOTE.contains(komo_core::domain::tool::UNCERTAIN_OUTCOME_ADVICE),
-            "the interrupted-result note must carry the shared uncertain-outcome advice"
-        );
-        assert!(
-            !INTERRUPTED_RESULT_NOTE.contains("Re-issue the call if you still need it"),
-            "an unknown outcome must not invite a blind retry"
-        );
-    }
-
-    #[test]
-    fn rebuild_past_the_finish_line_hands_back_the_answer() {
-        // Died after the final round but before the reply reached the
-        // transcript: no request at all, the answer is already in the journal.
-        let round = assistant_completion("the finished answer", None);
-        let entries = vec![
-            envelope_entry(vec![Turn::user("hi")]),
-            entry(
-                1,
-                JournalKind::Assistant,
-                serde_json::to_string(&round).unwrap(),
-            ),
-        ];
-        let rebuilt = rebuild_from_journal(&entries).unwrap();
-        match rebuilt.start {
-            TurnStart::Final(text) => assert_eq!(text, "the finished answer"),
-            _ => panic!("expected TurnStart::Final"),
-        }
-    }
-
-    #[test]
-    fn rebuild_from_envelope_alone_continues_from_the_prompt() {
-        // Died during the very first completion: the envelope's own history
-        // already ends on the user prompt.
-        let entries = vec![envelope_entry(vec![Turn::user("hi")])];
-        let rebuilt = rebuild_from_journal(&entries).unwrap();
-        assert!(matches!(rebuilt.start, TurnStart::Continue));
-        assert_eq!(rebuilt.history, vec![Turn::user("hi")]);
-    }
-
-    #[test]
-    fn rebuild_refuses_foreign_journals() {
-        // Unknown version.
-        let mut envelope = JournalEnvelope {
-            version: JOURNAL_VERSION + 1,
-            provider: "openai".into(),
-            model: "m".into(),
-            preamble: String::new(),
-            extra: None,
-            history: vec![Turn::user("hi")],
+        let rebuilt = rebuild_from_events(&session, &events, "t1").unwrap();
+        let Some(Turn::User(blocks)) = rebuilt.history.last() else {
+            panic!("the round's results close the history");
         };
-        let bad_version = vec![entry(
-            0,
-            JournalKind::Envelope,
-            serde_json::to_string(&envelope).unwrap(),
-        )];
-        assert!(rebuild_from_journal(&bad_version).is_err());
-        envelope.version = JOURNAL_VERSION;
+        let texts: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                UserBlock::ToolResult { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["first", "second", "third"]);
+    }
 
-        // No envelope first.
-        let no_envelope = vec![entry(0, JournalKind::Results, "{}")];
-        assert!(rebuild_from_journal(&no_envelope).is_err());
+    #[test]
+    fn a_call_that_never_settled_comes_back_as_an_uncertain_outcome() {
+        // The tool is *not* re-run: a mutation cannot be assumed idempotent, so
+        // whether to re-issue it is the model's decision — told plainly.
+        let session = asked("go");
+        let events = vec![
+            header_event(0),
+            round_event(1, "", &["a", "b"]),
+            started_event(2, "a", 0),
+            started_event(3, "b", 1),
+            settled_event(4, "a", 0, "landed"),
+        ];
+        let rebuilt = rebuild_from_events(&session, &events, "t1").unwrap();
+        let Some(Turn::User(blocks)) = rebuilt.history.last() else {
+            panic!("results close the history");
+        };
+        let texts: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                UserBlock::ToolResult { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts[0], "landed", "a settled call keeps its real result");
+        assert!(texts[1].contains("interrupted"));
+        assert!(matches!(rebuilt.start, TurnStart::Continue));
+    }
 
-        // Empty journal.
-        assert!(rebuild_from_journal(&[]).is_err());
+    #[test]
+    fn a_turn_that_had_already_answered_hands_the_answer_back() {
+        // The reply was produced and only the ledger close was lost. Re-issuing
+        // the request would pay for an answer that already exists.
+        let session = asked("go");
+        let events = vec![header_event(0), round_event(1, "all done", &[])];
+        let rebuilt = rebuild_from_events(&session, &events, "t1").unwrap();
+        match rebuilt.start {
+            TurnStart::Final(text) => assert_eq!(text, "all done"),
+            TurnStart::Continue => panic!("expected the answer back, not a continuation"),
+            _ => panic!("expected the answer back"),
+        }
+    }
+
+    #[test]
+    fn a_turn_with_no_recorded_header_cannot_be_rebuilt() {
+        // Without the envelope the continuation would be a *different* request:
+        // a re-assembled prompt whose memory recall and clock have moved on.
+        let session = asked("go");
+        assert!(rebuild_from_events(&session, &[round_event(0, "hi", &[])], "t1").is_err());
+    }
+
+    #[test]
+    fn another_turns_events_are_not_replayed_into_this_one() {
+        let session = asked("go");
+        let mut other = round_event(1, "", &["read"]);
+        if let SessionEventKind::AssistantRound(round) = &mut other.kind {
+            round.turn_id = "t0".into();
+        }
+        let events = vec![header_event(0), other];
+        let rebuilt = rebuild_from_events(&session, &events, "t1").unwrap();
+        assert_eq!(rebuilt.history.len(), 1, "only the user message survives");
     }
 
     #[tokio::test]
-    async fn resume_routes_on_the_envelopes_provider_not_the_session() {
+    async fn resume_routes_on_the_recorded_provider_not_the_session() {
         let router = router();
-        // The session says codex (the default), but the journal was written by
-        // a deepseek turn — the deepseek backend must get it.
-        let envelope = JournalEnvelope {
-            version: JOURNAL_VERSION,
-            provider: "deepseek".into(),
-            model: "deepseek-v4".into(),
-            preamble: String::new(),
-            extra: None,
-            history: vec![Turn::user("hi")],
-        };
-        let entries = vec![entry(
+        // The session says codex (the default), but the interrupted turn ran on
+        // deepseek — continuing it anywhere else would replay one provider's
+        // opaque state into another.
+        let events = vec![ev(
             0,
-            JournalKind::Envelope,
-            serde_json::to_string(&envelope).unwrap(),
+            SessionEventKind::RequestHeader(RequestHeaderEvent {
+                reason: HeaderReason::Initial,
+                provider: "deepseek".into(),
+                model: "deepseek-v4".into(),
+                effort: String::new(),
+                system: String::new(),
+                tools: vec![],
+                extra: None,
+            }),
         )];
         let error = router
-            .resume_turn(&session_on("codex:gpt-5.3-codex"), &entries, None, None)
+            .resume_turn(
+                &session_on("codex:gpt-5.3-codex"),
+                &events,
+                "t1",
+                None,
+                None,
+            )
             .await
             .err()
             .expect("the tagged stub always errors");

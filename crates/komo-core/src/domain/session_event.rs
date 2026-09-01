@@ -109,6 +109,26 @@ impl SessionEvent {
         }
     }
 
+    /// The turn this event belongs to, across every kind that records work —
+    /// wider than [`turn_id`](Self::turn_id), which answers only for the two
+    /// events that reach the conversation surface.
+    pub fn turn_id_of_work(&self) -> Option<&str> {
+        match &self.kind {
+            SessionEventKind::UserMessage(m) => Some(m.turn_id.as_str()),
+            SessionEventKind::AssistantMessage(m) => Some(m.turn_id.as_str()),
+            SessionEventKind::AssistantRound(r) => Some(r.turn_id.as_str()),
+            SessionEventKind::ToolCallStarted(c) => Some(c.turn_id.as_str()),
+            SessionEventKind::ToolCallSettled(c) => Some(c.turn_id.as_str()),
+            SessionEventKind::ApprovalRequested(a) => Some(a.turn_id.as_str()),
+            SessionEventKind::ApprovalResolved(a) => Some(a.turn_id.as_str()),
+            SessionEventKind::TurnStarted { turn_id }
+            | SessionEventKind::TurnCompleted { turn_id }
+            | SessionEventKind::TurnFailed { turn_id, .. }
+            | SessionEventKind::TurnCancelled { turn_id, .. } => Some(turn_id.as_str()),
+            _ => None,
+        }
+    }
+
     /// The surface placement this event declares, or `None` when it produces no
     /// long-term conversation message.
     ///
@@ -245,7 +265,7 @@ pub enum HeaderReason {
 /// Compared field-wise after canonicalization; anything that is not a *request
 /// input* (route capacity, for one) stays out, or a route change would register
 /// as an envelope change.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestHeaderEvent {
     pub reason: HeaderReason,
     pub provider: String,
@@ -258,6 +278,10 @@ pub struct RequestHeaderEvent {
     /// Tool schemas in assembly order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    /// Provider-specific request extras, opaque here. Part of the envelope: a
+    /// continuation that dropped them would not be re-issuing the same request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
 }
 
 impl RequestHeaderEvent {
@@ -269,6 +293,7 @@ impl RequestHeaderEvent {
             || self.effort != latest.effort
             || self.system != latest.system
             || self.tools != latest.tools
+            || self.extra != latest.extra
     }
 }
 
@@ -290,6 +315,11 @@ pub struct RequestContextEvent {
 pub struct AssistantRoundEvent {
     pub turn_id: String,
     pub round: u32,
+    /// The provider's id for this completion. Echoed back verbatim on a
+    /// continuation, which is what carries a reasoning model's chain of thought
+    /// across the interruption.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub response_id: String,
     pub blocks: serde_json::Value,
     #[serde(default)]
     pub tokens_in: i64,
@@ -543,6 +573,24 @@ pub fn derive_messages(events: &[SessionEvent], first_seq: u64) -> Result<Vec<Me
         }
     }
     Ok(out)
+}
+
+/// Records one turn's events into its session's log.
+///
+/// Handed to the LLM backend for the duration of a turn, because that is the
+/// only place provider-shaped state exists. Recording is best-effort by
+/// contract: a failure costs resumability and nothing else — it must never fail
+/// the turn it was describing.
+#[async_trait::async_trait]
+pub trait TurnRecorder: Send + Sync {
+    /// The turn these events belong to. The recorder is bound to one turn, so
+    /// the backend does not have to carry the id alongside it.
+    fn turn_id(&self) -> &str;
+
+    async fn record(&self, kinds: Vec<SessionEventKind>);
+    /// Make everything recorded so far survive a crash. Called before an effect
+    /// whose attribution depends on the record having landed.
+    async fn durable(&self);
 }
 
 // ── folds ────────────────────────────────────────────────────────────────────
@@ -932,6 +980,7 @@ mod tests {
             SessionEventKind::AssistantRound(AssistantRoundEvent {
                 turn_id: "t".into(),
                 round: 0,
+                response_id: String::new(),
                 blocks: serde_json::json!([]),
                 tokens_in: 0,
                 tokens_out: 0,
@@ -992,6 +1041,7 @@ mod tests {
                 SessionEventKind::AssistantRound(AssistantRoundEvent {
                     turn_id: "turn-1".into(),
                     round: 0,
+                    response_id: String::new(),
                     blocks: serde_json::json!([{"tool_call": "shell"}]),
                     tokens_in: 100,
                     tokens_out: 20,
@@ -1219,6 +1269,7 @@ mod tests {
             effort: String::new(),
             system: system.into(),
             tools: tools.iter().map(|t| (*t).to_string()).collect(),
+            extra: None,
         }
     }
 
@@ -1361,6 +1412,7 @@ mod tests {
             effort: String::new(),
             system: "You are komo.".into(),
             tools: vec!["read".into(), "shell".into()],
+            extra: None,
         };
         // Same inputs, different reason: still the same request envelope, so no
         // snapshot — this is what keeps a rendered system prompt out of every

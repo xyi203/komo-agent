@@ -20,7 +20,6 @@ use komo_agent::system_prompt::SystemPromptBuilder;
 use komo_core::domain::checkpoint::CheckpointStore;
 use komo_core::domain::embedding::EmbeddingClient;
 use komo_core::domain::skill::SkillOffer;
-use komo_core::domain::turn_journal::TurnJournalRepository;
 use komo_infra::embedding::{GatedEmbedder, OllamaEmbedder};
 use komo_infra::memory::memory_db::MemoryDb;
 use komo_infra::permissions_store::PermissionsStore;
@@ -143,9 +142,6 @@ impl RuntimeParts<'_> {
             max_turns: profile.max_turns,
             history_window: self.history_window,
             learning: profile.learns.then(|| self.learning.clone()),
-            journal: profile
-                .resumable
-                .then(|| self.db.clone() as Arc<dyn TurnJournalRepository>),
             checkpoint: profile
                 .checkpoints
                 .then(|| self.checkpoint.clone())
