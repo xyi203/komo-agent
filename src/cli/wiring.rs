@@ -138,6 +138,7 @@ impl RuntimeParts<'_> {
             // delegation, a cron job and a briefing each auditable through
             // `komo run list` alongside ordinary turns.
             runs: self.db.clone(),
+            projection: self.db.clone(),
             tool_executor: profile.tools,
             max_turns: profile.max_turns,
             history_window: self.history_window,

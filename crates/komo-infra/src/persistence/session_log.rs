@@ -335,21 +335,22 @@ impl SessionLog {
         self.state.lock().await.manifest.truncated_before
     }
 
-    /// Assign and buffer a batch of events, returning the seqs they were given.
+    /// Assign and buffer a batch of events, returning them as stamped.
     ///
     /// Buffered, not written: a caller that needs these bytes to have survived a
     /// crash calls [`durable_flush`](Self::durable_flush) before the effect they
     /// describe.
-    pub async fn append_batch(&self, kinds: Vec<SessionEventKind>) -> Vec<u64> {
+    pub async fn append_batch(&self, kinds: Vec<SessionEventKind>) -> Vec<SessionEvent> {
         let mut state = self.state.lock().await;
-        let mut seqs = Vec::with_capacity(kinds.len());
+        let mut appended = Vec::with_capacity(kinds.len());
         for kind in kinds {
             let seq = state.next_seq;
             state.next_seq += 1;
-            seqs.push(seq);
-            state.pending.push(SessionEvent::now(seq, kind));
+            let event = SessionEvent::now(seq, kind);
+            appended.push(event.clone());
+            state.pending.push(event);
         }
-        seqs
+        appended
     }
 
     /// Write everything buffered to the active segment and `fsync` it.
@@ -668,6 +669,11 @@ mod tests {
         })
     }
 
+    /// The seqs a batch was handed — what these assertions are about.
+    fn seqs(appended: Vec<SessionEvent>) -> Vec<u64> {
+        appended.into_iter().map(|event| event.seq).collect()
+    }
+
     async fn open(dir: &Path) -> SessionLog {
         SessionLog::open_or_create(dir.to_path_buf(), header())
             .await
@@ -678,9 +684,12 @@ mod tests {
     async fn events_survive_a_reopen_with_their_assigned_seqs() {
         let dir = dir("roundtrip");
         let log = open(&dir).await;
-        assert_eq!(log.append_batch(vec![say("a"), say("b")]).await, vec![0, 1]);
+        assert_eq!(
+            seqs(log.append_batch(vec![say("a"), say("b")]).await),
+            vec![0, 1]
+        );
         log.durable_flush().await.unwrap();
-        assert_eq!(log.append_batch(vec![say("c")]).await, vec![2]);
+        assert_eq!(seqs(log.append_batch(vec![say("c")]).await), vec![2]);
         log.durable_flush().await.unwrap();
 
         // A fresh handle takes `next_seq` from the active segment's last whole
@@ -691,7 +700,7 @@ mod tests {
             events.iter().map(|e| e.seq).collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
-        assert_eq!(reopened.append_batch(vec![say("d")]).await, vec![3]);
+        assert_eq!(seqs(reopened.append_batch(vec![say("d")]).await), vec![3]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -708,7 +717,10 @@ mod tests {
         let reopened = open(&dir).await;
         assert!(reopened.load().await.unwrap().is_empty());
         // And the seq it handed out is handed out again — nothing consumed it.
-        assert_eq!(reopened.append_batch(vec![say("real")]).await, vec![0]);
+        assert_eq!(
+            seqs(reopened.append_batch(vec![say("real")]).await),
+            vec![0]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -731,7 +743,10 @@ mod tests {
         assert_eq!(events.len(), 2, "the two whole records survive");
         // Writing resumes at the last *whole* record, so the torn one's seq is
         // reused rather than skipped.
-        assert_eq!(reopened.append_batch(vec![say("three")]).await, vec![2]);
+        assert_eq!(
+            seqs(reopened.append_batch(vec![say("three")]).await),
+            vec![2]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

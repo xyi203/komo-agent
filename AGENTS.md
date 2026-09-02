@@ -562,7 +562,24 @@ call the same functions, which is what keeps validation from forking.
   Not a sandbox and not a workspace snapshot — the pre-image of exactly what
   changed, which is what a personal agent needs far more often than container
   isolation.
-- `domain/run.rs` — run ledger: one `Run` per turn, one `RunStep` per call.
+- `domain/run.rs` + `domain/run_projection.rs` — run ledger: one `Run` per
+  turn, one `RunStep` per call, and **all of it a projection of the session
+  event log**. Nothing writes a run or a step directly: `project_runs` folds the
+  log and `RunProjectionStore::commit` upserts the rows — once when the turn
+  opens (from the opening events alone, so a crash leaves a `running` row for
+  `run list` and `run resume` to find) and once when it closes, from the same
+  read of the log that computes retention's floor. Two authoritative records of
+  one turn disagreed after exactly the crash they were meant to survive; now the
+  fold-vs-row cross-check (`assert_ledger_matches_log`) holds to the second.
+  Three things stay row-held because the log cannot state them: `outcome` (a
+  verdict a *later* turn gave), `learned` (merged, only ever advancing), and the
+  startup reconciler's ruling on whether an open turn is running or dead —
+  which the fold's silence must never overturn. `run prune` writes a
+  `projection:runs:pruned_before` fence in the same transaction as its deletes,
+  bounded by the newest run actually deleted, so a rebuild
+  (`Db::rebuild_run_projection`) cannot resurrect what an operator removed.
+  A turn's steps reach its closing tool note from `RunContext`, not from the
+  rows: mid-turn there are no step rows to read.
   `Run.memories` records **which stored memories reached that turn's prompt**
   (pinned and recall kept apart), carried out of prompt assembly on
   `TurnDriver::memories()` the same way `usage()` carries tokens. It answers
@@ -572,17 +589,19 @@ call the same functions, which is what keeps validation from forking.
   authority on content.
   The reverse direction — *which turns did this memory shape?*, the question
   asked right after correcting one — is a thin `run_memory_records` index
-  written from the same value in the same `finish`, and dropped with its run
-  by `prune`. Not answered by scanning runs: a `Run` carries two 4000-char
+  projected from the same `turn/memories` event, and dropped with its run by
+  `prune`. Not answered by scanning runs: a `Run` carries two 4000-char
   fields, so reading thousands of them for one JSON column is the wrong
-  query. **`memories` is written by `finish`, not `start`** — the enricher
-  runs inside the turn, so at `start` there is nothing yet to record.
+  query.
   `elapsed_ms` is the duration field (`started_at`/`ended_at` are whole
   seconds); 0 / empty `structured` read as *unknown/absent*, never
   instant/empty-object. Args redacted per-tool (`Tool::redact_args`); results
   truncated not scrubbed. `komo run resume` re-dispatches a *fresh* primed
-  turn (the ledger is an audit record, not a checkpoint); `recoverable` is set
-  only by crash reconciliation, cleared at-most-once, never auto-resumed.
+  turn (the ledger is an audit record, not a checkpoint); `recoverable` folds
+  as *no terminal event and unclaimed*, and the claim is the continuation's own
+  `turn/started{resumed_from}` — seq assignment decides who owns a recovery, so
+  at-most-once no longer depends on a row update racing another reader. Never
+  auto-resumed.
 - `domain/skill.rs` + `komo-infra`'s `skills` + `services/skill_registry.rs` —
   skills are `SKILL.md` files under `~/.komo/skills/` (active), `.candidates/`
   (proposals), `.archive/` (retired — `komo skills archive|restore`; nothing

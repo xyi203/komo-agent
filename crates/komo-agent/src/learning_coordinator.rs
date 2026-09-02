@@ -557,15 +557,6 @@ mod tests {
             self.marked.lock().unwrap().extend(run_ids.iter().cloned());
             Ok(())
         }
-        async fn start(&self, _run: &Run) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn append_step(&self, _step: &RunStep) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn finish(&self, _run: &Run) -> anyhow::Result<()> {
-            Ok(())
-        }
         async fn list(&self, _limit: usize) -> anyhow::Result<Vec<Run>> {
             Ok(Vec::new())
         }
@@ -574,9 +565,6 @@ mod tests {
         }
         async fn reconcile_interrupted(&self, _now: i64) -> anyhow::Result<usize> {
             Ok(0)
-        }
-        async fn mark_resumed(&self, _id: &str) -> anyhow::Result<()> {
-            Ok(())
         }
         async fn steps_by_tool(&self, _t: &str, _l: usize) -> anyhow::Result<Vec<RunStep>> {
             Ok(Vec::new())
@@ -759,15 +747,24 @@ mod tests {
             &self,
             _session_id: &str,
             kinds: Vec<SessionEventKind>,
-        ) -> anyhow::Result<Vec<u64>> {
+        ) -> anyhow::Result<Vec<komo_core::domain::session_event::SessionEvent>> {
             if self.fail_append {
                 anyhow::bail!("log offline");
             }
             let mut appended = self.appended.lock().unwrap();
             let first = appended.len() as u64;
-            let seqs = (first..first + kinds.len() as u64).collect();
+            let stamped = kinds
+                .iter()
+                .enumerate()
+                .map(|(i, kind)| {
+                    komo_core::domain::session_event::SessionEvent::now(
+                        first + i as u64,
+                        kind.clone(),
+                    )
+                })
+                .collect();
             appended.extend(kinds);
-            Ok(seqs)
+            Ok(stamped)
         }
         async fn durable_flush(&self, _session_id: &str) -> anyhow::Result<()> {
             self.flushes.fetch_add(1, Ordering::Relaxed);

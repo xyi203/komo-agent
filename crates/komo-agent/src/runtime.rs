@@ -1,6 +1,6 @@
 use crate::learning_coordinator::{LearningCoordinator, LearningTrigger};
 use komo_core::domain::{
-    cancel::{CANCELLED_ERROR, CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
+    cancel::{CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
     checkpoint::CheckpointStore,
     events::{ToolEventSink, TurnEvent},
     hooks::{StepDecision, StepHook, TurnHook},
@@ -8,7 +8,8 @@ use komo_core::domain::{
     message::{Message, Role},
     repository::{MessageRepository, SessionEventRepository, SessionRepository},
     run::RecalledMemories,
-    run::{RUN_FIELD_CAP, Run, RunRepository, RunStatus, tool_digest, truncate},
+    run::{Run, RunRepository, tool_digest, truncate},
+    run_projection::{ProjectedRun, RunProjectionStore, project_runs},
     session::Session,
     session_event::{
         AssistantMessageEvent, MessageSource, SessionEvent, SessionEventKind, SurfacePlacement,
@@ -62,9 +63,12 @@ pub struct AgentRuntime {
     /// The session's authoritative event log. Everything a turn does is
     /// appended here; `messages` is one projection of it.
     pub events: Arc<dyn SessionEventRepository>,
-    /// Run ledger: every turn is recorded here, with one step per tool call
-    /// (captured by the tool executor). See `domain/run.rs`, roadmap §7.
+    /// Run ledger, for reading: the rows are a projection of the event log,
+    /// so nothing here writes a turn or a step. See `domain/run.rs`, roadmap §7.
     pub runs: Arc<dyn RunRepository>,
+    /// Where a turn's fold is committed as ledger rows — the one writer those
+    /// tables have.
+    pub projection: Arc<dyn RunProjectionStore>,
     /// Tool catalog the in-house loop dispatches against. komo (not rig) now
     /// owns the multi-step loop and hands each round of requested calls to the
     /// executor, which owns lookup/retry/ledger/cap. See `run_agent_loop`.
@@ -143,10 +147,6 @@ impl TurnRecorder for RunRecorder {
     }
 }
 
-fn now() -> i64 {
-    time::OffsetDateTime::now_utc().unix_timestamp()
-}
-
 impl AgentRuntime {
     pub async fn handle_input(
         &self,
@@ -203,10 +203,9 @@ impl AgentRuntime {
             return Ok(None);
         }
 
-        let mut run = Run::start(&original.session_id, &original.input);
-        run.resumed_from = Some(original.id.clone());
         let turn = self.run_ledgered(
-            run,
+            &original.session_id,
+            Run::new_id(),
             TurnKind::Resume {
                 events,
                 turn_id: original.id.clone(),
@@ -223,74 +222,39 @@ impl AgentRuntime {
         Ok(Some(reply))
     }
 
-    /// One turn = one [`Run`]. Opens a ledger entry, runs the turn body under a
-    /// `RunContext` (so tool calls record steps) and a `run` tracing span, then
-    /// finalizes the entry with the outcome. All ledger writes are best-effort:
-    /// a ledger failure is logged but never changes the turn's result.
+    /// One turn = one id, carried by every event the turn appends and by the
+    /// ledger row folded out of them. Runs the turn body under a `RunContext`
+    /// (which orders the turn's tool steps) and a `run` tracing span, then
+    /// settles the turn: project the ledger, then let the log do its upkeep.
     async fn run_turn(&self, session_id: &str, user_input: String) -> anyhow::Result<String> {
-        let run = Run::start(session_id, &user_input);
-        self.run_ledgered(run, TurnKind::Fresh { user_input }).await
+        self.run_ledgered(session_id, Run::new_id(), TurnKind::Fresh { user_input })
+            .await
     }
 
-    async fn run_ledgered(&self, mut run: Run, kind: TurnKind) -> anyhow::Result<String> {
-        let session_id = run.session_id.clone();
-        if let Err(error) = self.runs.start(&run).await {
-            warn!(%error, "failed to open run ledger entry (non-fatal)");
-        }
+    async fn run_ledgered(
+        &self,
+        session_id: &str,
+        turn_id: String,
+        kind: TurnKind,
+    ) -> anyhow::Result<String> {
+        let span = info_span!("run", run_id = %turn_id, session = %session_id);
+        let ctx = RunContext::new(turn_id.clone()).with_checkpoint(self.checkpoint.clone());
 
-        let span = info_span!("run", run_id = %run.id, session = %session_id);
-        let ctx = RunContext::new(run.id.clone(), self.runs.clone())
-            .with_checkpoint(self.checkpoint.clone());
-        // Keep a handle to read the tool-step count after the turn (the seq
-        // counter is shared via `Arc`, so this clone sees the final value).
-        let probe = ctx.clone();
+        let outcome = self.turn_body(session_id, kind, ctx).instrument(span).await;
 
-        let outcome = self
-            .turn_body(&session_id, kind, ctx)
-            .instrument(span)
-            .await;
-
-        run.plan = match probe.steps_count() {
-            0 => "respond".to_string(),
-            n => format!("{n} tool call(s)"),
-        };
-        run.ended_at = Some(now());
-        // What the turn's model round-trips cost. Only a completed turn reports
-        // it: a failure surfaces before the driver can be asked, and 0 already
-        // reads as unknown in the ledger.
-        if let Ok((_, usage, memories)) = &outcome {
-            run.tokens_in = usage.input;
-            run.tokens_out = usage.output;
-            run.tokens_cached = usage.cached_input;
-            // Which memories shaped the answer, recorded beside what it cost.
-            // The log's own copy is written inside the turn (`turn_body`).
-            run.memories = memories.clone();
-        }
+        // The turn's own account of itself is the log's, not this function's:
+        // every field the ledger row used to be assigned here — the reply, what
+        // it cost, which memories shaped it, how it ended — is already an event
+        // that `run_projection` folds. What is left is saying so out loud.
         let outcome = outcome.map(|(reply, _, _)| reply);
         match &outcome {
-            Ok(reply) => {
-                run.status = RunStatus::Done;
-                run.final_output = truncate(reply, RUN_FIELD_CAP);
-                info!(run_id = %run.id, "run done");
-            }
-            Err(error) if is_cancelled(error) => {
-                // Cancelled, not broken: a distinct ledger error so `run list`
-                // reads honestly, and deliberately *not* `recoverable` — there
-                // is nothing to resume, the user asked it to stop.
-                run.status = RunStatus::Failed;
-                run.error = CANCELLED_ERROR.to_string();
-                info!(run_id = %run.id, "run cancelled");
-            }
-            Err(error) => {
-                run.status = RunStatus::Failed;
-                run.error = truncate(&format!("{error:#}"), RUN_FIELD_CAP);
-                warn!(run_id = %run.id, %error, "run failed");
-            }
+            Ok(_) => info!(run_id = %turn_id, "run done"),
+            // Cancelled, not broken, and deliberately not resumable: there is
+            // nothing to resume, the user asked it to stop.
+            Err(error) if is_cancelled(error) => info!(run_id = %turn_id, "run cancelled"),
+            Err(error) => warn!(run_id = %turn_id, %error, "run failed"),
         }
-        if let Err(error) = self.runs.finish(&run).await {
-            warn!(%error, "failed to finalize run ledger entry (non-fatal)");
-        }
-        self.log_upkeep(&run.session_id).await;
+        self.settle_turn(session_id).await;
 
         // Learning, detached from the reply path and dispatched **after** the
         // ledger closed. It reads this run back as an episode — status, steps
@@ -300,7 +264,7 @@ impl AgentRuntime {
         // coordinator's knowledge; the runtime only reports that a run ended.
         if let Some(learning) = &self.learning {
             let learning = learning.clone();
-            let run_id = run.id.clone();
+            let run_id = turn_id.clone();
             tokio::spawn(async move {
                 match learning.run(LearningTrigger::AfterRun { run_id }).await {
                     Ok(report) if !report.is_empty() => {
@@ -354,22 +318,24 @@ impl AgentRuntime {
         let resume_entries = match kind {
             TurnKind::Fresh { user_input } => {
                 let user_msg = Message::user(&user_input);
-                self.record(
-                    session_id,
-                    vec![
-                        SessionEventKind::TurnStarted {
-                            turn_id: run.run_id.clone(),
-                            resumed_from: None,
-                        },
-                        SessionEventKind::UserMessage(UserMessageEvent {
-                            turn_id: run.run_id.clone(),
-                            content: user_input.clone(),
-                            source: MessageSource::User,
-                            surface: SurfacePlacement::append(),
-                        }),
-                    ],
-                )
-                .await;
+                let opening = self
+                    .record(
+                        session_id,
+                        vec![
+                            SessionEventKind::TurnStarted {
+                                turn_id: run.run_id.clone(),
+                                resumed_from: None,
+                            },
+                            SessionEventKind::UserMessage(UserMessageEvent {
+                                turn_id: run.run_id.clone(),
+                                content: user_input.clone(),
+                                source: MessageSource::User,
+                                surface: SurfacePlacement::append(),
+                            }),
+                        ],
+                    )
+                    .await;
+                self.open_in_ledger(session_id, &opening).await;
                 session.messages.push(user_msg);
                 None
             }
@@ -387,14 +353,16 @@ impl AgentRuntime {
                 // the one it picks up. Without this the log has no record that
                 // the attempt happened at all — the interrupted turn's events
                 // are all it would show.
-                self.record(
-                    session_id,
-                    vec![SessionEventKind::TurnStarted {
-                        turn_id: run.run_id.clone(),
-                        resumed_from: Some(turn_id.clone()),
-                    }],
-                )
-                .await;
+                let opening = self
+                    .record(
+                        session_id,
+                        vec![SessionEventKind::TurnStarted {
+                            turn_id: run.run_id.clone(),
+                            resumed_from: Some(turn_id.clone()),
+                        }],
+                    )
+                    .await;
+                self.open_in_ledger(session_id, &opening).await;
                 Some((events, turn_id))
             }
         };
@@ -509,18 +477,13 @@ impl AgentRuntime {
         // the *next* turn knows tools ran, what they found, and where an
         // over-limit output was kept. Without it the transcript carries only
         // user/assistant text: a follow-up question about something a tool just
-        // read has to re-run the tool or be answered from nothing. Read from the
-        // ledger (already redacted and truncated) rather than tracked separately,
-        // and best-effort like every other ledger interaction.
+        // read has to re-run the tool or be answered from nothing. Taken from
+        // the turn's own steps — already redacted and truncated to exactly what
+        // the log records — because the ledger's rows are a projection now and
+        // this turn's are not committed until it closes.
         let tool_note = match probe.steps_count() {
             0 => String::new(),
-            _ => match self.runs.steps(&probe.run_id).await {
-                Ok(steps) => tool_digest(&steps),
-                Err(error) => {
-                    warn!(%error, "failed to read run steps for the tool note (non-fatal)");
-                    String::new()
-                }
-            },
+            _ => tool_digest(&probe.steps()),
         };
 
         let assistant_msg = Message::assistant(&reply).with_tool_note(&tool_note);
@@ -555,11 +518,34 @@ impl AgentRuntime {
         Ok((reply, usage, memories))
     }
 
-    /// Append this turn's events, best-effort. A record that fails to land must
-    /// never fail the turn it describes.
-    async fn record(&self, session_id: &str, kinds: Vec<SessionEventKind>) {
-        if let Err(error) = self.events.append(session_id, kinds).await {
-            warn!(%error, "failed to append session events (non-fatal)");
+    /// Append this turn's events, best-effort, answering with them as the log
+    /// stamped them. A record that fails to land must never fail the turn it
+    /// describes — an empty answer is that failure.
+    async fn record(&self, session_id: &str, kinds: Vec<SessionEventKind>) -> Vec<SessionEvent> {
+        match self.events.append(session_id, kinds).await {
+            Ok(appended) => appended,
+            Err(error) => {
+                warn!(%error, "failed to append session events (non-fatal)");
+                Vec::new()
+            }
+        }
+    }
+
+    /// The turn's row, the moment the log says the turn exists.
+    ///
+    /// A crash leaves it `running`, which is exactly what the startup
+    /// reconciler looks for: an interrupted turn has to be in the ledger to be
+    /// listed, inspected or resumed, and after the flip to a projection nothing
+    /// else would put it there until the turn was over. Folded from the opening
+    /// events themselves — the only commit that needs no read of the log,
+    /// because its caller has just written everything the fold needs.
+    async fn open_in_ledger(&self, session_id: &str, opening: &[SessionEvent]) {
+        let Some(through) = opening.last().map(|event| event.seq) else {
+            return;
+        };
+        let runs = project_runs(session_id, opening);
+        if let Err(error) = self.projection.commit(session_id, &runs, through).await {
+            warn!(%error, "failed to open the turn in the ledger (non-fatal)");
         }
     }
 
@@ -568,7 +554,7 @@ impl AgentRuntime {
     /// survived — including the ways that end badly. A failed turn whose events
     /// were only buffered reads afterwards as a turn that never happened.
     async fn record_durable(&self, session_id: &str, kinds: Vec<SessionEventKind>) {
-        self.record(session_id, kinds).await;
+        let _ = self.record(session_id, kinds).await;
         if let Err(error) = self.events.durable_flush(session_id).await {
             warn!(%error, "failed to make a finished turn durable (non-fatal)");
             // The log still holds unwritten events, and its upkeep is defined
@@ -577,19 +563,34 @@ impl AgentRuntime {
         }
     }
 
-    /// Let the session's log do its own upkeep now that the turn is over and the
-    /// ledger has closed it.
+    /// Close the turn out: commit the ledger, then let the log do its upkeep.
     ///
-    /// Rolls a full segment, and cuts the log back toward its budget when that
-    /// roll put it over. **After `runs.finish`, not at the durable write**: the
-    /// turn that just ended is protected by being unlearned, and the ledger only
-    /// offers a *finished* run as unlearned — run any earlier and the newest
-    /// turn is invisible to the rule that exists to protect it.
-    async fn log_upkeep(&self, session_id: &str) {
+    /// **One read of the log serves both.** The fold *is* the ledger — the rows
+    /// `run list` and `skills audit` read are committed from it here — and the
+    /// same fold says which turns retention may not cut, so reading the log
+    /// twice per turn would be paying twice for one answer.
+    ///
+    /// Ordered after the turn's terminal event and before learning is
+    /// dispatched: an episode is assembled from these rows, and the retention
+    /// rule that protects the turn that just ended reads it as *unlearned*,
+    /// which it cannot be until it is a row at all.
+    async fn settle_turn(&self, session_id: &str) {
+        let events = match self.events.events(session_id).await {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(%error, "failed to read the session log to settle the turn (non-fatal)");
+                return;
+            }
+        };
+        let runs = project_runs(session_id, &events);
+        let through = events.last().map(|event| event.seq).unwrap_or(0);
+        if let Err(error) = self.projection.commit(session_id, &runs, through).await {
+            warn!(%error, "failed to project the run ledger (non-fatal)");
+        }
         match self.events.turn_boundary(session_id).await {
             // Only a roll can put the log over its budget, so the cut is
-            // considered only then — and its input costs a full read.
-            Ok(true) => self.retain(session_id).await,
+            // considered only then.
+            Ok(true) => self.retain(session_id, &runs).await,
             Ok(false) => {}
             Err(error) => warn!(%error, "session log upkeep failed at a turn boundary (non-fatal)"),
         }
@@ -598,18 +599,11 @@ impl AgentRuntime {
     /// Cut the session's log back toward its budget, keeping every turn that is
     /// still resumable or still unlearned.
     ///
-    /// Both are read off the log's own projection except `learned`, which is the
-    /// sweep's watermark and lives on the ledger row. A turn nobody has finished
-    /// with outranks the space it costs: finding no safe cut is a normal answer,
-    /// and leaves the session over budget.
-    async fn retain(&self, session_id: &str) {
-        let events = match self.events.events(session_id).await {
-            Ok(events) => events,
-            Err(error) => {
-                warn!(%error, "failed to read the session log for retention (non-fatal)");
-                return;
-            }
-        };
+    /// Takes the fold the caller already has: recoverable comes straight off it,
+    /// and `learned` is the sweep's watermark, read from the rows it advances. A
+    /// turn nobody has finished with outranks the space it costs: finding no
+    /// safe cut is a normal answer, and leaves the session over budget.
+    async fn retain(&self, session_id: &str, runs: &[ProjectedRun]) {
         let unlearned: std::collections::HashSet<String> = self
             .runs
             .unlearned(Some(session_id), RETENTION_LEDGER_SCAN)
@@ -618,8 +612,8 @@ impl AgentRuntime {
             .into_iter()
             .map(|run| run.id)
             .collect();
-        let keep_from = komo_core::domain::run_projection::project_runs(session_id, &events)
-            .into_iter()
+        let keep_from = runs
+            .iter()
             .filter(|projected| projected.run.recoverable || unlearned.contains(&projected.run.id))
             .map(|projected| projected.start_seq)
             .min()
@@ -979,6 +973,7 @@ mod tests {
     use crate::interaction::CancelState;
     use async_trait::async_trait;
     use komo_core::domain::{
+        cancel::CANCELLED_ERROR,
         llm::{LlmClient, Step, ToolCallReq, TurnDriver},
         message::Role,
         repository::SessionRepository,
@@ -1253,6 +1248,7 @@ mod tests {
             sessions: db.clone(),
             messages: db.clone(),
             events: db.clone(),
+            projection: db.clone(),
             runs: db.clone(),
             tool_executor: executor,
             max_turns,
@@ -1541,6 +1537,67 @@ mod tests {
         assert_ledger_matches_log(&db, "cli:s1").await;
     }
 
+    /// The turn has to be in the ledger *before* it ends, or a crash leaves
+    /// nothing for `run list` to show and nothing for `run resume` to pick up.
+    /// The rows are a projection now, and this is the one commit that happens
+    /// while the turn is still running.
+    #[tokio::test]
+    async fn a_turn_is_in_the_ledger_while_it_is_still_running() {
+        /// Reads the ledger from inside the turn that is writing it.
+        struct Peek(Arc<Db>, Arc<Mutex<Vec<Run>>>);
+        #[async_trait]
+        impl Tool for Peek {
+            fn name(&self) -> &'static str {
+                "peek"
+            }
+            fn description(&self) -> &'static str {
+                "reads the run ledger mid-turn"
+            }
+            async fn call(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &komo_core::domain::context::ToolContext,
+            ) -> Result<ToolOutput, ToolError> {
+                let runs = RunRepository::list(&*self.0, 10).await.unwrap();
+                *self.1.lock().unwrap() = runs;
+                Ok(ToolOutput::text("peeked"))
+            }
+        }
+
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_open_row.db"))
+                .await
+                .unwrap(),
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (rt, _) = scripted_runtime(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("peek", "{}")]),
+                Step::Final("done".into()),
+            ],
+            vec![Arc::new(Peek(db.clone(), seen.clone()))],
+            30,
+        );
+
+        rt.handle_input("cli:open", "go".into()).await.unwrap();
+
+        let mid_turn = seen.lock().unwrap().clone();
+        assert_eq!(mid_turn.len(), 1, "the open turn is already a row");
+        assert_eq!(mid_turn[0].input, "go");
+        assert_eq!(mid_turn[0].status, RunStatus::Running);
+        assert!(
+            mid_turn[0].recoverable,
+            "an unterminated turn is what a crash leaves behind, and it is resumable"
+        );
+        // And the finished turn overwrites it rather than adding a second row.
+        let runs = RunRepository::list(&*db, 10).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::Done);
+        assert!(!runs[0].recoverable);
+        assert_ledger_matches_log(&db, "cli:open").await;
+    }
+
     /// Assert the run ledger rows for `session_id` are exactly what folding its
     /// event log produces.
     ///
@@ -1585,20 +1642,12 @@ mod tests {
             assert_eq!(run.resumed_from, row.resumed_from);
             assert_eq!(run.memories, row.memories);
             assert_eq!(run.learned, row.learned, "watermark of {}", row.id);
-            // Not the same stamps: the row takes `now()` when the runtime opens
-            // and closes the turn, the fold takes the bracketing events' own
-            // timestamps, and each pair is separated by the append between them.
-            // That divergence *is* the double write, and it goes away with it —
-            // what has to agree is that the turn started, and whether it ended.
-            assert!(
-                (run.started_at - row.started_at).abs() <= 1,
-                "started_at of {}",
-                row.id
-            );
-            assert_eq!(run.ended_at.is_some(), row.ended_at.is_some());
-            if let (Some(folded_at), Some(row_at)) = (run.ended_at, row.ended_at) {
-                assert!((folded_at - row_at).abs() <= 1, "ended_at of {}", row.id);
-            }
+            // Exactly the same stamps, not merely close ones. They used to
+            // differ by the append between them, because the row took `now()`
+            // while the fold took the bracketing events' own timestamps — that
+            // divergence *was* the double write, and it went away with it.
+            assert_eq!(run.started_at, row.started_at, "started_at of {}", row.id);
+            assert_eq!(run.ended_at, row.ended_at, "ended_at of {}", row.id);
 
             // The rows are exactly the calls that *settled*. A call the turn
             // died inside has no row at all — the step is written at settle —
@@ -1640,7 +1689,7 @@ mod tests {
             &self,
             session_id: &str,
             kinds: Vec<SessionEventKind>,
-        ) -> anyhow::Result<Vec<u64>> {
+        ) -> anyhow::Result<Vec<SessionEvent>> {
             self.inner.append(session_id, kinds).await
         }
         async fn durable_flush(&self, session_id: &str) -> anyhow::Result<()> {
@@ -1877,6 +1926,7 @@ mod tests {
             sessions: db.clone(),
             messages: db.clone(),
             events: db.clone(),
+            projection: db.clone(),
             runs: db.clone(),
             tool_executor: ToolExecutor::new(
                 komo_services::tool_execution::ToolExecutionConfig::default(),
@@ -2413,23 +2463,37 @@ mod tests {
     /// the turn's recorded events. Returns the original run.
     async fn seed_interrupted(db: &Arc<Db>, session_id: &str, rounds: u32) -> Run {
         use komo_core::domain::session_event::{
-            AssistantRoundEvent, HeaderReason, RequestHeaderEvent,
+            AssistantRoundEvent, HeaderReason, MessageSource, RequestHeaderEvent, SurfacePlacement,
+            UserMessageEvent,
         };
         SessionRepository::save(&**db, &Session::new(session_id))
             .await
             .unwrap();
-        say(db, session_id, Message::user("do the thing")).await;
         let run = Run::start(session_id, "do the thing");
-        RunRepository::start(&**db, &run).await.unwrap();
-        let mut kinds = vec![SessionEventKind::RequestHeader(RequestHeaderEvent {
-            reason: HeaderReason::Initial,
-            provider: "anthropic".into(),
-            model: "claude-sonnet-4-6".into(),
-            effort: String::new(),
-            system: "You are komo.".into(),
-            tools: vec![],
-            extra: None,
-        })];
+        // The turn as the log holds it: it opened, it was asked, it got as far
+        // as `rounds` completions — and then the process died, so there is no
+        // terminal event. Its `turn/started` is what makes it a turn at all.
+        let mut kinds = vec![
+            SessionEventKind::TurnStarted {
+                turn_id: run.id.clone(),
+                resumed_from: None,
+            },
+            SessionEventKind::UserMessage(UserMessageEvent {
+                turn_id: run.id.clone(),
+                content: "do the thing".into(),
+                source: MessageSource::User,
+                surface: SurfacePlacement::append(),
+            }),
+            SessionEventKind::RequestHeader(RequestHeaderEvent {
+                reason: HeaderReason::Initial,
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                effort: String::new(),
+                system: "You are komo.".into(),
+                tools: vec![],
+                extra: None,
+            }),
+        ];
         for round in 0..rounds {
             kinds.push(SessionEventKind::AssistantRound(AssistantRoundEvent {
                 turn_id: run.id.clone(),
@@ -2447,6 +2511,20 @@ mod tests {
         SessionEventRepository::durable_flush(&**db, session_id)
             .await
             .unwrap();
+        // The row the interrupted turn left behind: opened and never closed,
+        // exactly as the runtime commits it when a turn starts.
+        let events = SessionEventRepository::events(&**db, session_id)
+            .await
+            .unwrap();
+        let folded = project_runs(session_id, &events);
+        RunProjectionStore::commit(
+            &**db,
+            session_id,
+            &folded,
+            events.last().map(|e| e.seq).unwrap(),
+        )
+        .await
+        .unwrap();
         run
     }
 
@@ -2466,6 +2544,7 @@ mod tests {
             sessions: db.clone(),
             messages: db.clone(),
             events: db.clone(),
+            projection: db.clone(),
             runs: db.clone(),
             tool_executor: ToolExecutor::new(
                 komo_services::tool_execution::ToolExecutionConfig::default(),
@@ -2484,8 +2563,9 @@ mod tests {
             .unwrap()
             .expect("this run is continuable");
         assert_eq!(reply, "resumed reply");
-        // The driver was reopened from the journal, not begun fresh.
-        assert_eq!(*resumed_entries.lock().unwrap(), Some(2));
+        // The driver was reopened from the log, not begun fresh: the turn's own
+        // events — the pair that opened it, plus the two rounds it got through.
+        assert_eq!(*resumed_entries.lock().unwrap(), Some(4));
 
         // The continuation appended exactly one assistant message — the
         // interrupted turn's own user message still opens the pair.
@@ -2552,9 +2632,14 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        // An interrupted run that never got a journal (pre-journal build, or
-        // the write failed) — the caller must fall back to the digest path.
-        let original = seed_interrupted(&db, "cli:rs3", 0).await;
+        // An interrupted run whose turn left no events at all (a pre-log
+        // build, or the appends failed) — the caller must fall back to the
+        // digest path. The conversation is there; the turn is not.
+        SessionRepository::save(&*db, &Session::new("cli:rs3"))
+            .await
+            .unwrap();
+        say(&db, "cli:rs3", Message::user("do the thing")).await;
+        let original = Run::start("cli:rs3", "do the thing");
         let (rt, _) = scripted_runtime(db.clone(), vec![], vec![], 30);
         let rt = AgentRuntime { ..rt };
         let outcome = rt.resume_interrupted(&original).await.unwrap();

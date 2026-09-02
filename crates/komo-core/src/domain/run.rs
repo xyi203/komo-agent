@@ -8,9 +8,18 @@
 //! kanban/memory files. Every ledger write is best-effort: it must never fail a
 //! turn or a tool call (same contract as memory `mark_used`).
 //!
-//! `recoverable` marks the resumable set (§6): set by `reconcile_interrupted`
-//! when a crash leaves a run mid-flight, cleared by `mark_resumed` once a
-//! resume turn has been dispatched — so `komo run resume` is at-most-once.
+//! **These are rows, not facts.** Every field here is folded out of the
+//! session event log by `domain::run_projection` and committed through
+//! `RunProjectionStore`; nothing writes a run or a step directly any more,
+//! because two authoritative records of one turn disagreed after exactly the
+//! crash they were meant to survive. What is left on the row is what the log
+//! cannot state: the `outcome` a later turn revised, the `learned` watermark,
+//! and the reconciler's ruling on whether an open turn is running or dead.
+//!
+//! `recoverable` marks the resumable set (§6): a turn with no terminal event
+//! that no continuation has claimed. The claim is the continuation's own
+//! `turn/started{resumed_from}`, so `komo run resume` is at-most-once by seq
+//! assignment rather than by a row update racing another reader.
 
 use async_trait::async_trait;
 
@@ -84,9 +93,9 @@ pub struct Run {
     /// Failure reason. Empty unless `status == Failed`.
     pub error: String,
     /// The run was interrupted mid-flight (process died) and can be resumed:
-    /// set by [`RunRepository::reconcile_interrupted`], cleared by
-    /// [`RunRepository::mark_resumed`]. Only interruption produces a resumable
-    /// run — an ordinary `Failed` has no half-done steps worth handing over.
+    /// no terminal event, and no continuation has claimed it. Only interruption
+    /// produces a resumable run — an ordinary `Failed` has no half-done steps
+    /// worth handing over.
     #[serde(default)]
     pub recoverable: bool,
     pub started_at: i64,
@@ -143,10 +152,17 @@ pub struct Run {
 }
 
 impl Run {
+    /// A fresh turn id: the `turn_id` its `turn/started` event carries, and the
+    /// id of the row projected from it. One id in two representations, so a
+    /// ledger row and the events it folds from can never drift apart.
+    pub fn new_id() -> String {
+        format!("run-{}", uuid::Uuid::now_v7())
+    }
+
     /// Open a new run for `session_id`, started now.
     pub fn start(session_id: &str, input: &str) -> Self {
         Self {
-            id: format!("run-{}", uuid::Uuid::now_v7()),
+            id: Self::new_id(),
             session_id: session_id.to_string(),
             input: truncate(input, RUN_FIELD_CAP),
             plan: String::new(),
@@ -408,12 +424,6 @@ pub fn tool_digest(steps: &[RunStep]) -> String {
 
 #[async_trait]
 pub trait RunRepository: Send + Sync {
-    /// Persist a freshly-opened run (status = running).
-    async fn start(&self, run: &Run) -> anyhow::Result<()>;
-    /// Append a tool step to a run.
-    async fn append_step(&self, step: &RunStep) -> anyhow::Result<()>;
-    /// Update the run's outcome (status / final_output / error / ended_at).
-    async fn finish(&self, run: &Run) -> anyhow::Result<()>;
     /// Most-recent runs first, capped at `limit`.
     async fn list(&self, limit: usize) -> anyhow::Result<Vec<Run>>;
     /// Fetch a single run by id.
@@ -431,11 +441,11 @@ pub trait RunRepository: Send + Sync {
     /// in flight, so any left over is the residue of a crashed earlier process —
     /// leaving it would make `run list` lie. The runs it marks are the set
     /// `resume` picks from (§6).
+    ///
+    /// The one ruling the log cannot make, which is why it stays a row update:
+    /// "open" and "dead" look identical in an append-only record, and only a
+    /// process that has just started knows nothing of its own is running.
     async fn reconcile_interrupted(&self, now: i64) -> anyhow::Result<usize>;
-
-    /// Clear a run's `recoverable` flag once a resume turn has been dispatched
-    /// for it, so the same interruption is never resumed twice.
-    async fn mark_resumed(&self, id: &str) -> anyhow::Result<()>;
 
     /// The most recent steps of one tool across all runs (newest first, capped
     /// at `limit`). Backs derived audit views — e.g. which turns loaded a given

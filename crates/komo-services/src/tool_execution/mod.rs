@@ -863,9 +863,11 @@ impl ToolExecutionCore {
                     })
                     .unwrap_or_default(),
             };
-            if let Err(error) = run.repo.append_step(&step).await {
-                warn!(%error, tool = name, "failed to record run step (non-fatal)");
-            }
+            // The turn's own copy, for the tool note its closing message
+            // carries. The ledger's step rows are a projection of the event
+            // below, committed when the turn closes — so there is nothing to
+            // read back from them while the turn is still running.
+            run.record_step(step.clone());
 
             // Settled, in the session's own log — **per call**, the moment it
             // settles. Not once per round: a round of three that crashes with
@@ -974,7 +976,6 @@ mod tests {
 
     use super::*;
     use async_trait::async_trait;
-    use komo_core::domain::run::{Run, RunRepository, RunStep};
     use komo_core::domain::tool::ToolOutput;
     use serde_json::Value;
 
@@ -988,88 +989,6 @@ mod tests {
     }
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Captures appended steps; everything else is inert. `fail_appends` makes
-    /// every ledger write fail, for the write-failure contract.
-    struct RecordingRuns {
-        steps: Mutex<Vec<RunStep>>,
-        fail_appends: bool,
-    }
-
-    impl RecordingRuns {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                steps: Mutex::new(Vec::new()),
-                fail_appends: false,
-            })
-        }
-    }
-
-    #[async_trait]
-    impl RunRepository for RecordingRuns {
-        async fn runs_using_memory(
-            &self,
-            _memory_id: &str,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<komo_core::domain::run::MemoryUse>> {
-            Ok(Vec::new())
-        }
-
-        async fn start(&self, _run: &Run) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn append_step(&self, step: &RunStep) -> anyhow::Result<()> {
-            if self.fail_appends {
-                anyhow::bail!("ledger unavailable");
-            }
-            self.steps.lock().unwrap().push(step.clone());
-            Ok(())
-        }
-        async fn finish(&self, _run: &Run) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn list(&self, _limit: usize) -> anyhow::Result<Vec<Run>> {
-            Ok(Vec::new())
-        }
-        async fn get(&self, _id: &str) -> anyhow::Result<Option<Run>> {
-            Ok(None)
-        }
-        async fn steps(&self, _run_id: &str) -> anyhow::Result<Vec<RunStep>> {
-            Ok(Vec::new())
-        }
-        async fn prune(&self, _cutoff: i64) -> anyhow::Result<usize> {
-            Ok(0)
-        }
-        async fn reconcile_interrupted(&self, _now: i64) -> anyhow::Result<usize> {
-            Ok(0)
-        }
-        async fn mark_resumed(&self, _id: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn steps_by_tool(
-            &self,
-            _tool_name: &str,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<RunStep>> {
-            Ok(Vec::new())
-        }
-        async fn unlearned(
-            &self,
-            _session_id: Option<&str>,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<Run>> {
-            Ok(Vec::new())
-        }
-        async fn mark_learned(&self, _run_ids: &[String]) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn set_outcome(&self, _run_id: &str, _outcome: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn previous_in_session(&self, _run_id: &str) -> anyhow::Result<Option<Run>> {
-            Ok(None)
-        }
-    }
 
     struct EchoTool;
     #[async_trait]
@@ -1275,10 +1194,10 @@ mod tests {
         }
     }
 
-    fn ledgered(repo: Arc<RecordingRuns>) -> ToolTurnContext {
+    fn ledgered() -> ToolTurnContext {
         ToolTurnContext {
             session: SessionContext::detached("cli:test"),
-            run: Some(RunContext::new("run-1".into(), repo)),
+            run: Some(RunContext::new("run-1".into())),
             budget: TurnResultBudget::unlimited(),
             spin: SpinDetector::default(),
         }
@@ -1442,12 +1361,13 @@ mod tests {
 
     #[tokio::test]
     async fn ledgered_call_records_one_step() {
-        let repo = RecordingRuns::new();
+        let context = ledgered();
+        let run = context.run.clone().unwrap();
         let executor = executor(vec![Arc::new(EchoTool)], ToolExecutionConfig::default());
-        let out = one(&executor, call("echo", "hi"), &ledgered(repo.clone())).await;
+        let out = one(&executor, call("echo", "hi"), &context).await;
         assert_eq!(out.content, "echoed: hi");
 
-        let steps = repo.steps.lock().unwrap();
+        let steps = run.steps();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].run_id, "run-1");
         assert_eq!(steps[0].seq, 0);
@@ -1479,21 +1399,17 @@ mod tests {
             }
         }
 
-        let repo = RecordingRuns::new();
+        let context = ledgered();
+        let run = context.run.clone().unwrap();
         let executor = executor(vec![Arc::new(FlakyWriter)], ToolExecutionConfig::default());
-        let out = one(
-            &executor,
-            call("flaky_write", "{}"),
-            &ledgered(repo.clone()),
-        )
-        .await;
+        let out = one(&executor, call("flaky_write", "{}"), &context).await;
         assert!(
             out.content.contains("may or may not have taken effect"),
             "got: {}",
             out.content
         );
 
-        let steps = repo.steps.lock().unwrap();
+        let steps = run.steps();
         assert!(!steps[0].ok);
         assert!(
             steps[0].uncertain,
@@ -1503,42 +1419,28 @@ mod tests {
 
     #[tokio::test]
     async fn redaction_happens_before_the_ledger() {
-        let repo = RecordingRuns::new();
+        let context = ledgered();
+        let run = context.run.clone().unwrap();
         let executor = executor(vec![Arc::new(SecretTool)], ToolExecutionConfig::default());
-        one(
-            &executor,
-            call("secretive", "token=hunter2"),
-            &ledgered(repo.clone()),
-        )
-        .await;
-        let steps = repo.steps.lock().unwrap();
+        one(&executor, call("secretive", "token=hunter2"), &context).await;
+        let steps = run.steps();
         assert_eq!(steps[0].args, "[redacted]");
         assert!(!steps[0].args.contains("hunter2"));
     }
 
     #[tokio::test]
-    async fn ledger_failure_never_changes_the_tool_result() {
-        let repo = Arc::new(RecordingRuns {
-            steps: Mutex::new(Vec::new()),
-            fail_appends: true,
-        });
-        let executor = executor(vec![Arc::new(EchoTool)], ToolExecutionConfig::default());
-        let out = one(&executor, call("echo", "hi"), &ledgered(repo)).await;
-        assert_eq!(out.content, "echoed: hi");
-    }
-
-    #[tokio::test]
     async fn panicking_tool_becomes_an_error_outcome_and_error_step() {
-        let repo = RecordingRuns::new();
+        let context = ledgered();
+        let run = context.run.clone().unwrap();
         let executor = executor(
             vec![Arc::new(PanickingTool)],
             ToolExecutionConfig::default(),
         );
-        let out = one(&executor, call("boom", "{}"), &ledgered(repo.clone())).await;
+        let out = one(&executor, call("boom", "{}"), &context).await;
         assert!(out.content.contains("panicked"), "got: {}", out.content);
         assert!(out.content.contains("kaboom"));
 
-        let steps = repo.steps.lock().unwrap();
+        let steps = run.steps();
         assert_eq!(steps.len(), 1);
         assert!(!steps[0].ok);
         assert!(steps[0].error.contains("panicked"));
@@ -1595,14 +1497,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn retry_collapses_into_a_single_ledger_step() {
-        let repo = RecordingRuns::new();
+        let context = ledgered();
+        let run = context.run.clone().unwrap();
         let (tool, calls) = flaky(1, "connection refused", false);
         let executor = executor(vec![tool], ToolExecutionConfig::default());
-        let out = one(&executor, call("flaky", "{}"), &ledgered(repo.clone())).await;
+        let out = one(&executor, call("flaky", "{}"), &context).await;
         assert_eq!(out.content, "ok");
         assert_eq!(calls.load(Ordering::Relaxed), 2);
 
-        let steps = repo.steps.lock().unwrap();
+        let steps = run.steps();
         assert_eq!(
             steps.len(),
             1,
@@ -1614,7 +1517,6 @@ mod tests {
 
     #[tokio::test]
     async fn budget_counts_logical_calls_and_refuses_past_the_cap() {
-        let repo = RecordingRuns::new();
         let (tool, calls) = flaky(0, "unused", false); // never fails; just counts
         let executor = executor(
             vec![tool],
@@ -1623,7 +1525,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let context = ledgered(repo.clone());
+        let context = ledgered();
+        let run = context.run.clone().unwrap();
         // Distinct arguments per call: this exercises the *budget*, and calls
         // that are byte-identical would be stopped earlier by the spin detector.
         for i in 0..5 {
@@ -1641,7 +1544,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 5);
 
         // The refusal is still recorded as a failed step, for audit visibility.
-        let steps = repo.steps.lock().unwrap();
+        let steps = run.steps();
         assert_eq!(steps.len(), 6);
         assert!(!steps.last().unwrap().ok);
         assert!(steps.last().unwrap().error.contains("budget"));
@@ -1680,15 +1583,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_structured_view_reaches_the_ledger_but_not_the_model() {
-        let repo = RecordingRuns::new();
+        let context = ledgered();
+        let run = context.run.clone().unwrap();
         let executor = executor(
             vec![Arc::new(StructuredTool)],
             ToolExecutionConfig::default(),
         );
-        let out = one(&executor, call("structured", "{}"), &ledgered(repo.clone())).await;
+        let out = one(&executor, call("structured", "{}"), &context).await;
 
         assert_eq!(out.content, "done", "the model sees text only");
-        let steps = repo.steps.lock().unwrap();
+        let steps = run.steps();
         assert_eq!(
             steps[0].structured,
             serde_json::json!({ "exit": 0, "truncated": false })
@@ -1738,35 +1642,36 @@ mod tests {
         }
 
         let attempts = Arc::new(AtomicUsize::new(0));
-        let repo = RecordingRuns::new();
         let executor = executor(
             vec![Arc::new(Claiming(attempts.clone()))],
             ToolExecutionConfig::default(),
         );
         let context = ToolTurnContext {
             session: SessionContext::detached("cli:test").with_cancel(Arc::new(AlreadyCancelled)),
-            run: Some(RunContext::new("run-1".into(), repo.clone())),
+            run: Some(RunContext::new("run-1".into())),
             budget: TurnResultBudget::unlimited(),
             spin: SpinDetector::default(),
         };
+        let run = context.run.clone().unwrap();
 
         let out = one(&executor, call("claiming", "{}"), &context).await;
         assert!(out.content.contains(CANCELLED_ERROR), "{}", out.content);
         assert_eq!(attempts.load(Ordering::Relaxed), 1, "a cancel is terminal");
-        let steps = repo.steps.lock().unwrap();
+        let steps = run.steps();
         assert!(!steps[0].ok);
         assert_eq!(steps[0].error, CANCELLED_ERROR);
     }
 
     #[tokio::test]
     async fn a_failed_call_records_no_structured_view() {
-        let repo = RecordingRuns::new();
+        let context = ledgered();
+        let run = context.run.clone().unwrap();
         let executor = executor(
             vec![Arc::new(PanickingTool)],
             ToolExecutionConfig::default(),
         );
-        one(&executor, call("boom", "{}"), &ledgered(repo.clone())).await;
-        let steps = repo.steps.lock().unwrap();
+        one(&executor, call("boom", "{}"), &context).await;
+        let steps = run.steps();
         assert!(!steps[0].ok);
         assert!(steps[0].structured.is_null());
     }
@@ -1811,7 +1716,8 @@ mod tests {
         let root = std::env::temp_dir().join("komo_exec_output_store");
         let _ = std::fs::remove_dir_all(&root);
         let store = Arc::new(crate::tool_output_store::ToolOutputStore::new(root.clone()));
-        let repo = RecordingRuns::new();
+        let context = ledgered();
+        let run = context.run.clone().unwrap();
         let mut executor = ToolExecutor::new(ToolExecutionConfig {
             max_result_bytes: 512,
             ..Default::default()
@@ -1819,11 +1725,11 @@ mod tests {
         .with_output_store(store);
         executor.register(Arc::new(Chatty));
 
-        let out = one(&executor, call("chatty", "{}"), &ledgered(repo.clone())).await;
+        let out = one(&executor, call("chatty", "{}"), &context).await;
         assert!(out.content.contains("line 0"));
         assert!(out.content.contains("line 399"), "the tail must survive");
 
-        let steps = repo.steps.lock().unwrap();
+        let steps = run.steps();
         let stored = &steps[0].output_paths[0];
         assert!(out.content.contains(stored), "the preview names the file");
         assert!(
@@ -2336,12 +2242,13 @@ mod tests {
     /// tool call to audit — the refusal lives in the transcript instead.
     #[tokio::test]
     async fn a_vetoed_call_records_no_ledger_step() {
-        let repo = RecordingRuns::new();
+        let context = ledgered();
+        let run = context.run.clone().unwrap();
         let hook = RecordingHook::new("gate", Some("refused"));
         let executor = hooked(vec![Arc::new(EchoTool)], vec![hook]);
 
-        one(&executor, call("echo", "hi"), &ledgered(repo.clone())).await;
-        assert!(repo.steps.lock().unwrap().is_empty());
+        one(&executor, call("echo", "hi"), &context).await;
+        assert!(run.steps().is_empty());
     }
 
     /// An unknown tool still reaches the hooks: a hook that maps a name onto

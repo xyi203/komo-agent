@@ -730,7 +730,7 @@ impl SessionEventRepository for Db {
         &self,
         session_id: &str,
         kinds: Vec<SessionEventKind>,
-    ) -> anyhow::Result<Vec<u64>> {
+    ) -> anyhow::Result<Vec<SessionEvent>> {
         // The header is only consulted when the log does not exist yet, so this
         // describes a session at its first event and never overwrites identity.
         let header = self.session_header(session_id).await;
@@ -1148,123 +1148,6 @@ impl BriefingMarkRepository for Db {
 
 #[async_trait]
 impl RunRepository for Db {
-    async fn start(&self, run: &Run) -> anyhow::Result<()> {
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            toasty::create!(RunRecord {
-                id: run.id.clone(),
-                session_id: run.session_id.clone(),
-                input: run.input.clone(),
-                plan: run.plan.clone(),
-                status: run.status.as_str().to_string(),
-                final_output: run.final_output.clone(),
-                error: run.error.clone(),
-                recoverable: run.recoverable,
-                started_at: run.started_at,
-                ended_at: run.ended_at.unwrap_or(0),
-                tokens_in: run.tokens_in,
-                tokens_out: run.tokens_out,
-                tokens_cached: run.tokens_cached,
-                resumed_from: run.resumed_from.clone().unwrap_or_default(),
-                memories: if run.memories.is_empty() {
-                    String::new()
-                } else {
-                    serde_json::to_string(&run.memories).unwrap_or_default()
-                },
-                // Explicit, so the column's backfill default never applies to a
-                // run the learning pass is meant to see.
-                learned: run.learned,
-                outcome: run.outcome.clone(),
-            })
-            .exec(&mut conn)
-            .await?;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn append_step(&self, step: &RunStep) -> anyhow::Result<()> {
-        // A round's tool calls run concurrently (`run_agent_loop`), so several
-        // steps of the same run can be appended at once — retry on MVCC conflict.
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            toasty::create!(RunStepRecord {
-                id: uuid::Uuid::now_v7().to_string(),
-                run_id: step.run_id.clone(),
-                seq: step.seq,
-                tool_name: step.tool_name.clone(),
-                args: step.args.clone(),
-                result: step.result.clone(),
-                error: step.error.clone(),
-                ok: step.ok,
-                uncertain: step.uncertain,
-                started_at: step.started_at,
-                ended_at: step.ended_at,
-                elapsed_ms: step.elapsed_ms,
-                // `Null` is "no structured view" — store it as the empty string
-                // rather than the four bytes of `null`, so the column reads the
-                // same for a tool without one and a row written before it existed.
-                structured: match &step.structured {
-                    serde_json::Value::Null => String::new(),
-                    value => value.to_string(),
-                },
-                output_paths: step.output_paths.join("\n"),
-            })
-            .exec(&mut conn)
-            .await?;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn finish(&self, run: &Run) -> anyhow::Result<()> {
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            let mut record = RunRecord::get_by_id(&mut conn, &run.id).await?;
-            record
-                .update()
-                .plan(run.plan.clone())
-                .status(run.status.as_str().to_string())
-                .final_output(run.final_output.clone())
-                .error(run.error.clone())
-                .ended_at(run.ended_at.unwrap_or(0))
-                .tokens_in(run.tokens_in)
-                .tokens_out(run.tokens_out)
-                .tokens_cached(run.tokens_cached)
-                // Written here, not at `start`: the enricher runs inside the
-                // turn, so at `start` there is nothing to record yet.
-                .memories(if run.memories.is_empty() {
-                    String::new()
-                } else {
-                    serde_json::to_string(&run.memories).unwrap_or_default()
-                })
-                .exec(&mut conn)
-                .await?;
-            // The reverse index, written from the same value and at the same
-            // moment, so the two can never disagree about what a turn used.
-            for (memory_id, pinned) in run
-                .memories
-                .pinned
-                .iter()
-                .map(|id| (id, true))
-                .chain(run.memories.recall.iter().map(|id| (id, false)))
-            {
-                toasty::create!(RunMemoryRecord {
-                    id: uuid::Uuid::now_v7().to_string(),
-                    memory_id: memory_id.clone(),
-                    run_id: run.id.clone(),
-                    session_id: run.session_id.clone(),
-                    pinned,
-                    started_at: run.started_at,
-                })
-                .exec(&mut conn)
-                .await?;
-            }
-            Ok(())
-        })
-        .await
-    }
-
     async fn list(&self, limit: usize) -> anyhow::Result<Vec<Run>> {
         let mut conn = self.inner.connection().await?;
         // Most-recent-first ordering and the cap are pushed down to SQL, so a
@@ -1393,16 +1276,6 @@ impl RunRepository for Db {
             }
             tx.commit().await?;
             Ok(reconciled)
-        })
-        .await
-    }
-
-    async fn mark_resumed(&self, id: &str) -> anyhow::Result<()> {
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            let mut record = RunRecord::get_by_id(&mut conn, id).await?;
-            record.update().recoverable(false).exec(&mut conn).await?;
-            Ok(())
         })
         .await
     }
@@ -1956,6 +1829,7 @@ mod tests {
     }
     use super::*;
     use komo_core::domain::reminder::ReminderStatus;
+    use komo_core::domain::run_projection::ProjectedStep;
 
     /// A komo home of this test's own, wiped first.
     ///
@@ -2140,9 +2014,8 @@ mod tests {
                 recall: vec!["mem-a".into()],
             },
         );
-        for run in [&older, &newer] {
-            RunRepository::start(&db, run).await.unwrap();
-            RunRepository::finish(&db, run).await.unwrap();
+        for (through, run) in [&older, &newer].into_iter().enumerate() {
+            commit_run(&db, run, &[], through as u64).await;
         }
 
         let uses = RunRepository::runs_using_memory(&db, "mem-a", 10)
@@ -2261,21 +2134,15 @@ mod tests {
             .await
             .unwrap();
 
-        // The real order, which is the whole point: a run is opened *before*
-        // the turn runs, so at `start` there is nothing to record — the
-        // enricher has not run yet. Recording only at `start` (as this first
-        // did) leaves the column empty forever in production while a
-        // storage-roundtrip test passes happily.
+        // Recall reaches the row from the turn's own `turn/memories` event, so
+        // the projection carries whatever the fold saw — including nothing.
         let mut run = Run::start("api:s", "why did you say that");
-        assert!(run.memories.is_empty());
-        RunRepository::start(&db, &run).await.unwrap();
-
         run.memories = RecalledMemories {
             pinned: vec!["mem-pinned".into()],
             recall: vec!["mem-a".into(), "mem-b".into()],
         };
         run.status = komo_core::domain::run::RunStatus::Done;
-        RunRepository::finish(&db, &run).await.unwrap();
+        commit_run(&db, &run, &[], 10).await;
 
         let back = RunRepository::get(&db, &run.id).await.unwrap().unwrap();
         assert_eq!(back.memories.pinned, ["mem-pinned"]);
@@ -2283,9 +2150,8 @@ mod tests {
 
         // A turn that used none records none.
         let mut plain = Run::start("api:s", "hi");
-        RunRepository::start(&db, &plain).await.unwrap();
         plain.status = komo_core::domain::run::RunStatus::Done;
-        RunRepository::finish(&db, &plain).await.unwrap();
+        commit_run(&db, &plain, &[], 11).await;
         assert!(
             RunRepository::get(&db, &plain.id)
                 .await
@@ -2304,7 +2170,7 @@ mod tests {
             .unwrap();
         let mut run = Run::start("cli:s", "continue");
         run.resumed_from = Some("run-original".to_string());
-        RunRepository::start(&db, &run).await.unwrap();
+        commit_run(&db, &run, &[], 0).await;
         let back = RunRepository::get(&db, &run.id).await.unwrap().unwrap();
         assert_eq!(back.resumed_from.as_deref(), Some("run-original"));
     }
@@ -2317,9 +2183,8 @@ mod tests {
             .unwrap();
 
         let mut run = Run::start("cli:session-1", "do the thing");
-        RunRepository::start(&db, &run).await.unwrap();
 
-        // Append two steps out of seq order; `steps` must return them sorted.
+        // Two steps out of seq order; `steps` must return them sorted.
         let step = |seq: i64, tool: &str, ok: bool| RunStep {
             run_id: run.id.clone(),
             seq,
@@ -2343,18 +2208,17 @@ mod tests {
                 Vec::new()
             },
         };
-        RunRepository::append_step(&db, &step(1, "time", true))
-            .await
-            .unwrap();
-        RunRepository::append_step(&db, &step(0, "shell", false))
-            .await
-            .unwrap();
-
         run.plan = "multistep:2".into();
         run.status = RunStatus::Done;
         run.final_output = "all done".into();
         run.ended_at = Some(999);
-        RunRepository::finish(&db, &run).await.unwrap();
+        commit_run(
+            &db,
+            &run,
+            &[step(1, "time", true), step(0, "shell", false)],
+            0,
+        )
+        .await;
 
         let got = RunRepository::get(&db, &run.id).await.unwrap().unwrap();
         assert_eq!(got.status, RunStatus::Done);
@@ -2409,29 +2273,27 @@ mod tests {
             learned: false,
             outcome: String::new(),
         };
-        for (id, t) in [("run-a", 100), ("run-b", 200), ("run-c", 300)] {
+        for (through, (id, t)) in [("run-a", 100), ("run-b", 200), ("run-c", 300)]
+            .into_iter()
+            .enumerate()
+        {
             let run = make(id, t);
-            RunRepository::start(&db, &run).await.unwrap();
-            RunRepository::append_step(
-                &db,
-                &RunStep {
-                    run_id: id.to_string(),
-                    seq: 0,
-                    tool_name: "time".into(),
-                    args: "{}".into(),
-                    result: "ok".into(),
-                    error: String::new(),
-                    ok: true,
-                    uncertain: false,
-                    started_at: t,
-                    ended_at: t + 1,
-                    elapsed_ms: 12,
-                    structured: serde_json::Value::Null,
-                    output_paths: Vec::new(),
-                },
-            )
-            .await
-            .unwrap();
+            let step = RunStep {
+                run_id: id.to_string(),
+                seq: 0,
+                tool_name: "time".into(),
+                args: "{}".into(),
+                result: "ok".into(),
+                error: String::new(),
+                ok: true,
+                uncertain: false,
+                started_at: t,
+                ended_at: t + 1,
+                elapsed_ms: 12,
+                structured: serde_json::Value::Null,
+                output_paths: Vec::new(),
+            };
+            commit_run(&db, &run, &[step], through as u64).await;
         }
 
         // Cutoff drops run-a (100) and run-b (200), keeps run-c (300).
@@ -2458,15 +2320,14 @@ mod tests {
 
         // A run left mid-flight (status stays `Running`, as on a crash).
         let stuck = Run::start("cli:crashed", "long task");
-        RunRepository::start(&db, &stuck).await.unwrap();
+        commit_run(&db, &stuck, &[], 0).await;
 
         // A run that finished cleanly before the restart — must be untouched.
         let mut done = Run::start("cli:ok", "quick task");
         done.status = RunStatus::Done;
         done.final_output = "reply".into();
         done.ended_at = Some(500);
-        RunRepository::start(&db, &done).await.unwrap();
-        RunRepository::finish(&db, &done).await.unwrap();
+        commit_run(&db, &done, &[], 0).await;
 
         let reconciled = RunRepository::reconcile_interrupted(&db, 1234)
             .await
@@ -2491,11 +2352,6 @@ mod tests {
                 .unwrap(),
             0
         );
-
-        // Resuming clears the flag, so a second resume finds nothing.
-        RunRepository::mark_resumed(&db, &stuck.id).await.unwrap();
-        let stuck = RunRepository::get(&db, &stuck.id).await.unwrap().unwrap();
-        assert!(!stuck.recoverable);
     }
 
     #[tokio::test]
@@ -3117,6 +2973,28 @@ mod tests {
             )
             .await
             .unwrap();
+            // And the settings row the projection keeps its watermark in.
+            conn.execute(
+                "CREATE TABLE \"setting_records\" (\
+                 \"id\" TEXT NOT NULL, \"value\" TEXT NOT NULL, PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
+            // The step table in its old shape too — the projection writes both,
+            // so a migrated file has to be writable in both.
+            conn.execute(
+                "CREATE TABLE \"run_step_records\" (\
+                 \"id\" TEXT NOT NULL, \"run_id\" TEXT NOT NULL, \
+                 \"seq\" BIGINT NOT NULL, \"tool_name\" TEXT NOT NULL, \
+                 \"args\" TEXT NOT NULL, \"result\" TEXT NOT NULL, \
+                 \"error\" TEXT NOT NULL, \"ok\" BOOLEAN NOT NULL, \
+                 \"started_at\" BIGINT NOT NULL, \"ended_at\" BIGINT NOT NULL, \
+                 PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
         }
         std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
 
@@ -3148,14 +3026,32 @@ mod tests {
         fresh.tokens_in = 900;
         fresh.tokens_out = 120;
         fresh.tokens_cached = 700;
-        RunRepository::start(&db, &fresh).await.unwrap();
         fresh.status = RunStatus::Done;
-        RunRepository::finish(&db, &fresh).await.unwrap();
+        let step = RunStep {
+            run_id: fresh.id.clone(),
+            seq: 0,
+            tool_name: "time".into(),
+            args: "{}".into(),
+            result: "09:00".into(),
+            error: String::new(),
+            ok: true,
+            uncertain: false,
+            started_at: 100,
+            ended_at: 101,
+            elapsed_ms: 12,
+            structured: serde_json::Value::Null,
+            output_paths: Vec::new(),
+        };
+        commit_run(&db, &fresh, &[step], 0).await;
         let stored = RunRepository::get(&db, &fresh.id).await.unwrap().unwrap();
         assert_eq!(
             (stored.tokens_in, stored.tokens_out, stored.tokens_cached),
             (900, 120, 700)
         );
+        // The step table's own added columns are writable on the same file.
+        let steps = RunRepository::steps(&db, &fresh.id).await.unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].elapsed_ms, 12);
     }
 
     /// The learning watermark: `unlearned` offers finished, not-yet-learned runs
@@ -3165,13 +3061,16 @@ mod tests {
     async fn unlearned_offers_finished_runs_until_they_are_marked() {
         let db = Db::connect(&sqlite_url("komo_unlearned.db")).await.unwrap();
 
+        // Committed newest-first, so the watermark cannot be the run's own
+        // start: it has to advance per commit or the older ones are skipped.
+        let through = std::cell::Cell::new(0u64);
         let save = async |id: &str, session: &str, status: RunStatus, at: i64| {
             let mut run = Run::start(session, "q");
             run.id = id.to_string();
             run.started_at = at;
-            RunRepository::start(&db, &run).await.unwrap();
             run.status = status;
-            RunRepository::finish(&db, &run).await.unwrap();
+            through.set(through.get() + 1);
+            commit_run(&db, &run, &[], through.get()).await;
         };
         // Inserted newest-first to prove the ordering is the query's, not the
         // insertion order's.
@@ -3213,7 +3112,7 @@ mod tests {
         // A run still in flight has no decided outcome and no complete step
         // list, so it is not an episode yet.
         let running = Run::start("cli:a", "in flight");
-        RunRepository::start(&db, &running).await.unwrap();
+        commit_run(&db, &running, &[], through.get() + 1).await;
         assert_eq!(
             ids(RunRepository::unlearned(&db, None, 10).await.unwrap()),
             ["run-b"]
@@ -3289,6 +3188,26 @@ mod tests {
             .await
             .unwrap();
         SessionEventRepository::durable_flush(db, session_id)
+            .await
+            .unwrap();
+    }
+
+    /// Write a run and its steps the only way anything writes them now: as a
+    /// committed projection. `through` is the watermark, which every commit for
+    /// one session has to advance.
+    async fn commit_run(db: &Db, run: &Run, steps: &[RunStep], through: u64) {
+        let projected = ProjectedRun {
+            run: run.clone(),
+            steps: steps
+                .iter()
+                .map(|step| ProjectedStep {
+                    step: step.clone(),
+                    settled: true,
+                })
+                .collect(),
+            start_seq: 0,
+        };
+        RunProjectionStore::commit(db, &run.session_id, &[projected], through)
             .await
             .unwrap();
     }

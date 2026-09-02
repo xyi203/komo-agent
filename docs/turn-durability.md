@@ -482,13 +482,22 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
 
 
 - state.db 的 Run/RunStep 表保留为查询索引，不再由 runtime 和 executor 直接作为事实源写入。
+  **已完成**：`RunRepository` 的 `start`/`append_step`/`finish`/`mark_resumed`
+  四个写入方法直接删掉，`Db` 上的实现也删了；写行的只剩
+  `RunProjectionStore::commit`。
 - projector 保存 `last_seq`，提交必须幂等；提供按单 session 和全量 rebuild。
-  **写入端已完成、尚未接线**：`RunProjectionStore::commit`（core 定义、`Db` 实现）
-  把一次 fold 幂等地 upsert 成 Run/RunStep/RunMemory 行，水位存在
-  `projection:runs:<session>`，推不动就整段跳过；`Db::rebuild_run_projection`
-  是无视水位的全量重建。行持有的两个字段按 merge 处理：`outcome` 根本不写，
-  `learned` 只增不减——重建不能把学过的 turn 送回 backlog。接线要等下面
-  第 1、4 两件事，否则 rebuild 会让 prune 掉的 run 复活。
+  **已完成**：`commit`（core 定义、`Db` 实现）把一次 fold 幂等地 upsert 成
+  Run/RunStep/RunMemory 行，水位存在 `projection:runs:<session>`，推不动就整段
+  跳过；`Db::rebuild_run_projection` 是无视水位的全量重建。行持有的三个字段按
+  merge 处理：`outcome` 根本不写，`learned` 只增不减，fold 说 running 而行已终止
+  时保留行的判决。
+- 一个 turn 提交**两次**：开场一次、收尾一次。开场那次只折自己刚写进日志的开场
+  事件（不用读日志），因为崩溃留下的 turn 必须已经是一行 `running`，否则
+  `run list` 看不到、`run resume` 找不到。收尾那次和 retention 的 floor 共用同一次
+  日志读取——fold 既是账本，也是「哪些 turn 不能切」的答案。
+- 代价记在这里：一次 turn 的 step 行现在到收尾才落地，长 turn 跑到一半
+  `komo run inspect` 看不到已经完成的调用（TUI 的实时输出不受影响）。
+  turn 内那份步骤由 `RunContext` 持有，收尾消息的 tool note 从它取。
 - `run list`、`run inspect`、`unlearned(None, 200)`、`skills audit`、`memory used` 全部继续走投影表。
 - `run prune` 的 tombstone 是 projection control state，不是 SessionEvent；prune 和投影删除保持
   一个 state.db 事务，不打开 N 个 session artifact。

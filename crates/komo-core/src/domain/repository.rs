@@ -103,12 +103,18 @@ pub trait MessageRepository: Send + Sync {
 /// only then acts.
 #[async_trait]
 pub trait SessionEventRepository: Send + Sync {
-    /// Assign and buffer a batch, returning the seqs it was given.
+    /// Assign and buffer a batch, returning the events as the log stamped them.
+    ///
+    /// The events rather than their seqs, because a caller that has just
+    /// written a turn's opening is the one caller that can fold it without
+    /// reading the log back — and folding it against a second guess at the
+    /// timestamp would put a different `started_at` in the ledger than the log
+    /// holds.
     async fn append(
         &self,
         session_id: &str,
         kinds: Vec<SessionEventKind>,
-    ) -> anyhow::Result<Vec<u64>>;
+    ) -> anyhow::Result<Vec<SessionEvent>>;
 
     /// Make everything buffered survive a crash. Reaches the filesystem's
     /// durability boundary — flushing a userspace buffer would make the

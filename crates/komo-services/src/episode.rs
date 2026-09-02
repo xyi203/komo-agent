@@ -73,15 +73,6 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        async fn start(&self, _run: &Run) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn append_step(&self, _step: &RunStep) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn finish(&self, _run: &Run) -> anyhow::Result<()> {
-            Ok(())
-        }
         async fn list(&self, _limit: usize) -> anyhow::Result<Vec<Run>> {
             Ok(Vec::new())
         }
@@ -90,9 +81,6 @@ mod tests {
         }
         async fn reconcile_interrupted(&self, _now: i64) -> anyhow::Result<usize> {
             Ok(0)
-        }
-        async fn mark_resumed(&self, _id: &str) -> anyhow::Result<()> {
-            Ok(())
         }
         async fn steps_by_tool(&self, _tool: &str, _limit: usize) -> anyhow::Result<Vec<RunStep>> {
             Ok(Vec::new())

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 pub use request::*;
 
-use crate::domain::run::{Run, RunRepository};
+use crate::domain::run::Run;
 use crate::infra::gateway_client::GatewayClient;
 use komo_config::RuntimeConfig;
 use komo_infra::persistence::{db::Db, kanban::KanbanDb};
@@ -158,13 +158,9 @@ impl OperatorControl {
                         let kanban = direct.kanban().await?.clone();
                         let session_id = run.session_id.clone();
                         let (reply, continued) = local_turn(db.clone(), kanban, run, input).await?;
-                        // Clear the flag only after a turn was actually
-                        // dispatched; best-effort, like every ledger write.
-                        if let Err(error) =
-                            RunRepository::mark_resumed(db.as_ref(), &target_id).await
-                        {
-                            eprintln!("warning: failed to clear the recoverable flag: {error:#}");
-                        }
+                        // Nothing to clear: the continuation's own
+                        // `turn/started{resumed_from}` claimed the turn it
+                        // picked up, and a claimed turn is no longer offered.
                         Ok(ResumeOutcome {
                             run_id: target_id,
                             session_id,
@@ -358,7 +354,21 @@ mod tests {
         let db = backend.db().await.unwrap().clone();
         let run = Run::start("cli:test", "hello");
         let run_id = run.id.clone();
-        RunRepository::start(db.as_ref(), &run).await.unwrap();
+        // The ledger's rows are a projection of the session log, so this is how
+        // a run gets into them.
+        let projected = komo_core::domain::run_projection::ProjectedRun {
+            run: run.clone(),
+            steps: Vec::new(),
+            start_seq: 0,
+        };
+        komo_core::domain::run_projection::RunProjectionStore::commit(
+            db.as_ref(),
+            &run.session_id,
+            &[projected],
+            0,
+        )
+        .await
+        .unwrap();
         let err = control
             .resume_run(Some(run_id.clone()), |_, _, _, _| async {
                 Ok((String::new(), false))
@@ -367,9 +377,8 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("is not recoverable"));
 
-        // Interrupt-reconcile it, then resume dispatches the local turn and
-        // clears the flag (at-most-once).
-        RunRepository::reconcile_interrupted(db.as_ref(), now())
+        // Interrupt-reconcile it, then resume dispatches the local turn.
+        komo_core::domain::run::RunRepository::reconcile_interrupted(db.as_ref(), now())
             .await
             .unwrap();
         let outcome = control
@@ -382,15 +391,10 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.run_id, run_id);
         assert_eq!(outcome.reply, "done");
-        let again = control
-            .resume_run(Some(run_id), |_, _, _, _| async {
-                Ok((String::new(), false))
-            })
-            .await
-            .unwrap_err();
-        assert!(
-            again.to_string().contains("is not recoverable"),
-            "resume clears the recoverable flag"
-        );
+        // At-most-once is the log's now, not a flag this function clears: a
+        // real continuation opens with `turn/started{resumed_from}`, and the
+        // projection stops offering a claimed turn (`run_projection`, plus the
+        // runtime's own resume test). The stub dispatch above continues
+        // nothing, so this run stays resumable — which is the honest answer.
     }
 }

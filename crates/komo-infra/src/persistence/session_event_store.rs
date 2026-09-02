@@ -162,7 +162,7 @@ impl SessionEventStore {
         session_id: &str,
         header: SessionHeader,
         kinds: Vec<SessionEventKind>,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Vec<SessionEvent>> {
         Ok(self
             .open(session_id, header)
             .await?
@@ -419,14 +419,20 @@ mod tests {
             Arc::ptr_eq(&a, &b),
             "a second open must not open a second writer"
         );
+        let seq_of =
+            |appended: Vec<SessionEvent>| appended.into_iter().map(|e| e.seq).collect::<Vec<_>>();
         assert_eq!(
-            a.append_batch(vec![said("t1", "x", MessageSource::User)])
-                .await,
+            seq_of(
+                a.append_batch(vec![said("t1", "x", MessageSource::User)])
+                    .await
+            ),
             vec![0]
         );
         assert_eq!(
-            b.append_batch(vec![said("t1", "y", MessageSource::User)])
-                .await,
+            seq_of(
+                b.append_batch(vec![said("t1", "y", MessageSource::User)])
+                    .await
+            ),
             vec![1]
         );
         let _ = std::fs::remove_dir_all(store.root().parent().unwrap());

@@ -1291,9 +1291,9 @@ async fn resume_run(
     claim.release();
     let (reply, continued) = resumed?;
 
-    if let Err(error) = state.actions.runs.mark_resumed(&id).await {
-        warn!(%error, run_id = %id, "failed to clear recoverable flag after resume");
-    }
+    // Nothing to clear: the continuation's own `turn/started{resumed_from}` is
+    // the claim on the turn it picked up, and the projection stops offering a
+    // claimed turn for resume.
     info!(run_id = %id, session = %run.session_id, continued, "run resumed");
     Ok(Json(ResumeOutcome {
         run_id: id,

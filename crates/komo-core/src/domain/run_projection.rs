@@ -240,9 +240,26 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
         .filter_map(|projected| projected.run.resumed_from.clone())
         .collect();
 
+    // A continuation appends no user message of its own — the question is the
+    // one the interrupted turn was already answering — so it inherits it. The
+    // row is what an operator reads in `run list`, and a turn there with no
+    // input reads as a turn about nothing.
+    let inherited: Vec<(String, String)> = runs
+        .iter()
+        .filter(|projected| projected.run.input.is_empty())
+        .filter_map(|projected| {
+            let from = projected.run.resumed_from.as_deref()?;
+            let parent = runs.iter().find(|other| other.run.id == from)?;
+            Some((projected.run.id.clone(), parent.run.input.clone()))
+        })
+        .collect();
+
     for projected in &mut runs {
         if claimed.contains(&projected.run.id) {
             projected.run.recoverable = false;
+        }
+        if let Some((_, input)) = inherited.iter().find(|(id, _)| *id == projected.run.id) {
+            projected.run.input = input.clone();
         }
         // The LLM owns tool dispatch, so the plan is a description of what the
         // turn turned out to do, not a decision made before it ran.
@@ -569,6 +586,10 @@ mod tests {
             "t2 has no terminal event of its own yet"
         );
         assert_eq!(runs[1].run.resumed_from.as_deref(), Some("t1"));
+        assert_eq!(
+            runs[1].run.input, "go",
+            "a continuation is answering the same question, and the row says so"
+        );
     }
 
     #[test]

@@ -10,8 +10,8 @@
 //! scope.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::domain::approval::{ApprovalRequest, Approver, Decision};
 use crate::domain::cancel::CancelSignal;
@@ -19,7 +19,7 @@ use crate::domain::events::ToolEventSink;
 use crate::domain::gateway::{InterjectSource, ReplySink};
 use crate::domain::policy::LOCAL_CHANNEL;
 use crate::domain::repository::SessionEventRepository;
-use crate::domain::run::RunRepository;
+use crate::domain::run::RunStep;
 use crate::domain::session::ChannelPeer;
 use crate::domain::session_event::{
     ApprovalRequestedEvent, ApprovalResolvedEvent, SessionEventKind,
@@ -305,7 +305,14 @@ impl ReplySink for NoopSink {
 #[derive(Clone)]
 pub struct RunContext {
     pub run_id: String,
-    pub repo: Arc<dyn RunRepository>,
+    /// The steps this turn has settled, shared across clones.
+    ///
+    /// The ledger's step *rows* are a projection of the log now, written when
+    /// the turn closes — so mid-turn there is nothing there to read back, and
+    /// the one reader inside the turn (the tool note its closing message
+    /// carries) keeps them here instead. Ephemeral: the durable record is the
+    /// `tool/call-settled` event these are built from.
+    steps: Arc<Mutex<Vec<RunStep>>>,
     /// Monotonic step counter, shared across clones so steps within a run get a
     /// stable order even when tool calls run concurrently.
     seq: Arc<AtomicI64>,
@@ -318,10 +325,10 @@ pub struct RunContext {
 }
 
 impl RunContext {
-    pub fn new(run_id: String, repo: Arc<dyn RunRepository>) -> Self {
+    pub fn new(run_id: String) -> Self {
         Self {
             run_id,
-            repo,
+            steps: Arc::new(Mutex::new(Vec::new())),
             seq: Arc::new(AtomicI64::new(0)),
             checkpoint: None,
         }
@@ -349,6 +356,19 @@ impl RunContext {
     /// How many tool steps have been claimed so far (the post-turn count).
     pub fn steps_count(&self) -> i64 {
         self.seq.load(Ordering::Relaxed)
+    }
+
+    /// Keep a settled step, as the log records it.
+    pub fn record_step(&self, step: RunStep) {
+        self.steps.lock().unwrap().push(step);
+    }
+
+    /// This turn's settled steps in claim order — calls run concurrently, so
+    /// they arrive in completion order and are sorted back here.
+    pub fn steps(&self) -> Vec<RunStep> {
+        let mut steps = self.steps.lock().unwrap().clone();
+        steps.sort_by_key(|step| step.seq);
+        steps
     }
 }
 
@@ -546,14 +566,22 @@ mod approval_gate_tests {
 
     #[async_trait::async_trait]
     impl SessionEventRepository for Recording {
-        async fn append(&self, _s: &str, kinds: Vec<SessionEventKind>) -> anyhow::Result<Vec<u64>> {
+        async fn append(
+            &self,
+            _s: &str,
+            kinds: Vec<SessionEventKind>,
+        ) -> anyhow::Result<Vec<SessionEvent>> {
             if self.fail_append {
                 anyhow::bail!("disk full");
             }
             let mut all = self.appended.lock().unwrap();
-            let seqs = (all.len() as u64..).take(kinds.len()).collect();
+            let appended = kinds
+                .iter()
+                .enumerate()
+                .map(|(i, kind)| SessionEvent::now((all.len() + i) as u64, kind.clone()))
+                .collect();
             all.extend(kinds);
-            Ok(seqs)
+            Ok(appended)
         }
         async fn durable_flush(&self, _s: &str) -> anyhow::Result<()> {
             *self.durable_calls.lock().unwrap() += 1;
