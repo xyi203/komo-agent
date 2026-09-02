@@ -38,7 +38,7 @@ use std::time::Duration;
 use komo_core::domain::llm::LlmClient;
 use komo_core::domain::memory::{
     EvidenceRelation, Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryRepository,
-    MemoryStatus, ScoredMemory, select_recall,
+    MemoryStatus, ScoredMemory, select_related,
 };
 use komo_core::domain::message::Message;
 use komo_core::domain::session::Session;
@@ -331,8 +331,10 @@ impl MemoryConsolidator {
         let query = self.query.build_query(&observation.content).await;
         // Belief-agnostic on purpose: a *contested* claim the user just settled,
         // or a superseded one they reverted to, is precisely what a new
-        // observation may be about.
-        select_recall(library, ctx, &query, self.config.related_limit, now)
+        // observation may be about. Rejected claims are included for the same
+        // reason — re-observing one is the user's "no" coming round again, and
+        // filing it as a fresh candidate is how a rejection gets forgotten.
+        select_related(library, ctx, &query, self.config.related_limit, now)
     }
 
     /// Ask the aux model how the observation relates to one of `related`.
@@ -607,6 +609,54 @@ mod tests {
         assert_eq!(written.support_count, 1, "founding evidence is recorded");
         assert_eq!(written.evidence[0].session, "s-1");
         assert!(written.evidence[0].excerpt.contains("prefers rebase"));
+    }
+
+    /// A claim the user rejected must not come back as a fresh candidate the
+    /// next time it is observed — that is how a rejection is forgotten, one
+    /// occasion at a time. The consolidator sees rejected claims; the prompt
+    /// still never does.
+    #[tokio::test]
+    async fn a_rejected_claim_is_recognised_rather_than_filed_again() {
+        let mut rejected = active("mem-1", "user prefers rebase before push");
+        rejected.status = MemoryStatus::Rejected;
+        let store = Arc::new(FakeStore::new(vec![rejected]));
+        let c = consolidator(
+            store.clone(),
+            Ok(r#"{"relation":"same","target":"mem-1"}"#.into()),
+        );
+
+        let out = c
+            .consolidate_all(
+                &ctx(),
+                "s-2",
+                vec![observation(
+                    "user rebases rather than merging before a push",
+                )],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out[0], Consolidated::Supported { id: "mem-1".into() });
+        assert_eq!(store.len(), 1, "no second memory was created");
+        let after = store.get("mem-1");
+        assert_eq!(
+            after.status,
+            MemoryStatus::Rejected,
+            "seeing it again is not a reason to un-reject it"
+        );
+        // And it stays out of every prompt: injection reads `select_recall`.
+        let query = komo_core::domain::memory::RecallQuery::lexical("rebase before push");
+        assert!(
+            komo_core::domain::memory::select_recall(
+                &store.list().await.unwrap(),
+                &ctx(),
+                &query,
+                5,
+                0
+            )
+            .is_empty(),
+            "a rejected claim is never recallable"
+        );
     }
 
     /// A restatement in different words adds support instead of a second memory —

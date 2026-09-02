@@ -934,12 +934,51 @@ pub fn select_recall(
     limit: usize,
     now: i64,
 ) -> Vec<ScoredMemory> {
+    select_matching(memories, ctx, query, limit, now, |status| {
+        matches!(status, MemoryStatus::Active | MemoryStatus::Candidate)
+    })
+}
+
+/// [`select_recall`], plus the claims the user has already **rejected**.
+///
+/// The memory consolidator's view, and only its: an observation that matches a
+/// rejected claim is the user's own "no" being re-observed, and writing it back
+/// as a fresh candidate is how a rejection is forgotten — the same claim would
+/// come back on the next occasion, and the one after that.
+///
+/// A rejected memory still never reaches a prompt: injection goes through
+/// [`select_recall`], and `dream_verdict` promotes nothing that is not a
+/// candidate, so the evidence this lets a rejection accumulate cannot revive
+/// it. Only a human `memory promote` can.
+pub fn select_related(
+    memories: &[Memory],
+    ctx: &MemoryContext,
+    query: &RecallQuery,
+    limit: usize,
+    now: i64,
+) -> Vec<ScoredMemory> {
+    select_matching(memories, ctx, query, limit, now, |status| {
+        matches!(
+            status,
+            MemoryStatus::Active | MemoryStatus::Candidate | MemoryStatus::Rejected
+        )
+    })
+}
+
+fn select_matching(
+    memories: &[Memory],
+    ctx: &MemoryContext,
+    query: &RecallQuery,
+    limit: usize,
+    now: i64,
+    admits: impl Fn(MemoryStatus) -> bool,
+) -> Vec<ScoredMemory> {
     if query.is_empty() {
         return Vec::new();
     }
     let mut scored: Vec<ScoredMemory> = memories
         .iter()
-        .filter(|m| matches!(m.status, MemoryStatus::Active | MemoryStatus::Candidate))
+        .filter(|m| admits(m.status))
         .filter(|m| ctx.allows(&m.scope))
         .filter_map(|m| {
             recall_score(m, query, now).map(|score| ScoredMemory {

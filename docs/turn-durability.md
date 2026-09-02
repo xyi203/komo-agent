@@ -570,7 +570,11 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
    post-run 触发本来就不会打到它（子 agent runtime `learns: false`），漏的是
    scheduled sweep——它扫的是全库 `unlearned`，父子两条都在里面。
 2. 等待 `claim_session` 的 ingress 也必须先登记 cancel ownership，Stop 同时覆盖运行中和排队中。
-3. consolidator 的关联检索能看到 `Rejected` memory，但 Rejected 仍不得进入自动注入。
+3. ~~consolidator 的关联检索能看到 `Rejected` memory~~ —— **已修**：新增
+   `select_related`（= `select_recall` + Rejected），只有 consolidator 用它；注入路径
+   仍走 `select_recall`，`dream_verdict` 也只晋升 candidate，所以被拒绝的 claim 能积累
+   证据但永远回不到 prompt。原来的行为是：用户拒过的说法下次再被观察到，会当成全新
+   candidate 重新落库——一次一个 occasion 地把拒绝忘掉。
 4. 第一批已记录 approval 生命周期；后续再给 `approval/resolved` 补最终放行层级、scope key 和
    等待时间，作为 run ledger projection 的审计字段。
 5. memory observation 增加 provenance class，防止 untrusted tool content 被当成用户事实晋升。

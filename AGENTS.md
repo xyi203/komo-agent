@@ -491,6 +491,12 @@ call the same functions, which is what keeps validation from forking.
   independence is **per session** (`record_evidence` drops a session it already
   counted), which is what stops one talkative conversation from corroborating
   itself; the list is capped at `EVIDENCE_CAP` while the counts keep rising.
+  Its related-claim lookup uses `select_related` — recall's set **plus rejected
+  claims** — because re-observing something the user rejected is that "no"
+  coming round again, and filing it as a fresh candidate is how a rejection is
+  forgotten. Injection still reads `select_recall`, and `dream_verdict` promotes
+  only candidates, so a rejected claim can accumulate evidence and still never
+  reach a prompt.
   Reviewer extractions are always `candidate`, never pinned/active.
   **Both read paths share `MemoryQueryService`** — automatic recall and the
   model's own `memory search` build the same hybrid query, so a memory the model
