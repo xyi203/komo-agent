@@ -1584,6 +1584,7 @@ mod tests {
             assert_eq!(run.tokens_cached, row.tokens_cached);
             assert_eq!(run.resumed_from, row.resumed_from);
             assert_eq!(run.memories, row.memories);
+            assert_eq!(run.learned, row.learned, "watermark of {}", row.id);
             // Not the same stamps: the row takes `now()` when the runtime opens
             // and closes the turn, the fold takes the bracketing events' own
             // timestamps, and each pair is separated by the append between them.
@@ -2605,6 +2606,7 @@ mod tests {
             scripted_runtime(db.clone(), vec![Step::Final("done".into())], Vec::new(), 30);
         rt.learning = Some(Arc::new(
             crate::learning_coordinator::LearningCoordinator::new(
+                db.clone(),
                 db.clone(),
                 db.clone(),
                 Arc::new(StatusSpy(seen.clone())),

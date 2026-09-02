@@ -369,12 +369,17 @@ call the same functions, which is what keeps validation from forking.
   (`grounded_rewrite`) that is handed the real body and returns the complete
   replacement; failing to ground drops the proposal rather than writing the
   blind one. New skills need no second pass.
-  **The watermark is `Run.learned`, per run** — not a per-session turn count: a
-  count says how many turns there were, never which ones were new. A run the
-  pass deliberately skips (cancelled turns, sweep sessions) is marked too, since
+  **The watermark is per run, not a per-session turn count**: a count says how
+  many turns there were, never which ones were new. It lives in the log as one
+  `learning/completed` / `learning/skipped(reason)` per turn, durably flushed
+  *before* `Run.learned` moves — the row is the index over those events, so a
+  row that read learned over a log that never said so would come back unlearned
+  the moment the ledger is rebuilt (`run_projection` folds it). A run the pass
+  deliberately skips (cancelled turns, sweep sessions) is marked too, since
   "considered and declined" and "not yet considered" have to be different states
-  or every sweep re-examines it forever. A *failed* pass marks nothing, so the
-  next sweep retries it.
+  or every sweep re-examines it forever. A *failed* pass — including one whose
+  watermark event could not be written — marks nothing, so the next sweep
+  retries it.
   **Learning is dispatched after `runs.finish`, never from inside the turn** —
   an episode assembled while its run is still open has no decided status, and
   `unlearned` would not offer it at all, so the turn would silently never be

@@ -459,9 +459,12 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
 
 1. `prune` 删掉的 run 会在 rebuild 时复活，需要 `run/pruned` 之类的墓碑。
 2. `outcome` 是可修订的，投影必须 merge 而不是覆盖。
-3. `learned` 目前没有任何人写 `learning/completed`/`skipped`；
-   coordinator 拿到事件依赖之前，它得继续留在行上——fold 恒返回 false
-   会让 sweep 永远重读每一个 run。
+3. ~~`learned` 没有任何人写 `learning/completed`/`skipped`~~ —— **已完成**：
+   `LearningCoordinator` 的 retire 现在逐 turn 写一条 completed 或
+   skipped(reason)，durable flush 之后才动 `Run.learned` 行；事件写不进去就整批
+   留在 backlog，因为行说 learned、日志没说，rebuild 之后这批会重新被抽取一遍。
+   三个 skip 理由（sweep session / cancelled turn / episode unavailable）是日志里
+   唯一能解释「为什么这一轮从没被学过」的记录。fold 见 `run_projection`。
 4. `reconcile_interrupted` / `mark_resumed` 变成「无终止事件」+ 一个认领事件；
    认领靠日志 seq 分配天然串行化，比现在的行更新更可靠。
 

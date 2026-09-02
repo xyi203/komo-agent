@@ -11,14 +11,10 @@
 //! So the rows become a query index over this fold. Nothing here reads the
 //! database, and the fold is total: an event log alone reproduces the ledger.
 //!
-//! Three fields are **not** produced here, and each for its own reason:
+//! Two fields are **not** produced here, and each for its own reason:
 //!
 //! - [`Run::outcome`] is revisable by what the user says in a *later* turn, so
 //!   it is row-held state merged over the projection, never derived from it.
-//! - [`Run::learned`] is the learning sweep's watermark. It will fold from
-//!   `learning/completed` / `learning/skipped` once the coordinator writes them;
-//!   until then it stays row-held, because a fold that always answered `false`
-//!   would offer every run to the sweep forever.
 //! - [`Run::recoverable`] folds as *interrupted*, which is not the same as the
 //!   reconciled row: a turn with no terminal event is either running right now
 //!   or died, and only the process can tell those apart. Translating one into
@@ -75,6 +71,20 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
     let mut replies: Vec<String> = Vec::new();
 
     for event in events {
+        // The learning watermark. Decided by the sweep after the turn is over,
+        // so it arrives past the run's terminal event and is not part of its
+        // work — but it is the same fact the row's `learned` flag held, and
+        // *skipped* has to advance it too, or a turn the sweep considered and
+        // declined is offered again forever.
+        if let SessionEventKind::LearningCompleted { turn_id }
+        | SessionEventKind::LearningSkipped { turn_id, .. } = &event.kind
+        {
+            if let Some(projected) = runs.iter_mut().find(|p| p.run.id == *turn_id) {
+                projected.run.learned = true;
+            }
+            continue;
+        }
+
         let Some(turn_id) = event.turn_id_of_work() else {
             continue;
         };
@@ -490,5 +500,59 @@ mod tests {
             call_started(1, 100, "ghost", "c1", "read"),
         ];
         assert!(project_runs("s1", &events).is_empty());
+    }
+
+    #[test]
+    fn the_learning_watermark_folds_from_either_verdict() {
+        // Both verdicts retire the turn. "Considered and declined" has to read
+        // as learned, or every sweep offers the same turn again forever.
+        for verdict in [
+            SessionEventKind::LearningCompleted {
+                turn_id: "t1".into(),
+            },
+            SessionEventKind::LearningSkipped {
+                turn_id: "t1".into(),
+                reason: "cancelled turn".into(),
+            },
+        ] {
+            let events = vec![
+                started(0, 100, "t1"),
+                ev(
+                    1,
+                    101,
+                    SessionEventKind::TurnCompleted {
+                        turn_id: "t1".into(),
+                    },
+                ),
+                ev(2, 102, verdict),
+            ];
+            assert!(project_runs("s1", &events)[0].run.learned);
+        }
+    }
+
+    #[test]
+    fn a_turn_nobody_has_learned_from_folds_unlearned() {
+        let events = vec![
+            started(0, 100, "t1"),
+            ev(
+                1,
+                101,
+                SessionEventKind::TurnCompleted {
+                    turn_id: "t1".into(),
+                },
+            ),
+            // Another turn's watermark says nothing about this one.
+            started(2, 102, "t2"),
+            ev(
+                3,
+                103,
+                SessionEventKind::LearningCompleted {
+                    turn_id: "t2".into(),
+                },
+            ),
+        ];
+        let runs = project_runs("s1", &events);
+        assert!(!runs[0].run.learned);
+        assert!(runs[1].run.learned);
     }
 }

@@ -26,10 +26,11 @@ use tracing::warn;
 use komo_core::domain::{
     episode::{AssessedEpisode, OutcomeAssessment},
     llm::LlmClient,
-    repository::SessionRepository,
+    repository::{SessionEventRepository, SessionRepository},
     reviewer::{ReviewOutcome, Reviewer},
     run::{Run, RunRepository},
     session::Session,
+    session_event::SessionEventKind,
 };
 use komo_services::episode::assemble;
 
@@ -113,6 +114,9 @@ impl LearningReport {
 pub struct LearningCoordinator {
     sessions: Arc<dyn SessionRepository>,
     runs: Arc<dyn RunRepository>,
+    /// Where the watermark actually lives: one `learning/completed` or
+    /// `learning/skipped` per turn this pass finished with.
+    events: Arc<dyn SessionEventRepository>,
     reviewer: Arc<dyn Reviewer>,
     /// Learn once a session has this many finished turns waiting.
     interval: usize,
@@ -127,12 +131,14 @@ impl LearningCoordinator {
     pub fn new(
         sessions: Arc<dyn SessionRepository>,
         runs: Arc<dyn RunRepository>,
+        events: Arc<dyn SessionEventRepository>,
         reviewer: Arc<dyn Reviewer>,
         interval: usize,
     ) -> Self {
         Self {
             sessions,
             runs,
+            events,
             reviewer,
             interval: interval.max(1),
             aux: None,
@@ -166,7 +172,11 @@ impl LearningCoordinator {
                 if exempt_from_learning(&self.sessions, &run.session_id).await {
                     // Retire it from the backlog rather than leaving it to be
                     // re-examined and re-declined by every future sweep.
-                    self.retire(&[run.id]).await;
+                    self.retire(
+                        &run.session_id,
+                        &[Retired::Skipped(run.id.clone(), SWEEP_SESSION)],
+                    )
+                    .await;
                     return Ok(report);
                 }
                 let pending = self
@@ -183,7 +193,8 @@ impl LearningCoordinator {
                 let pending = self.runs.unlearned(None, SWEEP_SCAN_CAP).await?;
                 for (session_id, runs) in group_by_session(pending) {
                     if exempt_from_learning(&self.sessions, &session_id).await {
-                        self.retire(&run_ids(&runs)).await;
+                        self.retire(&session_id, &skipped(&runs, SWEEP_SESSION))
+                            .await;
                         continue;
                     }
                     // Isolate per-session failures: one bad pass must not abort
@@ -292,17 +303,20 @@ impl LearningCoordinator {
         if batch.is_empty() {
             return Ok(());
         }
-        let ids = run_ids(&batch);
 
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut retired: Vec<Retired> = Vec::new();
         let mut episodes = Vec::new();
         for run in &batch {
             let Some(view) = assemble(&self.runs, &run.id).await? else {
+                retired.push(Retired::Skipped(run.id.clone(), NO_EPISODE));
                 continue;
             };
             if !view.learning_eligible() {
+                retired.push(Retired::Skipped(run.id.clone(), CANCELLED));
                 continue;
             }
+            retired.push(Retired::Learned(run.id.clone()));
             // The stored assessment, when there is one, may carry the user's
             // own verdict — the strongest evidence there is, and the only kind
             // that arrives after the turn it judges.
@@ -314,7 +328,7 @@ impl LearningCoordinator {
         }
         if episodes.is_empty() {
             // Nothing to extract from, but the batch was still examined.
-            self.retire(&ids).await;
+            self.retire(session_id, &retired).await;
             return Ok(());
         }
 
@@ -333,22 +347,77 @@ impl LearningCoordinator {
         let count = episodes.len();
         let outcome = self.reviewer.review(&session, &episodes).await?;
         report.absorb(&outcome, count);
-        self.retire(&ids).await;
+        self.retire(session_id, &retired).await;
         Ok(())
     }
 
-    /// Advance the watermark past `ids`. Best-effort: a failure only means those
-    /// runs are offered again, and the extractor's dedup guards make a re-read
-    /// harmless rather than wrong.
-    async fn retire(&self, ids: &[String]) {
-        if let Err(error) = self.runs.mark_learned(ids).await {
+    /// Advance the watermark past `retired` — the log first, then the row.
+    ///
+    /// The event is the watermark and the row is an index over it, so the order
+    /// is not a preference: a row that read `learned` over a log that never said
+    /// so would come back unlearned the moment the ledger is rebuilt from
+    /// events, and every sweep would re-extract the turn.
+    ///
+    /// Best-effort in both halves: a failure only means those runs are offered
+    /// again, and the extractor's dedup guards make a re-read harmless rather
+    /// than wrong.
+    async fn retire(&self, session_id: &str, retired: &[Retired]) {
+        if retired.is_empty() {
+            return;
+        }
+        let kinds = retired
+            .iter()
+            .map(|entry| match entry {
+                Retired::Learned(turn_id) => SessionEventKind::LearningCompleted {
+                    turn_id: turn_id.clone(),
+                },
+                Retired::Skipped(turn_id, reason) => SessionEventKind::LearningSkipped {
+                    turn_id: turn_id.clone(),
+                    reason: (*reason).to_string(),
+                },
+            })
+            .collect();
+        if let Err(error) = self.events.append(session_id, kinds).await {
+            warn!(%error, session = %session_id, "failed to record the learning watermark; the batch stays in the backlog");
+            return;
+        }
+        if let Err(error) = self.events.durable_flush(session_id).await {
+            warn!(%error, session = %session_id, "the learning watermark is not durable yet (non-fatal)");
+        }
+        let ids: Vec<String> = retired.iter().map(|e| e.turn_id().to_string()).collect();
+        if let Err(error) = self.runs.mark_learned(&ids).await {
             warn!(%error, "failed to advance the learning watermark");
         }
     }
 }
 
-fn run_ids(runs: &[Run]) -> Vec<String> {
-    runs.iter().map(|r| r.id.clone()).collect()
+/// Why a turn left the learning backlog. Both halves advance the watermark:
+/// "considered and declined" and "not yet considered" have to be different
+/// states, or every sweep re-examines the same turn forever.
+enum Retired {
+    Learned(String),
+    Skipped(String, &'static str),
+}
+
+impl Retired {
+    fn turn_id(&self) -> &str {
+        match self {
+            Retired::Learned(id) | Retired::Skipped(id, _) => id,
+        }
+    }
+}
+
+/// The reasons a turn is retired without being extracted from. Short and
+/// stable: they land in a durable log, where they are the only account of why
+/// a turn was never learned from.
+const SWEEP_SESSION: &str = "sweep session";
+const CANCELLED: &str = "cancelled turn";
+const NO_EPISODE: &str = "episode unavailable";
+
+fn skipped(runs: &[Run], reason: &'static str) -> Vec<Retired> {
+    runs.iter()
+        .map(|r| Retired::Skipped(r.id.clone(), reason))
+        .collect()
 }
 
 /// Group runs by session, preserving the oldest-first order within each session
@@ -641,12 +710,111 @@ mod tests {
         run(id, session, RunStatus::Done, "")
     }
 
+    /// A session log that keeps only what a learning pass writes to it.
+    struct FakeEvents {
+        appended: Mutex<Vec<SessionEventKind>>,
+        flushes: AtomicUsize,
+        fail_append: bool,
+    }
+
+    impl FakeEvents {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                appended: Mutex::new(Vec::new()),
+                flushes: AtomicUsize::new(0),
+                fail_append: false,
+            })
+        }
+
+        fn offline() -> Arc<Self> {
+            Arc::new(Self {
+                appended: Mutex::new(Vec::new()),
+                flushes: AtomicUsize::new(0),
+                fail_append: true,
+            })
+        }
+
+        /// The watermark as `(turn id, skip reason)` pairs, in write order.
+        fn watermarks(&self) -> Vec<(String, Option<String>)> {
+            self.appended
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|kind| match kind {
+                    SessionEventKind::LearningCompleted { turn_id } => {
+                        Some((turn_id.clone(), None))
+                    }
+                    SessionEventKind::LearningSkipped { turn_id, reason } => {
+                        Some((turn_id.clone(), Some(reason.clone())))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl SessionEventRepository for FakeEvents {
+        async fn append(
+            &self,
+            _session_id: &str,
+            kinds: Vec<SessionEventKind>,
+        ) -> anyhow::Result<Vec<u64>> {
+            if self.fail_append {
+                anyhow::bail!("log offline");
+            }
+            let mut appended = self.appended.lock().unwrap();
+            let first = appended.len() as u64;
+            let seqs = (first..first + kinds.len() as u64).collect();
+            appended.extend(kinds);
+            Ok(seqs)
+        }
+        async fn durable_flush(&self, _session_id: &str) -> anyhow::Result<()> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        async fn events(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Vec<komo_core::domain::session_event::SessionEvent>> {
+            Ok(Vec::new())
+        }
+        async fn turn_boundary(&self, _session_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn retain(&self, _session_id: &str, _keep_from: u64) -> anyhow::Result<Option<u64>> {
+            Ok(None)
+        }
+    }
+
     fn coordinator(
         runs: Arc<FakeRuns>,
         reviewer: Arc<RecordingReviewer>,
         interval: usize,
     ) -> LearningCoordinator {
-        LearningCoordinator::new(FakeSessions::new(), runs, reviewer, interval)
+        LearningCoordinator::new(
+            FakeSessions::new(),
+            runs,
+            FakeEvents::new(),
+            reviewer,
+            interval,
+        )
+    }
+
+    fn coordinator_logging(
+        runs: Arc<FakeRuns>,
+        reviewer: Arc<RecordingReviewer>,
+        interval: usize,
+        events: Arc<FakeEvents>,
+        sweeps: Vec<&str>,
+    ) -> LearningCoordinator {
+        LearningCoordinator::new(
+            FakeSessions::with_sweeps(sweeps),
+            runs,
+            events,
+            reviewer,
+            interval,
+        )
     }
 
     fn coordinator_with_sweeps(
@@ -655,7 +823,13 @@ mod tests {
         interval: usize,
         sweeps: Vec<&str>,
     ) -> LearningCoordinator {
-        LearningCoordinator::new(FakeSessions::with_sweeps(sweeps), runs, reviewer, interval)
+        LearningCoordinator::new(
+            FakeSessions::with_sweeps(sweeps),
+            runs,
+            FakeEvents::new(),
+            reviewer,
+            interval,
+        )
     }
 
     #[tokio::test]
@@ -750,6 +924,105 @@ mod tests {
 
         assert!(reviewer.calls.lock().unwrap().is_empty());
         assert_eq!(runs.marked.lock().unwrap().len(), 2);
+    }
+
+    /// The watermark is a durable event now; the row is the index over it. A
+    /// pass has to say *per turn* which of the two things happened to it, or a
+    /// rebuilt ledger cannot tell a turn it learned from apart from one it
+    /// declined.
+    #[tokio::test]
+    async fn each_retired_turn_leaves_its_own_watermark_event() {
+        let runs = FakeRuns::new(vec![
+            run("run-1", "cli:s", RunStatus::Failed, CANCELLED_ERROR),
+            done("run-2", "cli:s"),
+        ]);
+        let reviewer = Arc::new(RecordingReviewer::default());
+        let events = FakeEvents::new();
+        let c = coordinator_logging(
+            runs.clone(),
+            reviewer.clone(),
+            2,
+            events.clone(),
+            Vec::new(),
+        );
+
+        c.run(LearningTrigger::AfterRun {
+            run_id: "run-2".into(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            events.watermarks(),
+            vec![
+                ("run-1".to_string(), Some(CANCELLED.to_string())),
+                ("run-2".to_string(), None),
+            ],
+            "the cancelled turn is skipped with a reason; the extracted one completes"
+        );
+        assert!(
+            events.flushes.load(Ordering::Relaxed) > 0,
+            "the watermark has to survive a crash, or the batch is learned twice"
+        );
+    }
+
+    /// An exempt session is examined and declined, and the log has to say so —
+    /// otherwise a rebuilt ledger offers every sweep turn to the extractor.
+    #[tokio::test]
+    async fn a_sweep_session_is_skipped_with_its_reason() {
+        let runs = FakeRuns::new(vec![done("run-1", "sweep-a")]);
+        let reviewer = Arc::new(RecordingReviewer::default());
+        let events = FakeEvents::new();
+        let c = coordinator_logging(
+            runs.clone(),
+            reviewer.clone(),
+            1,
+            events.clone(),
+            vec!["sweep-a"],
+        );
+
+        c.run(LearningTrigger::AfterRun {
+            run_id: "run-1".into(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            events.watermarks(),
+            vec![("run-1".to_string(), Some(SWEEP_SESSION.to_string()))]
+        );
+    }
+
+    /// The log leads the row. If the event cannot be written the turn stays in
+    /// the backlog: a row that reads `learned` over a log that never said so
+    /// comes back unlearned the moment the ledger is rebuilt from events.
+    #[tokio::test]
+    async fn a_log_that_cannot_record_the_watermark_keeps_the_batch_pending() {
+        let runs = FakeRuns::new(vec![done("run-1", "cli:s"), done("run-2", "cli:s")]);
+        let reviewer = Arc::new(RecordingReviewer::default());
+        let c = coordinator_logging(
+            runs.clone(),
+            reviewer.clone(),
+            2,
+            FakeEvents::offline(),
+            Vec::new(),
+        );
+
+        c.run(LearningTrigger::AfterRun {
+            run_id: "run-2".into(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reviewer.calls.lock().unwrap().len(),
+            1,
+            "the pass still ran — only the watermark failed"
+        );
+        assert!(
+            runs.marked.lock().unwrap().is_empty(),
+            "the row must not advance past a watermark the log does not hold"
+        );
     }
 
     #[tokio::test]
@@ -917,7 +1190,7 @@ mod tests {
             },
             ..Default::default()
         });
-        let c = LearningCoordinator::new(FakeSessions::new(), runs, reviewer, 1);
+        let c = LearningCoordinator::new(FakeSessions::new(), runs, FakeEvents::new(), reviewer, 1);
 
         let report = c.run(LearningTrigger::Scheduled).await.unwrap();
 
@@ -1004,6 +1277,7 @@ mod tests {
         LearningCoordinator::new(
             FakeSessions::new(),
             runs,
+            FakeEvents::new(),
             Arc::new(RecordingReviewer::default()),
             10,
         )
@@ -1148,8 +1422,14 @@ mod tests {
     async fn learning_reads_the_stored_outcome_rather_than_recomputing_it() {
         let runs = feedback_pair("可以了");
         let reviewer = Arc::new(RecordingReviewer::default());
-        let c = LearningCoordinator::new(FakeSessions::new(), runs.clone(), reviewer.clone(), 2)
-            .with_feedback(Arc::new(VerdictLlm("SUCCESS")));
+        let c = LearningCoordinator::new(
+            FakeSessions::new(),
+            runs.clone(),
+            FakeEvents::new(),
+            reviewer.clone(),
+            2,
+        )
+        .with_feedback(Arc::new(VerdictLlm("SUCCESS")));
 
         c.run(LearningTrigger::AfterRun {
             run_id: "run-2".into(),

@@ -564,6 +564,7 @@ pub async fn build(
         LearningCoordinator::new(
             db.clone(),
             db.clone(),
+            db.clone(),
             reviewer,
             config.runtime.review_interval,
         )
