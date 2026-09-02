@@ -257,17 +257,8 @@ impl AgentRuntime {
             run.tokens_out = usage.output;
             run.tokens_cached = usage.cached_input;
             // Which memories shaped the answer, recorded beside what it cost.
+            // The log's own copy is written inside the turn (`turn_body`).
             run.memories = memories.clone();
-            if !memories.is_empty() {
-                self.record(
-                    &run.session_id,
-                    vec![SessionEventKind::TurnMemories {
-                        turn_id: run.id.clone(),
-                        memories: memories.clone(),
-                    }],
-                )
-                .await;
-            }
         }
         let outcome = outcome.map(|(reply, _, _)| reply);
         match &outcome {
@@ -526,21 +517,26 @@ impl AgentRuntime {
         };
 
         let assistant_msg = Message::assistant(&reply).with_tool_note(&tool_note);
-        self.record_durable(
-            session_id,
-            vec![
-                SessionEventKind::AssistantMessage(AssistantMessageEvent {
-                    turn_id: probe.run_id.clone(),
-                    content: reply.clone(),
-                    tool_note,
-                    surface: SurfacePlacement::append(),
-                }),
-                SessionEventKind::TurnCompleted {
-                    turn_id: probe.run_id.clone(),
-                },
-            ],
-        )
-        .await;
+        let mut closing = vec![SessionEventKind::AssistantMessage(AssistantMessageEvent {
+            turn_id: probe.run_id.clone(),
+            content: reply.clone(),
+            tool_note,
+            surface: SurfacePlacement::append(),
+        })];
+        // Which memories shaped this answer. Inside the turn's own closing batch
+        // rather than after it: `turn/completed` is what ends a turn, and a
+        // segment is sealed on that boundary, so an event recorded past it would
+        // land in the next segment and outlive the turn it describes.
+        if !memories.is_empty() {
+            closing.push(SessionEventKind::TurnMemories {
+                turn_id: probe.run_id.clone(),
+                memories: memories.clone(),
+            });
+        }
+        closing.push(SessionEventKind::TurnCompleted {
+            turn_id: probe.run_id.clone(),
+        });
+        self.record_durable(session_id, closing).await;
         session.messages.push(assistant_msg);
 
         // Lifecycle hooks: the turn delivered. Failed/cancelled turns never
@@ -568,6 +564,12 @@ impl AgentRuntime {
         self.record(session_id, kinds).await;
         if let Err(error) = self.events.durable_flush(session_id).await {
             warn!(%error, "failed to make a finished turn durable (non-fatal)");
+            // The log still holds unwritten events, and its upkeep is defined
+            // over what has landed. Skipped rather than attempted and refused.
+            return;
+        }
+        if let Err(error) = self.events.turn_boundary(session_id).await {
+            warn!(%error, "session log upkeep failed at a turn boundary (non-fatal)");
         }
     }
 
@@ -1561,6 +1563,46 @@ mod tests {
                 assert_eq!(folded.output_paths, row.output_paths);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_grew_the_log_past_a_segment_seals_it_on_its_way_out() {
+        // Segments are retention's unit of deletion, so one may only be cut
+        // where a turn ended. Nothing sealed them at all until this seam
+        // existed, which left every session as one file that grows forever and
+        // gave retention no candidate to ever consider.
+        let home = std::env::temp_dir().join("komo-test-komo_rt_seal");
+        let db = Arc::new(Db::connect(&sqlite_url("komo_rt_seal")).await.unwrap());
+        let (rt, _) = scripted_runtime(db.clone(), vec![Step::Final("ok".into())], vec![], 30);
+
+        // One turn whose own user message is bigger than a segment.
+        let big = "x".repeat(1024 * 1024 + 1024);
+        rt.handle_input("cli:s-seal", big).await.unwrap();
+
+        // The directory name is an encoding of the session id, so the segment
+        // is found by walking rather than by rebuilding that encoding here.
+        let sessions = std::fs::read_dir(home.join("sessions"))
+            .expect("the session log directory")
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert_eq!(sessions.len(), 1);
+        let segments = std::fs::read_dir(sessions[0].path())
+            .expect("segments")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".jsonl"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            segments.contains("000001.jsonl"),
+            "the turn boundary should have opened a second segment, found {segments:?}"
+        );
+        // And the log still reads as one conversation across the two files.
+        let session = SessionRepository::find(&*db, "cli:s-seal")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[1].content, "ok");
     }
 
     #[tokio::test]

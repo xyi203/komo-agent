@@ -108,6 +108,18 @@ impl SessionEventStore {
     /// Append a batch to a session that is already open, returning the assigned
     /// seqs. The batch is buffered; a caller that needs it to have survived a
     /// crash calls [`SessionLog::durable_flush`] before the effect it describes.
+    /// Roll the session's active segment if it has grown past its target.
+    ///
+    /// Returns whether a segment was sealed — the only moment the log's retained
+    /// size can cross its budget, and so the only moment retention has anything
+    /// new to consider.
+    pub async fn seal(&self, session_id: &str) -> Result<bool> {
+        match self.existing(session_id).await? {
+            Some(log) => log.seal_if_full().await,
+            None => Ok(false),
+        }
+    }
+
     pub async fn append(
         &self,
         session_id: &str,

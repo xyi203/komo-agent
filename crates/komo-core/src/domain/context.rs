@@ -565,6 +565,10 @@ mod approval_gate_tests {
         async fn events(&self, _s: &str) -> anyhow::Result<Vec<SessionEvent>> {
             Ok(Vec::new())
         }
+
+        async fn turn_boundary(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     struct Fixed(Decision);

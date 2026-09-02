@@ -117,6 +117,15 @@ pub trait SessionEventRepository: Send + Sync {
 
     /// The session's events, oldest first. Empty for a session with no log.
     async fn events(&self, session_id: &str) -> anyhow::Result<Vec<SessionEvent>>;
+
+    /// A completed turn just became durable — a safe point for the log to do its
+    /// own upkeep.
+    ///
+    /// Called here and nowhere else because a turn boundary is the only place
+    /// the log may cut itself: its unit of deletion has to hold whole turns, or
+    /// the recoverable half of a turn becomes unsplittable from the deletable
+    /// one. Best-effort — the turn is already over and nothing here may fail it.
+    async fn turn_boundary(&self, session_id: &str) -> anyhow::Result<()>;
 }
 
 #[async_trait]
