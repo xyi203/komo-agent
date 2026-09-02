@@ -26,6 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::message::{Message, Role};
+use super::run::RecalledMemories;
 use time::OffsetDateTime;
 
 /// Bumped when an event's envelope or an existing payload changes shape in a
@@ -121,10 +122,11 @@ impl SessionEvent {
             SessionEventKind::ToolCallSettled(c) => Some(c.turn_id.as_str()),
             SessionEventKind::ApprovalRequested(a) => Some(a.turn_id.as_str()),
             SessionEventKind::ApprovalResolved(a) => Some(a.turn_id.as_str()),
-            SessionEventKind::TurnStarted { turn_id }
+            SessionEventKind::TurnStarted { turn_id, .. }
             | SessionEventKind::TurnCompleted { turn_id }
             | SessionEventKind::TurnFailed { turn_id, .. }
-            | SessionEventKind::TurnCancelled { turn_id, .. } => Some(turn_id.as_str()),
+            | SessionEventKind::TurnCancelled { turn_id, .. }
+            | SessionEventKind::TurnMemories { turn_id, .. } => Some(turn_id.as_str()),
             _ => None,
         }
     }
@@ -159,7 +161,14 @@ pub enum SessionEventKind {
     SessionModelChanged { model: String, effort: String },
 
     #[serde(rename = "turn/started")]
-    TurnStarted { turn_id: String },
+    TurnStarted {
+        turn_id: String,
+        /// The interrupted turn this one continues, when it is a continuation
+        /// rather than a fresh turn. The audit link a resumed turn is otherwise
+        /// indistinguishable from a first attempt by.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resumed_from: Option<String>,
+    },
     #[serde(rename = "user/message")]
     UserMessage(UserMessageEvent),
     #[serde(rename = "request/header")]
@@ -189,6 +198,15 @@ pub enum SessionEventKind {
         pristine: bool,
     },
 
+    /// Which stored memories reached this turn's prompt. Its own event rather
+    /// than a `request/header` field because the header is written only when the
+    /// envelope *changes* — recall changes every turn, so folding it in would
+    /// defeat that dedup and rewrite the whole envelope each time.
+    #[serde(rename = "turn/memories")]
+    TurnMemories {
+        turn_id: String,
+        memories: RecalledMemories,
+    },
     #[serde(rename = "compaction/started")]
     CompactionStarted { turn_id: String },
     #[serde(rename = "compaction/completed")]
@@ -921,6 +939,63 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_turn_costs_no_bytes_for_the_continuation_link() {
+        // Most turns are not continuations, and `turn/started` is written once
+        // per turn on every session — an always-present null would be pure
+        // overhead on the most common event there is.
+        let fresh = SessionEvent::new(
+            0,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::TurnStarted {
+                turn_id: "turn-1".into(),
+                resumed_from: None,
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&fresh).unwrap(),
+            r#"{"v":1,"seq":0,"at":"2026-08-31T00:00:00Z","type":"turn/started","data":{"turn_id":"turn-1"}}"#
+        );
+
+        let continued = SessionEvent::new(
+            1,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::TurnStarted {
+                turn_id: "turn-2".into(),
+                resumed_from: Some("turn-1".into()),
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&continued).unwrap(),
+            r#"{"v":1,"seq":1,"at":"2026-08-31T00:00:00Z","type":"turn/started","data":{"turn_id":"turn-2","resumed_from":"turn-1"}}"#
+        );
+        assert_eq!(
+            decode_event(&serde_json::to_string(&continued).unwrap()).unwrap(),
+            Some(continued)
+        );
+    }
+
+    #[test]
+    fn recall_is_its_own_event_so_the_envelope_stays_deduped() {
+        // `request/header` is written only when the envelope changes; recall
+        // changes every turn, so folding it in there would rewrite the whole
+        // envelope — system prompt and tool schemas included — each time.
+        let event = SessionEvent::new(
+            7,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::TurnMemories {
+                turn_id: "turn-1".into(),
+                memories: RecalledMemories {
+                    pinned: vec!["m1".into()],
+                    recall: vec!["m2".into()],
+                },
+            },
+        );
+        let line = serde_json::to_string(&event).unwrap();
+        assert!(line.contains(r#""type":"turn/memories""#), "{line}");
+        assert_eq!(decode_event(&line).unwrap(), Some(event));
+    }
+
+    #[test]
     fn an_unknown_required_event_refuses_the_log() {
         // Written by a newer komo that added a type this build does not know.
         let line = r#"{"v":1,"seq":9,"at":"2026-08-31T00:00:00Z","type":"workflow/step-entered","data":{}}"#;
@@ -962,6 +1037,7 @@ mod tests {
                 at("2026-08-31T00:00:00Z"),
                 SessionEventKind::TurnStarted {
                     turn_id: "t".into(),
+                    resumed_from: None,
                 },
             ),
         ];

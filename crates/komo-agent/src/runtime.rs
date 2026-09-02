@@ -258,6 +258,16 @@ impl AgentRuntime {
             run.tokens_cached = usage.cached_input;
             // Which memories shaped the answer, recorded beside what it cost.
             run.memories = memories.clone();
+            if !memories.is_empty() {
+                self.record(
+                    &run.session_id,
+                    vec![SessionEventKind::TurnMemories {
+                        turn_id: run.id.clone(),
+                        memories: memories.clone(),
+                    }],
+                )
+                .await;
+            }
         }
         let outcome = outcome.map(|(reply, _, _)| reply);
         match &outcome {
@@ -351,6 +361,7 @@ impl AgentRuntime {
                     vec![
                         SessionEventKind::TurnStarted {
                             turn_id: run.run_id.clone(),
+                            resumed_from: None,
                         },
                         SessionEventKind::UserMessage(UserMessageEvent {
                             turn_id: run.run_id.clone(),
@@ -374,6 +385,18 @@ impl AgentRuntime {
                     session.messages.last().map(|m| m.role == Role::User) == Some(true),
                     "transcript already ends in a reply — nothing to resume"
                 );
+                // A continuation is its own turn in the log too, linked back to
+                // the one it picks up. Without this the log has no record that
+                // the attempt happened at all — the interrupted turn's events
+                // are all it would show.
+                self.record(
+                    session_id,
+                    vec![SessionEventKind::TurnStarted {
+                        turn_id: run.run_id.clone(),
+                        resumed_from: Some(turn_id.clone()),
+                    }],
+                )
+                .await;
                 Some((events, turn_id))
             }
         };
