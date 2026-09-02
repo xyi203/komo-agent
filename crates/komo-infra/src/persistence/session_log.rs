@@ -485,6 +485,14 @@ impl SessionLog {
             .min())
     }
 
+    /// Seal the active segment whatever its size, for tests that care about the
+    /// boundary rather than about writing a megabyte to reach it.
+    #[cfg(test)]
+    pub(super) async fn seal_now(&self) -> Result<bool> {
+        self.state.lock().await.active_bytes = SEGMENT_TARGET_BYTES;
+        self.seal_if_full().await
+    }
+
     /// Sealed segments, oldest first, when the log is over `budget`. Empty when
     /// it is not.
     async fn retention_candidates(&self, budget: u64) -> Result<Vec<SegmentRef>> {

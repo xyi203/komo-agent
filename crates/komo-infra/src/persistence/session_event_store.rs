@@ -130,12 +130,25 @@ impl SessionEventStore {
     /// accounting, and no cliff where crossing the line costs a session most of
     /// its detail at once.
     pub async fn retain(&self, session_id: &str, keep_from: u64) -> Result<Option<u64>> {
+        self.retain_within(session_id, keep_from, SESSION_RETAINED_BYTES)
+            .await
+    }
+
+    /// [`Self::retain`] against an explicit budget, so the whole chain — pick a
+    /// cut, fold a base, truncate, read back — can be exercised without writing
+    /// the real ceiling's worth of events.
+    async fn retain_within(
+        &self,
+        session_id: &str,
+        keep_from: u64,
+        budget: u64,
+    ) -> Result<Option<u64>> {
         let Some(log) = self.existing(session_id).await? else {
             return Ok(None);
         };
         // `None` when the log is inside its budget, or when every cut it could
         // make would reach into what must survive.
-        let Some(cut) = log.retention_cut(SESSION_RETAINED_BYTES, keep_from).await? else {
+        let Some(cut) = log.retention_cut(budget, keep_from).await? else {
             return Ok(None);
         };
         let events = log.load().await?;
@@ -287,6 +300,65 @@ mod tests {
             tool_note: String::new(),
             surface: SurfacePlacement::append(),
         })
+    }
+
+    #[tokio::test]
+    async fn a_log_over_budget_sheds_its_oldest_segment_and_still_reads() {
+        // The whole chain in one place: roll, pick a cut, fold a base, truncate,
+        // read back. Each piece is tested on its own; what this asserts is that
+        // a session that got too big loses bulk and keeps its conversation.
+        let store = store("retain");
+        let id = "019fad15-8199-7461-9d48-0a6c779f1c8d";
+        let log = store.open(id, header(id)).await.unwrap();
+
+        for turn in 0..3 {
+            store
+                .append(
+                    id,
+                    header(id),
+                    vec![
+                        SessionEventKind::TurnStarted {
+                            turn_id: format!("t{turn}"),
+                            resumed_from: None,
+                        },
+                        said(
+                            &format!("t{turn}"),
+                            &format!("q{turn}"),
+                            MessageSource::User,
+                        ),
+                        answered(&format!("t{turn}"), &format!("a{turn}")),
+                        SessionEventKind::TurnCompleted {
+                            turn_id: format!("t{turn}"),
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+            log.durable_flush().await.unwrap();
+            assert!(log.seal_now().await.unwrap());
+        }
+        let before = store.messages(id).await.unwrap();
+        assert_eq!(before.len(), 6);
+
+        // Budget 0, nothing protected: the oldest segment goes.
+        let cut = store.retain_within(id, u64::MAX, 0).await.unwrap();
+        assert_eq!(cut, Some(3), "the first turn's four events end at seq 3");
+
+        // Same conversation, fewer bytes: the turn markers went, the words did not.
+        let after = store.messages(id).await.unwrap();
+        assert_eq!(
+            after.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+        let events = store.events(id).await.unwrap();
+        assert_eq!(
+            events.iter().filter(|e| e.seq <= 3).count(),
+            2,
+            "only q0 and a0 survive the cut, not the turn markers around them"
+        );
     }
 
     #[tokio::test]
