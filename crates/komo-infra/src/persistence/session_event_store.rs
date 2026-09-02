@@ -211,6 +211,14 @@ impl SessionEventStore {
         }
     }
 
+    /// The tail from `seq` on — the segments that hold it, and no others.
+    pub async fn events_from(&self, session_id: &str, seq: u64) -> Result<Vec<SessionEvent>> {
+        match self.existing(session_id).await? {
+            Some(log) => log.read_from(seq).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
     fn dir_for(&self, session_id: &str) -> PathBuf {
         self.root.join(encode_dir_name(session_id))
     }

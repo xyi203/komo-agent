@@ -776,6 +776,13 @@ mod tests {
         ) -> anyhow::Result<Vec<komo_core::domain::session_event::SessionEvent>> {
             Ok(Vec::new())
         }
+        async fn events_from(
+            &self,
+            _session_id: &str,
+            _seq: u64,
+        ) -> anyhow::Result<Vec<komo_core::domain::session_event::SessionEvent>> {
+            Ok(Vec::new())
+        }
         async fn turn_boundary(&self, _session_id: &str) -> anyhow::Result<bool> {
             Ok(false)
         }

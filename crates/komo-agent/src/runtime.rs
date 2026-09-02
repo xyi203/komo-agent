@@ -9,13 +9,17 @@ use komo_core::domain::{
     repository::{MessageRepository, SessionEventRepository, SessionRepository},
     run::RecalledMemories,
     run::{Run, RunRepository, tool_digest, truncate},
-    run_projection::{ProjectedRun, RunProjectionStore, project_runs, replay_floor},
+    run_projection::{RunProjectionStore, project_runs, replay_floor},
     session::Session,
     session_event::{
         AssistantMessageEvent, MessageSource, SessionEvent, SessionEventKind, SurfacePlacement,
         TurnRecorder, UserMessageEvent,
     },
 };
+/// A turn whose opening the log never confirmed: settle folds the whole log
+/// rather than a tail it cannot locate. Always correct, only slower.
+const UNKNOWN_START: u64 = u64::MAX;
+
 /// How many of a session's runs retention asks the ledger about. The watermark
 /// it needs is the *oldest* unlearned run, and the sweep retires runs in
 /// batches, so a session with more pending than this has its floor pinned by
@@ -24,7 +28,7 @@ const RETENTION_LEDGER_SCAN: usize = 500;
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
@@ -239,8 +243,16 @@ impl AgentRuntime {
     ) -> anyhow::Result<String> {
         let span = info_span!("run", run_id = %turn_id, session = %session_id);
         let ctx = RunContext::new(turn_id.clone()).with_checkpoint(self.checkpoint.clone());
+        // Where this turn starts in the log, filled in as it opens. It is what
+        // lets the settle below fold the turn's own tail instead of the whole
+        // conversation; `UNKNOWN_START` means "read it all", which is always
+        // correct and only slower.
+        let opened_at = AtomicU64::new(UNKNOWN_START);
 
-        let outcome = self.turn_body(session_id, kind, ctx).instrument(span).await;
+        let outcome = self
+            .turn_body(session_id, kind, ctx, &opened_at)
+            .instrument(span)
+            .await;
 
         // The turn's own account of itself is the log's, not this function's:
         // every field the ledger row used to be assigned here — the reply, what
@@ -254,7 +266,8 @@ impl AgentRuntime {
             Err(error) if is_cancelled(error) => info!(run_id = %turn_id, "run cancelled"),
             Err(error) => warn!(run_id = %turn_id, %error, "run failed"),
         }
-        self.settle_turn(session_id).await;
+        self.settle_turn(session_id, opened_at.load(Ordering::Relaxed))
+            .await;
 
         // Learning, detached from the reply path and dispatched **after** the
         // ledger closed. It reads this run back as an episode — status, steps
@@ -290,6 +303,7 @@ impl AgentRuntime {
         session_id: &str,
         kind: TurnKind,
         run: RunContext,
+        opened_at: &AtomicU64,
     ) -> anyhow::Result<(String, TokenUsage, RecalledMemories)> {
         // Load only the recent window for the agent loop — the LLM windows the
         // history to the same bound anyway, so a long-lived chat session no
@@ -335,6 +349,9 @@ impl AgentRuntime {
                         ],
                     )
                     .await;
+                if let Some(first) = opening.first().map(|event| event.seq) {
+                    opened_at.store(first, Ordering::Relaxed);
+                }
                 self.open_in_ledger(session_id, &opening).await;
                 session.messages.push(user_msg);
                 None
@@ -362,6 +379,10 @@ impl AgentRuntime {
                         }],
                     )
                     .await;
+                // Deliberately not recorded: a continuation's settle has to
+                // re-commit the turns it claimed, and those are earlier turns of
+                // their own. A resume is rare; a full fold there is the cheap
+                // way to keep the claim honest.
                 self.open_in_ledger(session_id, &opening).await;
                 Some((events, turn_id))
             }
@@ -574,8 +595,13 @@ impl AgentRuntime {
     /// dispatched: an episode is assembled from these rows, and the retention
     /// rule that protects the turn that just ended reads it as *unlearned*,
     /// which it cannot be until it is a row at all.
-    async fn settle_turn(&self, session_id: &str) {
-        let events = match self.events.events(session_id).await {
+    async fn settle_turn(&self, session_id: &str, from_seq: u64) {
+        let tail = match from_seq {
+            // A turn whose start the log never confirmed, and every resume.
+            UNKNOWN_START => self.events.events(session_id).await,
+            from => self.events.events_from(session_id, from).await,
+        };
+        let events = match tail {
             Ok(events) => events,
             Err(error) => {
                 warn!(%error, "failed to read the session log to settle the turn (non-fatal)");
@@ -590,7 +616,7 @@ impl AgentRuntime {
         match self.events.turn_boundary(session_id).await {
             // Only a roll can put the log over its budget, so the cut is
             // considered only then.
-            Ok(true) => self.retain(session_id, &runs).await,
+            Ok(true) => self.retain(session_id).await,
             Ok(false) => {}
             Err(error) => warn!(%error, "session log upkeep failed at a turn boundary (non-fatal)"),
         }
@@ -599,11 +625,22 @@ impl AgentRuntime {
     /// Cut the session's log back toward its budget, keeping every turn that is
     /// still resumable or still unlearned.
     ///
-    /// Takes the fold the caller already has: recoverable comes straight off it,
-    /// and `learned` is the sweep's watermark, read from the rows it advances. A
-    /// turn nobody has finished with outranks the space it costs: finding no
-    /// safe cut is a normal answer, and leaves the session over budget.
-    async fn retain(&self, session_id: &str, runs: &[ProjectedRun]) {
+    /// The floor is over every turn the session still holds, so this is the one
+    /// place that reads the whole log — and a roll is the only moment the
+    /// retained size can cross budget, so it is paid per *segment*, not per
+    /// turn. `recoverable` comes off the fold; `learned` is the sweep's
+    /// watermark, read from the rows it advances. A turn nobody has finished
+    /// with outranks the space it costs: finding no safe cut is a normal
+    /// answer, and leaves the session over budget.
+    async fn retain(&self, session_id: &str) {
+        let events = match self.events.events(session_id).await {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(%error, "failed to read the session log for retention (non-fatal)");
+                return;
+            }
+        };
+        let runs = &project_runs(session_id, &events);
         let unlearned: std::collections::HashSet<String> = self
             .runs
             .unlearned(Some(session_id), RETENTION_LEDGER_SCAN)
@@ -1624,9 +1661,14 @@ mod tests {
             .collect();
 
         assert_eq!(projected.len(), written.len(), "run count");
-        for (folded, row) in projected.iter().zip(&written) {
+        for folded in projected.iter() {
+            // Paired by id, not by position: turns inside one second tie on
+            // `started_at`, and the row order within a tie is the query's.
+            let row = written
+                .iter()
+                .find(|row| row.id == folded.run.id)
+                .unwrap_or_else(|| panic!("no row for folded run {}", folded.run.id));
             let run = &folded.run;
-            assert_eq!(run.id, row.id);
             assert_eq!(run.session_id, row.session_id);
             assert_eq!(run.input, row.input, "input of {}", row.id);
             assert_eq!(run.plan, row.plan, "plan of {}", row.id);
@@ -1680,6 +1722,83 @@ mod tests {
 
     /// Wraps the real store, reports every turn as a roll, and records the
     /// retention floor the runtime computed instead of cutting.
+    /// Records which shape of read the runtime asked the log for.
+    struct ReadSpy {
+        inner: Arc<Db>,
+        reads: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl SessionEventRepository for ReadSpy {
+        async fn append(
+            &self,
+            session_id: &str,
+            kinds: Vec<SessionEventKind>,
+        ) -> anyhow::Result<Vec<SessionEvent>> {
+            self.inner.append(session_id, kinds).await
+        }
+        async fn durable_flush(&self, session_id: &str) -> anyhow::Result<()> {
+            self.inner.durable_flush(session_id).await
+        }
+        async fn events(&self, session_id: &str) -> anyhow::Result<Vec<SessionEvent>> {
+            self.reads.lock().unwrap().push("whole log".to_string());
+            self.inner.events(session_id).await
+        }
+        async fn events_from(
+            &self,
+            session_id: &str,
+            seq: u64,
+        ) -> anyhow::Result<Vec<SessionEvent>> {
+            self.reads.lock().unwrap().push(format!("from {seq}"));
+            self.inner.events_from(session_id, seq).await
+        }
+        async fn turn_boundary(&self, session_id: &str) -> anyhow::Result<bool> {
+            self.inner.turn_boundary(session_id).await
+        }
+        async fn retain(&self, session_id: &str, keep_from: u64) -> anyhow::Result<Option<u64>> {
+            self.inner.retain(session_id, keep_from).await
+        }
+    }
+
+    /// A session that has been talking for a while must not re-fold itself
+    /// every turn. A turn settles from where it opened; the whole log is read
+    /// only when a segment rolls, which is once per segment's worth of writing.
+    #[tokio::test]
+    async fn a_turn_settles_from_its_own_start_not_the_whole_log() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_tail_settle.db"))
+                .await
+                .unwrap(),
+        );
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        // The scripted driver is handed its whole script on the first turn, so
+        // each turn gets its own runtime over the same store.
+        for text in ["one", "two", "three"] {
+            let (mut rt, _) =
+                scripted_runtime(db.clone(), vec![Step::Final(text.into())], vec![], 30);
+            rt.events = Arc::new(ReadSpy {
+                inner: db.clone(),
+                reads: reads.clone(),
+            });
+            rt.handle_input("cli:tail", text.into()).await.unwrap();
+        }
+
+        let reads = reads.lock().unwrap().clone();
+        assert!(
+            !reads.iter().any(|read| read == "whole log"),
+            "no roll happened, so nothing had to read the whole log: {reads:?}"
+        );
+        // Five events a turn here: `turn/started`, the user message, the one
+        // assistant round, the assistant message, `turn/completed`.
+        assert_eq!(
+            reads,
+            vec!["from 0", "from 5", "from 10"],
+            "each settle starts where its own turn did"
+        );
+        assert_eq!(RunRepository::list(&*db, 10).await.unwrap().len(), 3);
+        assert_ledger_matches_log(&db, "cli:tail").await;
+    }
+
     struct RetentionSpy {
         inner: Arc<Db>,
         floors: Arc<Mutex<Vec<u64>>>,
@@ -1699,6 +1818,13 @@ mod tests {
         }
         async fn events(&self, session_id: &str) -> anyhow::Result<Vec<SessionEvent>> {
             self.inner.events(session_id).await
+        }
+        async fn events_from(
+            &self,
+            session_id: &str,
+            seq: u64,
+        ) -> anyhow::Result<Vec<SessionEvent>> {
+            self.inner.events_from(session_id, seq).await
         }
         async fn turn_boundary(&self, _session_id: &str) -> anyhow::Result<bool> {
             Ok(true)

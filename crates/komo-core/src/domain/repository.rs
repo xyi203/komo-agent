@@ -124,6 +124,14 @@ pub trait SessionEventRepository: Send + Sync {
     /// The session's events, oldest first. Empty for a session with no log.
     async fn events(&self, session_id: &str) -> anyhow::Result<Vec<SessionEvent>>;
 
+    /// The session's events from `seq` on, oldest first.
+    ///
+    /// What a turn settling itself needs: its own events are the log's tail, and
+    /// folding a whole conversation to write one turn's rows is a cost that
+    /// grows for as long as the session lives. A caller that needs the *whole*
+    /// log — a rebuild, a retention floor — asks for it.
+    async fn events_from(&self, session_id: &str, seq: u64) -> anyhow::Result<Vec<SessionEvent>>;
+
     /// A completed turn just became durable — a safe point for the log to do its
     /// own upkeep.
     ///

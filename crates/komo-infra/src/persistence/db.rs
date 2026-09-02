@@ -748,6 +748,10 @@ impl SessionEventRepository for Db {
         Ok(self.events.events(session_id).await?)
     }
 
+    async fn events_from(&self, session_id: &str, seq: u64) -> anyhow::Result<Vec<SessionEvent>> {
+        Ok(self.events.events_from(session_id, seq).await?)
+    }
+
     async fn turn_boundary(&self, session_id: &str) -> anyhow::Result<bool> {
         Ok(self.events.seal(session_id).await?)
     }

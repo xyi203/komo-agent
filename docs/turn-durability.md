@@ -491,6 +491,12 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
   跳过；`Db::rebuild_run_projection` 是无视水位的全量重建。行持有的三个字段按
   merge 处理：`outcome` 根本不写，`learned` 只增不减，fold 说 running 而行已终止
   时保留行的判决。
+- 收尾只折**自己那一段**：`SessionEventRepository::events_from` 从这一轮的开场 seq
+  读起（开场提交时记下），一次 turn 不再为了写自己那一行去解析整个会话。
+  只有两种情况读全量：续跑（它必须重新提交被认领的祖先，才能把 recoverable 清掉），
+  以及滚段之后算 retention floor——floor 是「这个 session 还留着的每一轮」上的最小值，
+  但滚段是每写满一个段才发生一次，所以这笔全量读按段付费，不按轮付费。
+  回归测试 `a_turn_settles_from_its_own_start_not_the_whole_log` 盯住这条。
 - 一个 turn 提交**两次**：开场一次、收尾一次。开场那次只折自己刚写进日志的开场
   事件（不用读日志），因为崩溃留下的 turn 必须已经是一行 `running`，否则
   `run list` 看不到、`run resume` 找不到。收尾那次和 retention 的 floor 共用同一次
