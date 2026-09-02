@@ -544,12 +544,19 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
 4. 第一批已记录 approval 生命周期；后续再给 `approval/resolved` 补最终放行层级、scope key 和
    等待时间，作为 run ledger projection 的审计字段。
 5. memory observation 增加 provenance class，防止 untrusted tool content 被当成用户事实晋升。
-6. **二次 resume 会丢掉第一次续跑之前的轮次**。续跑是一个新的 `Run`，事件按新 run_id 落盘，
-   而 `rebuild_from_events` 只认单个 turn_id，于是 A→B→C 的链条里 C 看不到 A 的 assistant
-   round，退化成从用户消息重跑整轮。降级是安全的（只是白花钱），但一次崩溃可恢复、两次就不行
-   并不是想要的语义。修法二选一：`resume_interrupted` 沿 `resumed_from` 收集整条链按集合过滤，
-   或让续跑的事件沿用原始 turn_id、把 ledger 的 run_id 和日志的 turn_id 分开——后者更正确，
-   一个逻辑 turn 在日志里就该是一个 id。
+6. ~~**二次 resume 会丢掉第一次续跑之前的轮次**~~ —— **已修**，取的是第一种修法：
+   `rebuild_from_events` 自己沿 `turn/started{resumed_from}` 走出整条链
+   （`attempt_chain`），按 id 集合过滤事件；A→B→C 里 C 现在按 seq 顺序重放 A 和 B
+   的全部 round。回归测试去掉修法就变成「C 一条 round 都没有」，也就是原来的
+   退化路径。
+   **没有选「让续跑沿用原始 turn_id」那条**：账本行现在就是按 turn_id 折出来的
+   （第二批 2.1 刚落地），共用 id 会把两次尝试合成一行，各自的 token、状态、
+   认领关系全都糊在一起；真要分开就得让每条事件同时带 logical turn 和 attempt
+   两个 id，是一次 schema 级改动。如果后面确实需要「一个逻辑 turn 在日志里一个
+   id」，那是独立一刀，不该搭在这次修 bug 上。
+   顺带补上一个同源的洞：retention 的 floor 原来只保 `start_seq`，一个可续跑的
+   turn 的祖先尝试可能被切掉——现在按 `replay_floor` 沿链取最小值，
+   「保住还能续跑的 turn」才真的保住了它会重放的那些轮次。
 
 ---
 

@@ -80,6 +80,29 @@ pub struct ProjectedStep {
     pub settled: bool,
 }
 
+/// The seq a turn's log has to survive from: its own start, and the start of
+/// every earlier attempt at it.
+///
+/// A continuation is rebuilt from its whole `resumed_from` chain, so cutting an
+/// ancestor's rounds away would leave a turn that still reads as resumable but
+/// silently re-runs the work those rounds already paid for. Retention asks this
+/// rather than `start_seq` for exactly that reason.
+///
+/// Bounded by the number of runs, so a `resumed_from` cycle cannot loop.
+pub fn replay_floor(runs: &[ProjectedRun], run: &ProjectedRun) -> u64 {
+    let mut floor = run.start_seq;
+    let mut current = run.run.resumed_from.clone();
+    for _ in 0..runs.len() {
+        let Some(id) = current else { break };
+        let Some(parent) = runs.iter().find(|other| other.run.id == id) else {
+            break;
+        };
+        floor = floor.min(parent.start_seq);
+        current = parent.run.resumed_from.clone();
+    }
+    floor
+}
+
 /// Fold one session's events into the runs they record, oldest first.
 ///
 /// Events for a turn that never opened with `turn/started` are ignored rather
@@ -590,6 +613,44 @@ mod tests {
             runs[1].run.input, "go",
             "a continuation is answering the same question, and the row says so"
         );
+    }
+
+    #[test]
+    fn a_resumable_turn_holds_the_log_back_to_its_first_attempt() {
+        // A→B→C, C still open: retention may not cut A's rounds away, because
+        // rebuilding C replays them.
+        let events = vec![
+            started(0, 100, "A"),
+            asked(1, 100, "A", "go"),
+            ev(
+                2,
+                200,
+                SessionEventKind::TurnStarted {
+                    turn_id: "B".into(),
+                    resumed_from: Some("A".into()),
+                },
+            ),
+            ev(
+                3,
+                300,
+                SessionEventKind::TurnStarted {
+                    turn_id: "C".into(),
+                    resumed_from: Some("B".into()),
+                },
+            ),
+        ];
+        let runs = project_runs("s1", &events);
+        let open = runs.iter().find(|p| p.run.id == "C").unwrap();
+        assert!(open.run.recoverable, "C is the attempt still in flight");
+        assert_eq!(open.start_seq, 3);
+        assert_eq!(
+            replay_floor(&runs, open),
+            0,
+            "the floor reaches back to the turn that first asked the question"
+        );
+        // A turn nobody resumed answers with its own start.
+        let first = runs.iter().find(|p| p.run.id == "A").unwrap();
+        assert_eq!(replay_floor(&runs, first), 0);
     }
 
     #[test]

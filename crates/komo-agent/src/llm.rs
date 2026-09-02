@@ -625,6 +625,36 @@ struct RebuiltTurn {
     start: TurnStart,
 }
 
+/// Every attempt at one logical turn: `turn_id` plus the ids it was resumed
+/// from, transitively.
+///
+/// A continuation is a new turn in the log, linked back by `resumed_from`, so
+/// A→B→C is three ids for one question. Rebuilding C from C alone loses A's and
+/// B's rounds — safe (it just re-does the work) but not the semantics anyone
+/// wants: one crash would be recoverable and two would not.
+///
+/// Bounded by the number of `turn/started` events, so a `resumed_from` cycle
+/// (which the log's own ordering makes impossible, but nothing here proves)
+/// cannot loop.
+fn attempt_chain(events: &[SessionEvent], turn_id: &str) -> std::collections::HashSet<String> {
+    let mut chain = std::collections::HashSet::new();
+    chain.insert(turn_id.to_string());
+    let mut current = turn_id.to_string();
+    loop {
+        let parent = events.iter().find_map(|event| match &event.kind {
+            SessionEventKind::TurnStarted {
+                turn_id,
+                resumed_from: Some(from),
+            } if *turn_id == current => Some(from.clone()),
+            _ => None,
+        });
+        match parent {
+            Some(from) if chain.insert(from.clone()) => current = from,
+            _ => return chain,
+        }
+    }
+}
+
 /// Rebuild the state an interrupted turn died with, from its session's events.
 ///
 /// The history is **derived**, not stored: `session.messages` is the
@@ -641,6 +671,13 @@ struct RebuiltTurn {
 /// `idempotent` answers whether a tool may simply be run again — the newest
 /// round's unsettled calls are re-dispatched through it rather than reported as
 /// lost (see [`TurnStart::Replay`]).
+///
+/// A turn resumed **twice** is rebuilt from every attempt at it, not just the
+/// last one: each continuation is its own turn in the log, so the rounds a
+/// second crash has to replay are spread across the chain, and reading only the
+/// newest id would drop the work the first attempt already paid for and answer
+/// the question from scratch. The chain is walked through
+/// `turn/started{resumed_from}`.
 fn rebuild_from_events(
     session: &Session,
     events: &[SessionEvent],
@@ -654,6 +691,8 @@ fn rebuild_from_events(
 
     let mut history: Vec<Turn> = session.messages.iter().flat_map(to_turns).collect();
 
+    let attempts = attempt_chain(events, turn_id);
+
     // One round's calls: what was dispatched, and what came back.
     struct Round {
         id: String,
@@ -663,7 +702,7 @@ fn rebuild_from_events(
     let mut rounds: Vec<Round> = Vec::new();
     for event in events
         .iter()
-        .filter(|e| e.turn_id_of_work() == Some(turn_id))
+        .filter(|e| e.turn_id_of_work().is_some_and(|id| attempts.contains(id)))
     {
         match &event.kind {
             SessionEventKind::AssistantRound(round) => rounds.push(Round {
@@ -1861,6 +1900,68 @@ mod tests {
         let mut session = Session::new("s");
         session.messages.push(Message::user(text));
         session
+    }
+
+    /// A turn resumed **twice**: A died after a round, B (resumed from A) died
+    /// after another, and C picks up B. C has to replay both rounds — reading
+    /// only B's would send the model back to the question, so one crash would
+    /// be recoverable and two would not.
+    #[test]
+    fn a_second_resume_replays_every_attempt_before_it() {
+        let session = asked("go");
+        let opened = |seq: u64, turn: &str, from: Option<&str>| {
+            ev(
+                seq,
+                SessionEventKind::TurnStarted {
+                    turn_id: turn.into(),
+                    resumed_from: from.map(str::to_string),
+                },
+            )
+        };
+        let round_of = |seq: u64, turn: &str, id: &str| {
+            ev(
+                seq,
+                SessionEventKind::AssistantRound(AssistantRoundEvent {
+                    turn_id: turn.into(),
+                    round: 0,
+                    response_id: id.into(),
+                    blocks: serde_json::to_value(vec![AssistantBlock::Text("working".into())])
+                        .unwrap(),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    tokens_cached: 0,
+                }),
+            )
+        };
+        let events = vec![
+            opened(0, "A", None),
+            header_event(1),
+            round_of(2, "A", "msg-a"),
+            opened(3, "B", Some("A")),
+            round_of(4, "B", "msg-b"),
+            opened(5, "C", Some("B")),
+        ];
+
+        let rebuilt = rebuild_from_events(&session, &events, "C", &|_| false).unwrap();
+
+        let replayed: Vec<String> = rebuilt
+            .history
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::Assistant { id, .. } => id.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replayed,
+            vec!["msg-a".to_string(), "msg-b".to_string()],
+            "both attempts' rounds, in the order they happened"
+        );
+        assert_eq!(
+            rebuilt.history.len(),
+            3,
+            "the question, then the two rounds"
+        );
     }
 
     #[test]

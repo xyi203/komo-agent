@@ -9,7 +9,7 @@ use komo_core::domain::{
     repository::{MessageRepository, SessionEventRepository, SessionRepository},
     run::RecalledMemories,
     run::{Run, RunRepository, tool_digest, truncate},
-    run_projection::{ProjectedRun, RunProjectionStore, project_runs},
+    run_projection::{ProjectedRun, RunProjectionStore, project_runs, replay_floor},
     session::Session,
     session_event::{
         AssistantMessageEvent, MessageSource, SessionEvent, SessionEventKind, SurfacePlacement,
@@ -615,7 +615,9 @@ impl AgentRuntime {
         let keep_from = runs
             .iter()
             .filter(|projected| projected.run.recoverable || unlearned.contains(&projected.run.id))
-            .map(|projected| projected.start_seq)
+            // Its own start is not enough: a resumable turn replays every
+            // earlier attempt at it, and those are turns of their own in the log.
+            .map(|projected| replay_floor(runs, projected))
             .min()
             .unwrap_or(u64::MAX);
 
