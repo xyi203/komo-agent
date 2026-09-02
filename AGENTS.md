@@ -392,11 +392,14 @@ call the same functions, which is what keeps validation from forking.
   **Cancelled turns are audit, not lessons**: the work stopped part-way by the
   user's choice, so its silence is not evidence and its half-done steps are not
   a procedure worth keeping.
-  **Sweep sessions are exempt** (`Session.origin` is `cron`/`briefing`) — a sweep restates
-  facts the agent already knows, and each run's session counts as a fresh
-  "independent occasion" to the consolidator, so extracting there would let the
-  memory library corroborate itself on a timer. The guard lives in
-  `LearningCoordinator` (`exempt_from_learning`), covering both triggers.
+  **Sweep and delegate sessions are exempt** (`SessionOrigin::is_learnable`,
+  matched exhaustively so a new origin must decide) — a sweep restates facts the
+  agent already knows, and each run's session counts as a fresh "independent
+  occasion" to the consolidator, so extracting there would let the memory
+  library corroborate itself on a timer; a delegation is the *parent* turn's own
+  work, so learning from both counts one occasion twice. The guard lives in
+  `LearningCoordinator` (`learning_exemption`, which also names the reason the
+  watermark event records), covering both triggers.
 - `komo-agent`'s `delegate` — sub-agent as a real agent turn on its own session
   (`Session.origin = delegate`, which is what keeps it out of the session list); inherits the parent's ambient session context (approvals prompt the
   real conversation, cancel propagates); recursion blocked structurally

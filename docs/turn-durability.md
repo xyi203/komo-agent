@@ -564,7 +564,11 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
 
 这些问题由本次核对发现，但不是权威事件日志首批实现的前置条件：
 
-1. `delegate` session 不参与 learning，避免父子 session 被算成两次独立 evidence。
+1. ~~`delegate` session 不参与 learning~~ —— **已修**：判据从
+   `SessionOrigin::is_sweep` 换成 `is_learnable`（穷举匹配，新 origin 必须自己表态），
+   `Delegate` 和两种 sweep 一样退出 backlog，水位事件里的理由是 `delegated turn`。
+   post-run 触发本来就不会打到它（子 agent runtime `learns: false`），漏的是
+   scheduled sweep——它扫的是全库 `unlearned`，父子两条都在里面。
 2. 等待 `claim_session` 的 ingress 也必须先登记 cancel ownership，Stop 同时覆盖运行中和排队中。
 3. consolidator 的关联检索能看到 `Rejected` memory，但 Rejected 仍不得进入自动注入。
 4. 第一批已记录 approval 生命周期；后续再给 `approval/resolved` 补最终放行层级、scope key 和

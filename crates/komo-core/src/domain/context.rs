@@ -101,10 +101,22 @@ impl SessionOrigin {
         }
     }
 
-    /// Whether this is one of komo's own scheduled turns. Sweeps restate what
-    /// the agent already knows, so nothing here is a lesson or a name.
-    pub fn is_sweep(self) -> bool {
-        matches!(self, Self::Cron | Self::Briefing)
+    /// Whether a turn on this session is a lesson worth extracting from.
+    ///
+    /// Only a real conversation is. A sweep (`Cron`/`Briefing`) restates what
+    /// the agent already knows, and each run's session counts as a fresh
+    /// "independent occasion" to the memory consolidator — extracting there
+    /// lets the library corroborate itself on a timer. A `Delegate` session is
+    /// the *parent* turn's own work done by a sub-agent, so learning from both
+    /// counts one occasion twice, which is the same failure by another route.
+    ///
+    /// Matched exhaustively rather than written as "anything but `User`": a new
+    /// origin has to decide this deliberately.
+    pub fn is_learnable(self) -> bool {
+        match self {
+            Self::User => true,
+            Self::Cron | Self::Briefing | Self::Delegate => false,
+        }
     }
 }
 

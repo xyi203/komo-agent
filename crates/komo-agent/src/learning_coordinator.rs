@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use tracing::warn;
 
 use komo_core::domain::{
+    context::SessionOrigin,
     episode::{AssessedEpisode, OutcomeAssessment},
     llm::LlmClient,
     repository::{SessionEventRepository, SessionRepository},
@@ -44,12 +45,13 @@ const LEARN_BATCH_CAP: usize = 50;
 /// others of a turn.
 const SWEEP_SCAN_CAP: usize = 200;
 
-/// Sessions komo must never learn from: unattended sweep turns (briefings and
-/// cron jobs). A sweep restates facts the agent already knows (tasks, memories,
-/// device state), so extraction there re-observes the same claims on every run —
-/// and each run's session is a "new independent occasion" to the consolidator,
-/// which turns repetition into corroboration. The result is a memory library
-/// that confirms itself on a timer.
+/// Why this session's turns are not lessons, or `None` if they are.
+///
+/// Two kinds are exempt, for one reason: both would hand the memory
+/// consolidator the same occasion twice, and a second occasion is what it reads
+/// as corroboration. An unattended **sweep** restates facts the agent already
+/// knows on a timer; a **delegation** is the parent turn's own work, already
+/// being learned from where it was asked for.
 ///
 /// Read off the session record's `origin`, which the turn stamped when it
 /// opened the session. It used to be a prefix test on the id — a second
@@ -59,13 +61,19 @@ const SWEEP_SCAN_CAP: usize = 200;
 /// A session that cannot be read is **not** exempt: silently skipping learning
 /// is the failure nobody would notice, while learning from a sweep is one the
 /// dream sweep's evidence counts would eventually show.
-async fn exempt_from_learning(sessions: &Arc<dyn SessionRepository>, session_id: &str) -> bool {
+async fn learning_exemption(
+    sessions: &Arc<dyn SessionRepository>,
+    session_id: &str,
+) -> Option<&'static str> {
     match sessions.find_windowed(session_id, 1).await {
-        Ok(Some(session)) => session.origin.is_sweep(),
-        Ok(None) => false,
+        Ok(Some(session)) if !session.origin.is_learnable() => Some(match session.origin {
+            SessionOrigin::Delegate => DELEGATED_TURN,
+            _ => SWEEP_SESSION,
+        }),
+        Ok(_) => None,
         Err(error) => {
             warn!(%error, session = %session_id, "could not read a session's origin; not exempting");
-            false
+            None
         }
     }
 }
@@ -169,14 +177,11 @@ impl LearningCoordinator {
                 // whole reason assessments are stored rather than recomputed.
                 self.assess(&run).await;
                 self.absorb_feedback(&run).await;
-                if exempt_from_learning(&self.sessions, &run.session_id).await {
+                if let Some(reason) = learning_exemption(&self.sessions, &run.session_id).await {
                     // Retire it from the backlog rather than leaving it to be
                     // re-examined and re-declined by every future sweep.
-                    self.retire(
-                        &run.session_id,
-                        &[Retired::Skipped(run.id.clone(), SWEEP_SESSION)],
-                    )
-                    .await;
+                    self.retire(&run.session_id, &[Retired::Skipped(run.id.clone(), reason)])
+                        .await;
                     return Ok(report);
                 }
                 let pending = self
@@ -192,9 +197,8 @@ impl LearningCoordinator {
             LearningTrigger::Scheduled => {
                 let pending = self.runs.unlearned(None, SWEEP_SCAN_CAP).await?;
                 for (session_id, runs) in group_by_session(pending) {
-                    if exempt_from_learning(&self.sessions, &session_id).await {
-                        self.retire(&session_id, &skipped(&runs, SWEEP_SESSION))
-                            .await;
+                    if let Some(reason) = learning_exemption(&self.sessions, &session_id).await {
+                        self.retire(&session_id, &skipped(&runs, reason)).await;
                         continue;
                     }
                     // Isolate per-session failures: one bad pass must not abort
@@ -232,7 +236,10 @@ impl LearningCoordinator {
         let Some(aux) = &self.aux else {
             return;
         };
-        if exempt_from_learning(&self.sessions, &run.session_id).await {
+        if learning_exemption(&self.sessions, &run.session_id)
+            .await
+            .is_some()
+        {
             return;
         }
         let Ok(Some(previous)) = self.runs.previous_in_session(&run.id).await else {
@@ -411,6 +418,7 @@ impl Retired {
 /// stable: they land in a durable log, where they are the only account of why
 /// a turn was never learned from.
 const SWEEP_SESSION: &str = "sweep session";
+const DELEGATED_TURN: &str = "delegated turn";
 const CANCELLED: &str = "cancelled turn";
 const NO_EPISODE: &str = "episode unavailable";
 
@@ -580,31 +588,43 @@ mod tests {
 
     struct FakeSessions {
         loads: AtomicUsize,
-        /// Ids the store reports as komo's own scheduled sessions. Named
-        /// explicitly rather than derived from the id: whether a session is a
-        /// sweep is a stored fact now, and a test that spelled it into the id
-        /// would still pass if the code went back to parsing one.
-        sweeps: Vec<String>,
+        /// Ids the store reports with a non-`User` origin. Named explicitly
+        /// rather than derived from the id: what is driving a session is a
+        /// stored fact now, and a test that spelled it into the id would still
+        /// pass if the code went back to parsing one.
+        origins: Vec<(String, SessionOrigin)>,
     }
 
     impl FakeSessions {
         fn new() -> Arc<Self> {
-            Self::with_sweeps(Vec::new())
+            Self::with_origins(Vec::new())
         }
 
         fn with_sweeps(sweeps: Vec<&str>) -> Arc<Self> {
+            Self::with_origins(
+                sweeps
+                    .into_iter()
+                    .map(|id| (id, SessionOrigin::Cron))
+                    .collect(),
+            )
+        }
+
+        fn with_origins(origins: Vec<(&str, SessionOrigin)>) -> Arc<Self> {
             Arc::new(Self {
                 loads: AtomicUsize::new(0),
-                sweeps: sweeps.into_iter().map(str::to_string).collect(),
+                origins: origins
+                    .into_iter()
+                    .map(|(id, origin)| (id.to_string(), origin))
+                    .collect(),
             })
         }
 
         fn origin_of(&self, id: &str) -> SessionOrigin {
-            if self.sweeps.iter().any(|s| s == id) {
-                SessionOrigin::Cron
-            } else {
-                SessionOrigin::User
-            }
+            self.origins
+                .iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, origin)| *origin)
+                .unwrap_or(SessionOrigin::User)
         }
     }
 
@@ -967,6 +987,47 @@ mod tests {
         assert!(
             events.flushes.load(Ordering::Relaxed) > 0,
             "the watermark has to survive a crash, or the batch is learned twice"
+        );
+    }
+
+    /// A delegation is the parent turn's own work, done by a sub-agent on its
+    /// own session. Learning from both hands the consolidator one occasion
+    /// twice — and a second independent occasion is exactly what it counts as
+    /// corroboration, so a claim the parent turn made once could promote itself.
+    #[tokio::test]
+    async fn a_delegated_session_is_not_a_second_occasion() {
+        let runs = FakeRuns::new(vec![done("run-1", "sub"), done("run-2", "cli:a")]);
+        let reviewer = Arc::new(RecordingReviewer::default());
+        let events = FakeEvents::new();
+        let c = LearningCoordinator::new(
+            FakeSessions::with_origins(vec![("sub", SessionOrigin::Delegate)]),
+            runs.clone(),
+            events.clone(),
+            reviewer.clone(),
+            1,
+        );
+
+        c.run(LearningTrigger::Scheduled).await.unwrap();
+
+        let sessions: Vec<String> = reviewer
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(session, _)| session.clone())
+            .collect();
+        assert_eq!(
+            sessions,
+            vec!["cli:a".to_string()],
+            "the delegate's session is not handed to the extractor"
+        );
+        assert_eq!(
+            events.watermarks(),
+            vec![
+                ("run-1".to_string(), Some(DELEGATED_TURN.to_string())),
+                ("run-2".to_string(), None),
+            ],
+            "and it is retired with its reason, not left for every future sweep"
         );
     }
 
