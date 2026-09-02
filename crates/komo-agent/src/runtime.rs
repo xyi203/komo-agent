@@ -15,6 +15,12 @@ use komo_core::domain::{
         TurnRecorder, UserMessageEvent,
     },
 };
+/// How many of a session's runs retention asks the ledger about. The watermark
+/// it needs is the *oldest* unlearned run, and the sweep retires runs in
+/// batches, so a session with more pending than this has its floor pinned by
+/// one of them regardless.
+const RETENTION_LEDGER_SCAN: usize = 500;
+
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -284,6 +290,7 @@ impl AgentRuntime {
         if let Err(error) = self.runs.finish(&run).await {
             warn!(%error, "failed to finalize run ledger entry (non-fatal)");
         }
+        self.log_upkeep(&run.session_id).await;
 
         // Learning, detached from the reply path and dispatched **after** the
         // ledger closed. It reads this run back as an episode — status, steps
@@ -568,8 +575,62 @@ impl AgentRuntime {
             // over what has landed. Skipped rather than attempted and refused.
             return;
         }
-        if let Err(error) = self.events.turn_boundary(session_id).await {
-            warn!(%error, "session log upkeep failed at a turn boundary (non-fatal)");
+    }
+
+    /// Let the session's log do its own upkeep now that the turn is over and the
+    /// ledger has closed it.
+    ///
+    /// Rolls a full segment, and cuts the log back toward its budget when that
+    /// roll put it over. **After `runs.finish`, not at the durable write**: the
+    /// turn that just ended is protected by being unlearned, and the ledger only
+    /// offers a *finished* run as unlearned — run any earlier and the newest
+    /// turn is invisible to the rule that exists to protect it.
+    async fn log_upkeep(&self, session_id: &str) {
+        match self.events.turn_boundary(session_id).await {
+            // Only a roll can put the log over its budget, so the cut is
+            // considered only then — and its input costs a full read.
+            Ok(true) => self.retain(session_id).await,
+            Ok(false) => {}
+            Err(error) => warn!(%error, "session log upkeep failed at a turn boundary (non-fatal)"),
+        }
+    }
+
+    /// Cut the session's log back toward its budget, keeping every turn that is
+    /// still resumable or still unlearned.
+    ///
+    /// Both are read off the log's own projection except `learned`, which is the
+    /// sweep's watermark and lives on the ledger row. A turn nobody has finished
+    /// with outranks the space it costs: finding no safe cut is a normal answer,
+    /// and leaves the session over budget.
+    async fn retain(&self, session_id: &str) {
+        let events = match self.events.events(session_id).await {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(%error, "failed to read the session log for retention (non-fatal)");
+                return;
+            }
+        };
+        let unlearned: std::collections::HashSet<String> = self
+            .runs
+            .unlearned(Some(session_id), RETENTION_LEDGER_SCAN)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        let keep_from = komo_core::domain::run_projection::project_runs(session_id, &events)
+            .into_iter()
+            .filter(|projected| projected.run.recoverable || unlearned.contains(&projected.run.id))
+            .map(|projected| projected.start_seq)
+            .min()
+            .unwrap_or(u64::MAX);
+
+        match self.events.retain(session_id, keep_from).await {
+            Ok(Some(through)) => {
+                info!(session_id, through, "cut the session log back into budget")
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "failed to cut the session log (non-fatal)"),
         }
     }
 
@@ -1563,6 +1624,78 @@ mod tests {
                 assert_eq!(folded.output_paths, row.output_paths);
             }
         }
+    }
+
+    /// Wraps the real store, reports every turn as a roll, and records the
+    /// retention floor the runtime computed instead of cutting.
+    struct RetentionSpy {
+        inner: Arc<Db>,
+        floors: Arc<Mutex<Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl SessionEventRepository for RetentionSpy {
+        async fn append(
+            &self,
+            session_id: &str,
+            kinds: Vec<SessionEventKind>,
+        ) -> anyhow::Result<Vec<u64>> {
+            self.inner.append(session_id, kinds).await
+        }
+        async fn durable_flush(&self, session_id: &str) -> anyhow::Result<()> {
+            self.inner.durable_flush(session_id).await
+        }
+        async fn events(&self, session_id: &str) -> anyhow::Result<Vec<SessionEvent>> {
+            self.inner.events(session_id).await
+        }
+        async fn turn_boundary(&self, _session_id: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn retain(&self, _session_id: &str, keep_from: u64) -> anyhow::Result<Option<u64>> {
+            self.floors.lock().unwrap().push(keep_from);
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_will_not_cut_into_a_turn_nobody_has_finished_with() {
+        // Space never outranks a turn that is still resumable or still
+        // unlearned. The floor is the oldest such turn's own start, so a session
+        // that has never been learned from cannot be cut at all — and once the
+        // sweep retires that turn, the floor moves up to the next one.
+        let db = Arc::new(Db::connect(&sqlite_url("komo_rt_retain")).await.unwrap());
+        let floors = Arc::new(Mutex::new(Vec::new()));
+        // The scripted driver is handed the whole script on its first turn, so
+        // each turn here gets its own runtime over the same store.
+        let spy = |floors: &Arc<Mutex<Vec<u64>>>| RetentionSpy {
+            inner: db.clone(),
+            floors: floors.clone(),
+        };
+        let (mut rt, _) = scripted_runtime(db.clone(), vec![Step::Final("one".into())], vec![], 30);
+        rt.events = Arc::new(spy(&floors));
+        rt.handle_input("cli:s-retain", "hi".into()).await.unwrap();
+        assert_eq!(
+            floors.lock().unwrap().as_slice(),
+            &[0],
+            "the turn that just ran is unlearned, so nothing below its start may go"
+        );
+
+        // The sweep retires it; now only the next turn holds the floor.
+        let first = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+        RunRepository::mark_learned(&*db, &[first.id.clone()])
+            .await
+            .unwrap();
+        floors.lock().unwrap().clear();
+        let (mut rt, _) = scripted_runtime(db.clone(), vec![Step::Final("two".into())], vec![], 30);
+        rt.events = Arc::new(spy(&floors));
+        rt.handle_input("cli:s-retain", "again".into())
+            .await
+            .unwrap();
+        assert!(
+            floors.lock().unwrap()[0] > 0,
+            "a learned turn no longer pins the floor at the start of the log, got {:?}",
+            floors.lock().unwrap()
+        );
     }
 
     #[tokio::test]

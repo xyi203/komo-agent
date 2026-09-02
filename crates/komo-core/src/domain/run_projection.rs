@@ -34,6 +34,12 @@ use super::session_event::{MessageSource, SessionEvent, SessionEventKind, ToolOu
 pub struct ProjectedRun {
     pub run: Run,
     pub steps: Vec<ProjectedStep>,
+    /// Where this turn begins in the log — the seq of its `turn/started`.
+    ///
+    /// Retention deletes whole segments, so the question it has to answer is
+    /// "from which seq on must the log survive intact", and a run's id says
+    /// nothing about that.
+    pub start_seq: u64,
 }
 
 /// One call, and whether the log ever saw it finish.
@@ -90,6 +96,7 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
             runs.push(ProjectedRun {
                 run,
                 steps: Vec::new(),
+                start_seq: event.seq,
             });
             replies.push(String::new());
             continue;
@@ -316,7 +323,7 @@ mod tests {
         ];
         let projected = project_runs("s1", &events);
         assert_eq!(projected.len(), 1);
-        let ProjectedRun { run, steps } = &projected[0];
+        let ProjectedRun { run, steps, .. } = &projected[0];
         assert_eq!(run.id, "t1");
         assert_eq!(run.session_id, "s1");
         assert_eq!(run.input, "go");

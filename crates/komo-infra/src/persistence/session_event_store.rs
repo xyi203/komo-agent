@@ -21,7 +21,7 @@ use komo_core::domain::session_event::{
 };
 use tokio::sync::Mutex;
 
-use super::session_log::{LogError, SessionLog};
+use super::session_log::{LogError, RetentionBase, SESSION_RETAINED_BYTES, SessionLog};
 
 type Result<T> = std::result::Result<T, LogError>;
 
@@ -118,6 +118,30 @@ impl SessionEventStore {
             Some(log) => log.seal_if_full().await,
             None => Ok(false),
         }
+    }
+
+    /// Cut the log back toward its retained budget, keeping everything from
+    /// `keep_from` on intact. Returns the seq it truncated through, or `None`
+    /// when it did not cut.
+    ///
+    /// Drops the **oldest** sealed segment only. Sealing happens once per
+    /// segment's worth of writing, so a session over budget sheds its oldest
+    /// segment each time it gains a new one and settles at the budget — no size
+    /// accounting, and no cliff where crossing the line costs a session most of
+    /// its detail at once.
+    pub async fn retain(&self, session_id: &str, keep_from: u64) -> Result<Option<u64>> {
+        let Some(log) = self.existing(session_id).await? else {
+            return Ok(None);
+        };
+        // `None` when the log is inside its budget, or when every cut it could
+        // make would reach into what must survive.
+        let Some(cut) = log.retention_cut(SESSION_RETAINED_BYTES, keep_from).await? else {
+            return Ok(None);
+        };
+        let events = log.load().await?;
+        let base = RetentionBase::cut(&events, cut, log.truncated_before().await)?;
+        log.truncate(base).await?;
+        Ok(Some(cut))
     }
 
     pub async fn append(

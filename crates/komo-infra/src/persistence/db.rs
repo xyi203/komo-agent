@@ -731,9 +731,12 @@ impl SessionEventRepository for Db {
         Ok(self.events.events(session_id).await?)
     }
 
-    async fn turn_boundary(&self, session_id: &str) -> anyhow::Result<()> {
-        self.events.seal(session_id).await?;
-        Ok(())
+    async fn turn_boundary(&self, session_id: &str) -> anyhow::Result<bool> {
+        Ok(self.events.seal(session_id).await?)
+    }
+
+    async fn retain(&self, session_id: &str, keep_from: u64) -> anyhow::Result<Option<u64>> {
+        Ok(self.events.retain(session_id, keep_from).await?)
     }
 }
 

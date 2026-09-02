@@ -125,7 +125,20 @@ pub trait SessionEventRepository: Send + Sync {
     /// the log may cut itself: its unit of deletion has to hold whole turns, or
     /// the recoverable half of a turn becomes unsplittable from the deletable
     /// one. Best-effort — the turn is already over and nothing here may fail it.
-    async fn turn_boundary(&self, session_id: &str) -> anyhow::Result<()>;
+    ///
+    /// Answers whether the log rolled, which is the only moment its retained
+    /// size can cross budget and so the only moment [`Self::retain`] has
+    /// anything new to consider.
+    async fn turn_boundary(&self, session_id: &str) -> anyhow::Result<bool>;
+
+    /// Cut the log back toward its retained budget, keeping everything from
+    /// `keep_from` on intact. Answers the seq it truncated through, if it cut.
+    ///
+    /// The caller owns `keep_from` because the log cannot know it: which turns
+    /// are still resumable or still unlearned is the ledger's question, and
+    /// **space never outranks it** — a session sits over budget rather than
+    /// drop a turn nobody has finished with.
+    async fn retain(&self, session_id: &str, keep_from: u64) -> anyhow::Result<Option<u64>>;
 }
 
 #[async_trait]

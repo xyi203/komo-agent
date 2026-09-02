@@ -55,7 +55,7 @@ const SEGMENT_TARGET_BYTES: u64 = 1024 * 1024;
 /// Sealed segments over this much invite a retention sweep. Deliberately far
 /// above any single turn: one 400k-token turn's events must never be able to
 /// push a session past its own budget mid-turn.
-const SESSION_RETAINED_BYTES: u64 = 32 * 1024 * 1024;
+pub(super) const SESSION_RETAINED_BYTES: u64 = 32 * 1024 * 1024;
 
 const MANIFEST_FILE: &str = "manifest.json";
 
@@ -107,9 +107,10 @@ fn base_file_name(through_seq: u64) -> String {
 /// gone, deleting it puts a hole in history — which is why a reader that cannot
 /// load it refuses the session rather than falling back to the retained tail.
 ///
-/// It holds surviving events **verbatim**, so a reader folds base-then-tail
-/// with one rule instead of two. Their seqs are below `truncated_before` and
-/// are deliberately not contiguous: only what still matters survives.
+/// It holds surviving events with their seq and content intact, so a reader
+/// folds base-then-tail with one rule instead of two. Their seqs are below
+/// `truncated_before` and are deliberately not contiguous: only what still
+/// matters survives.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetentionBase {
     /// Inclusive. Every event at or below this is accounted for by the base.
@@ -117,6 +118,71 @@ pub struct RetentionBase {
     /// In seq order: the conversation surface's message events, plus the latest
     /// `request/header` and `request/context`.
     pub events: Vec<SessionEvent>,
+}
+
+impl RetentionBase {
+    /// What survives a cut at `through_seq`: the surface as it stands there,
+    /// plus the envelope needed to reopen the session.
+    ///
+    /// `dense_from` is the log's current `truncated_before` — the events are
+    /// folded to find the surface, and a log that was already cut once is
+    /// already sparse below it.
+    ///
+    /// Surviving nodes are re-declared as `append`. A replacement is kept only
+    /// because it is *on* the surface, and the nodes it shadowed are exactly
+    /// what a cut drops — so replaying its `replace` would look for a `start`
+    /// that no longer exists and refuse the whole log. Rewriting it to an
+    /// append preserves the surface exactly and loses only a citation whose
+    /// targets are gone.
+    pub fn cut(events: &[SessionEvent], through_seq: u64, dense_from: u64) -> Result<Self> {
+        use komo_core::domain::session_event::fold_surface;
+
+        let surface = fold_surface(events, dense_from)?;
+        let live: std::collections::HashSet<u64> = surface.nodes().iter().copied().collect();
+        let mut kept: Vec<SessionEvent> = events
+            .iter()
+            .filter(|e| e.seq <= through_seq && live.contains(&e.seq))
+            .cloned()
+            .map(as_append)
+            .collect();
+
+        // The envelope: without it a resumed turn would re-assemble a *different*
+        // request. Same "latest at or below the cut" rule the folds read it by.
+        let covered = |e: &&SessionEvent| e.seq <= through_seq;
+        for latest in [
+            events
+                .iter()
+                .filter(covered)
+                .rfind(|e| matches!(e.kind, SessionEventKind::RequestHeader(_))),
+            events
+                .iter()
+                .filter(covered)
+                .rfind(|e| matches!(e.kind, SessionEventKind::RequestContext(_))),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !live.contains(&latest.seq) {
+                kept.push(latest.clone());
+            }
+        }
+        kept.sort_by_key(|e| e.seq);
+        Ok(Self {
+            through_seq,
+            events: kept,
+        })
+    }
+}
+
+/// Re-declare a surviving surface node as a plain append. See [`RetentionBase::cut`].
+fn as_append(mut event: SessionEvent) -> SessionEvent {
+    use komo_core::domain::session_event::SurfacePlacement;
+    match &mut event.kind {
+        SessionEventKind::UserMessage(message) => message.surface = SurfacePlacement::append(),
+        SessionEventKind::AssistantMessage(message) => message.surface = SurfacePlacement::append(),
+        _ => {}
+    }
+    event
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
@@ -398,13 +464,30 @@ impl SessionLog {
         Ok(true)
     }
 
-    /// Sealed segments, oldest first, when the log is over its retained budget.
+    /// Where this log may cut, or `None` for nothing to do.
     ///
-    /// Empty when it is not. The caller decides how far to cut — the store does
-    /// not know whether a segment holds a recoverable or unlearned run, and
-    /// **space never outranks that**: a session is allowed to sit over budget
-    /// rather than drop a turn nobody has finished with.
-    pub async fn retention_candidates(&self) -> Result<Vec<SegmentRef>> {
+    /// `budget` is the retained-bytes ceiling; under it there is nothing to cut.
+    /// `keep_from` is the first seq that must survive intact — the caller's
+    /// question, because the log does not know which turns are still resumable
+    /// or still unlearned, and **space never outranks that**: a session sits
+    /// over budget rather than drop a turn nobody has finished with.
+    ///
+    /// Answers the **oldest** sealed boundary below `keep_from`, so a log over
+    /// budget sheds one segment each time it gains one and settles at the
+    /// ceiling — rather than shedding everything sealed the moment it crosses.
+    pub async fn retention_cut(&self, budget: u64, keep_from: u64) -> Result<Option<u64>> {
+        Ok(self
+            .retention_candidates(budget)
+            .await?
+            .iter()
+            .filter_map(|segment| segment.sealed_last_seq)
+            .filter(|last| *last < keep_from)
+            .min())
+    }
+
+    /// Sealed segments, oldest first, when the log is over `budget`. Empty when
+    /// it is not.
+    async fn retention_candidates(&self, budget: u64) -> Result<Vec<SegmentRef>> {
         let state = self.state.lock().await;
         let sealed: Vec<SegmentRef> = state
             .manifest
@@ -422,11 +505,7 @@ impl SessionLog {
                 .map(|m| m.len())
                 .unwrap_or(0);
         }
-        Ok(if total > SESSION_RETAINED_BYTES {
-            sealed
-        } else {
-            Vec::new()
-        })
+        Ok(if total > budget { sealed } else { Vec::new() })
     }
 
     /// Replace everything at or below `base.through_seq` with `base`.
@@ -746,6 +825,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_cuts_the_oldest_segment_and_stops_at_what_must_survive() {
+        let dir = dir("retention_cut");
+        let log = open(&dir).await;
+        log.append_batch(vec![say("a"), say("b")]).await;
+        log.durable_flush().await.unwrap();
+        force_seal(&log).await; // segment 0 ends at seq 1
+        log.append_batch(vec![say("c"), say("d")]).await;
+        log.durable_flush().await.unwrap();
+        force_seal(&log).await; // segment 1 ends at seq 3
+        log.append_batch(vec![say("e")]).await;
+        log.durable_flush().await.unwrap();
+
+        // Inside budget there is nothing to cut, however much may be dropped.
+        assert_eq!(log.retention_cut(u64::MAX, u64::MAX).await.unwrap(), None);
+        // Over budget it sheds the *oldest* segment, not everything sealed.
+        assert_eq!(log.retention_cut(0, u64::MAX).await.unwrap(), Some(1));
+        // A turn that must survive from seq 1 puts that cut out of reach, and
+        // the session stays over budget rather than lose it.
+        assert_eq!(log.retention_cut(0, 1).await.unwrap(), None);
+        // The next segment is still off limits while the floor sits inside it.
+        assert_eq!(log.retention_cut(0, 2).await.unwrap(), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cut_keeps_the_surface_and_the_envelope_and_nothing_else() {
+        // What survives is what a later turn needs: the conversation, and the
+        // envelope that says how to reopen it. The turn markers, rounds and
+        // tool calls that made it are the bulk, and they are what goes.
+        use komo_core::domain::session_event::{
+            HeaderReason, RequestHeaderEvent, ToolCallStartedEvent,
+        };
+        let events = vec![
+            SessionEvent::now(
+                0,
+                SessionEventKind::TurnStarted {
+                    turn_id: "t1".into(),
+                    resumed_from: None,
+                },
+            ),
+            SessionEvent::now(1, say("q1")),
+            SessionEvent::now(
+                2,
+                SessionEventKind::RequestHeader(RequestHeaderEvent {
+                    reason: HeaderReason::Initial,
+                    provider: "codex".into(),
+                    model: "gpt-test".into(),
+                    effort: String::new(),
+                    system: "SYSTEM".into(),
+                    tools: vec![],
+                    extra: None,
+                }),
+            ),
+            SessionEvent::now(
+                3,
+                SessionEventKind::ToolCallStarted(ToolCallStartedEvent {
+                    turn_id: "t1".into(),
+                    call_id: "c1".into(),
+                    call_index: 0,
+                    tool: "read".into(),
+                    args: "{}".into(),
+                }),
+            ),
+            SessionEvent::now(
+                4,
+                SessionEventKind::TurnCompleted {
+                    turn_id: "t1".into(),
+                },
+            ),
+            SessionEvent::now(5, say("q2")),
+        ];
+        let base = RetentionBase::cut(&events, 4, 0).unwrap();
+        assert_eq!(base.through_seq, 4);
+        assert_eq!(
+            base.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the message and the envelope, not the turn markers or the call"
+        );
+        // Above the cut is the retained tail's business, not the base's.
+        assert!(base.events.iter().all(|e| e.seq <= 4));
+    }
+
+    #[test]
+    fn a_surviving_replacement_becomes_an_append_so_the_base_can_be_folded() {
+        // A summary is kept because it is on the surface; the messages it
+        // shadowed are exactly what the cut drops. Replaying its `replace`
+        // would then look for a `start` that no longer exists and refuse the
+        // whole log — so what survives is re-declared as an append.
+        use komo_core::domain::session_event::{
+            MessageSource, SurfacePlacement, UserMessageEvent, fold_surface,
+        };
+        let summary = SessionEvent::now(
+            2,
+            SessionEventKind::UserMessage(UserMessageEvent {
+                turn_id: "t2".into(),
+                content: "[summary]".into(),
+                source: MessageSource::Compaction,
+                surface: SurfacePlacement::replace(0, 1, vec![0, 1]),
+            }),
+        );
+        let events = vec![
+            SessionEvent::now(0, say("q1")),
+            SessionEvent::now(1, say("a1")),
+            summary,
+            SessionEvent::now(3, say("q2")),
+        ];
+        // Before the cut the summary shadows the two messages it covers.
+        assert_eq!(fold_surface(&events, 0).unwrap().nodes(), &[2, 3]);
+
+        let base = RetentionBase::cut(&events, 2, 0).unwrap();
+        assert_eq!(
+            base.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![2]
+        );
+        // Folding the base with the retained tail gives the same surface, which
+        // it could not if the replacement had been kept as one.
+        let mut rebuilt = base.events.clone();
+        rebuilt.push(events[3].clone());
+        assert_eq!(fold_surface(&rebuilt, 3).unwrap().nodes(), &[2, 3]);
+    }
+
+    #[tokio::test]
     async fn a_base_that_kept_only_what_still_matters_still_reads() {
         // A real base is **sparse**: it holds the surface's messages and the
         // latest envelope, not every event below the cut. Its seqs therefore
@@ -881,7 +1082,12 @@ mod tests {
         log.append_batch(vec![say("a")]).await;
         log.durable_flush().await.unwrap();
         force_seal(&log).await;
-        assert!(log.retention_candidates().await.unwrap().is_empty());
+        assert!(
+            log.retention_candidates(SESSION_RETAINED_BYTES)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

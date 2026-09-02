@@ -566,8 +566,12 @@ mod approval_gate_tests {
             Ok(Vec::new())
         }
 
-        async fn turn_boundary(&self, _session_id: &str) -> anyhow::Result<()> {
-            Ok(())
+        async fn turn_boundary(&self, _session_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn retain(&self, _session_id: &str, _keep_from: u64) -> anyhow::Result<Option<u64>> {
+            Ok(None)
         }
     }
 
