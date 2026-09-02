@@ -471,6 +471,12 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
 
 - state.db 的 Run/RunStep 表保留为查询索引，不再由 runtime 和 executor 直接作为事实源写入。
 - projector 保存 `last_seq`，提交必须幂等；提供按单 session 和全量 rebuild。
+  **写入端已完成、尚未接线**：`RunProjectionStore::commit`（core 定义、`Db` 实现）
+  把一次 fold 幂等地 upsert 成 Run/RunStep/RunMemory 行，水位存在
+  `projection:runs:<session>`，推不动就整段跳过；`Db::rebuild_run_projection`
+  是无视水位的全量重建。行持有的两个字段按 merge 处理：`outcome` 根本不写，
+  `learned` 只增不减——重建不能把学过的 turn 送回 backlog。接线要等下面
+  第 1、4 两件事，否则 rebuild 会让 prune 掉的 run 复活。
 - `run list`、`run inspect`、`unlearned(None, 200)`、`skills audit`、`memory used` 全部继续走投影表。
 - `run prune` 的 tombstone 是 projection control state，不是 SessionEvent；prune 和投影删除保持
   一个 state.db 事务，不打开 N 个 session artifact。

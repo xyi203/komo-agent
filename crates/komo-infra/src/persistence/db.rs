@@ -23,6 +23,7 @@ use komo_core::domain::{
     reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
     repository::{MessageRepository, SessionEventRepository, SessionRepository},
     run::{INTERRUPTED_ERROR, MemoryUse, Run, RunRepository, RunStatus, RunStep, parse_run_status},
+    run_projection::{ProjectedRun, RunProjectionStore, project_runs},
     session::{ChannelPeer, Session},
     session_event::{SESSION_EVENT_VERSION, SessionEvent, SessionEventKind, SessionHeader},
     skill::Skill,
@@ -279,6 +280,13 @@ const INBOX_STATUS_COMPLETED: &str = "completed";
 const HOME_SETTING_KEY: &str = "home_chat";
 /// Setting key for the briefing watermark (local date last handled).
 const BRIEFING_MARK_KEY: &str = "briefing_last_handled";
+
+/// Settings key holding how far one session's run projection is committed.
+/// Per session rather than one global cursor: the fold is per session, and a
+/// log that has not changed must be skippable on its own.
+fn run_projection_key(session_id: &str) -> String {
+    format!("projection:runs:{session_id}")
+}
 
 // ── Db ───────────────────────────────────────────────────────────────────────
 
@@ -1469,6 +1477,203 @@ impl RunRepository for Db {
             for id in run_ids {
                 let mut record = RunRecord::get_by_id(&mut tx, id).await?;
                 record.update().learned(true).exec(&mut tx).await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+// ── RunProjectionStore ────────────────────────────────────────────────────────
+
+#[async_trait]
+impl RunProjectionStore for Db {
+    async fn commit(
+        &self,
+        session_id: &str,
+        runs: &[ProjectedRun],
+        through: u64,
+    ) -> anyhow::Result<()> {
+        let key = run_projection_key(session_id);
+        let committed = self
+            .setting_get(&key)
+            .await?
+            .and_then(|value| value.parse::<u64>().ok());
+        if committed.is_some_and(|at| at >= through) {
+            return Ok(());
+        }
+        self.write_projection(runs).await?;
+        // The watermark lands *after* the rows, so a crash between the two
+        // re-commits a fold the tables already hold — which is the one thing a
+        // commit is allowed to do twice.
+        self.setting_set(&key, &through.to_string()).await
+    }
+}
+
+impl Db {
+    /// Re-commit every session's ledger out of its log, watermarks ignored.
+    ///
+    /// The repair path: these tables are disposable, and this is what makes
+    /// that true of the ledger too. Answers how many runs it wrote.
+    pub async fn rebuild_run_projection(&self) -> anyhow::Result<usize> {
+        let mut total = 0;
+        for session_id in self.events.session_ids().await? {
+            let events = self.events.events(&session_id).await?;
+            let runs = project_runs(&session_id, &events);
+            if runs.is_empty() {
+                continue;
+            }
+            let through = events.last().map(|event| event.seq).unwrap_or(0);
+            self.write_projection(&runs).await?;
+            self.setting_set(&run_projection_key(&session_id), &through.to_string())
+                .await?;
+            total += runs.len();
+        }
+        Ok(total)
+    }
+
+    /// Write one session's fold as rows, in a single transaction.
+    ///
+    /// Every write is an upsert and nothing is deleted: a settled call and a
+    /// finished turn are immutable in the log, so an existing row already
+    /// agrees with the fold, and a row the fold no longer produces would mean
+    /// the log lost events — which is a gap the loader rejects, not something
+    /// to clean up here.
+    async fn write_projection(&self, runs: &[ProjectedRun]) -> anyhow::Result<()> {
+        if runs.is_empty() {
+            return Ok(());
+        }
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let mut tx = conn.transaction().await?;
+            for projected in runs {
+                let run = &projected.run;
+                let memories = if run.memories.is_empty() {
+                    String::new()
+                } else {
+                    serde_json::to_string(&run.memories).unwrap_or_default()
+                };
+                match RunRecord::get_by_id(&mut tx, &run.id).await {
+                    Ok(mut record) => {
+                        // `outcome` is not here at all, and `learned` only ever
+                        // advances: both are row-held, and the fold overwriting
+                        // them would drop a verdict the user gave after the turn.
+                        let learned = record.learned || run.learned;
+                        record
+                            .update()
+                            .input(run.input.clone())
+                            .plan(run.plan.clone())
+                            .status(run.status.as_str().to_string())
+                            .final_output(run.final_output.clone())
+                            .error(run.error.clone())
+                            .recoverable(run.recoverable)
+                            .started_at(run.started_at)
+                            .ended_at(run.ended_at.unwrap_or(0))
+                            .tokens_in(run.tokens_in)
+                            .tokens_out(run.tokens_out)
+                            .tokens_cached(run.tokens_cached)
+                            .memories(memories.clone())
+                            .resumed_from(run.resumed_from.clone().unwrap_or_default())
+                            .learned(learned)
+                            .exec(&mut tx)
+                            .await?;
+                    }
+                    Err(_) => {
+                        toasty::create!(RunRecord {
+                            id: run.id.clone(),
+                            session_id: run.session_id.clone(),
+                            input: run.input.clone(),
+                            plan: run.plan.clone(),
+                            status: run.status.as_str().to_string(),
+                            final_output: run.final_output.clone(),
+                            error: run.error.clone(),
+                            recoverable: run.recoverable,
+                            started_at: run.started_at,
+                            ended_at: run.ended_at.unwrap_or(0),
+                            tokens_in: run.tokens_in,
+                            tokens_out: run.tokens_out,
+                            tokens_cached: run.tokens_cached,
+                            memories: memories.clone(),
+                            resumed_from: run.resumed_from.clone().unwrap_or_default(),
+                            learned: run.learned,
+                            outcome: String::new(),
+                        })
+                        .exec(&mut tx)
+                        .await?;
+                    }
+                }
+
+                // Only the calls that settled become rows — that is what the
+                // ledger has always held, and an unsettled call is the fold's
+                // own answer to recovery, not a step anyone ran.
+                let run_id = run.id.clone();
+                let existing = toasty::query!(RunStepRecord FILTER .run_id == #run_id)
+                    .exec(&mut tx)
+                    .await?;
+                for step in projected
+                    .steps
+                    .iter()
+                    .filter(|s| s.settled)
+                    .map(|s| &s.step)
+                {
+                    if existing.iter().any(|row| row.seq == step.seq) {
+                        continue;
+                    }
+                    toasty::create!(RunStepRecord {
+                        id: uuid::Uuid::now_v7().to_string(),
+                        run_id: step.run_id.clone(),
+                        seq: step.seq,
+                        tool_name: step.tool_name.clone(),
+                        args: step.args.clone(),
+                        result: step.result.clone(),
+                        error: step.error.clone(),
+                        ok: step.ok,
+                        uncertain: step.uncertain,
+                        started_at: step.started_at,
+                        ended_at: step.ended_at,
+                        elapsed_ms: step.elapsed_ms,
+                        structured: match &step.structured {
+                            serde_json::Value::Null => String::new(),
+                            value => value.to_string(),
+                        },
+                        output_paths: step.output_paths.join("\n"),
+                    })
+                    .exec(&mut tx)
+                    .await?;
+                }
+
+                // The reverse index `komo memory used` reads. Same upsert rule:
+                // a link is one turn's use of one memory, and the log states it
+                // once.
+                let mem_run_id = run.id.clone();
+                let links = toasty::query!(RunMemoryRecord FILTER .run_id == #mem_run_id)
+                    .exec(&mut tx)
+                    .await?;
+                for (memory_id, pinned) in run
+                    .memories
+                    .pinned
+                    .iter()
+                    .map(|id| (id, true))
+                    .chain(run.memories.recall.iter().map(|id| (id, false)))
+                {
+                    if links
+                        .iter()
+                        .any(|link| link.memory_id == *memory_id && link.pinned == pinned)
+                    {
+                        continue;
+                    }
+                    toasty::create!(RunMemoryRecord {
+                        id: uuid::Uuid::now_v7().to_string(),
+                        memory_id: memory_id.clone(),
+                        run_id: run.id.clone(),
+                        session_id: run.session_id.clone(),
+                        pinned,
+                        started_at: run.started_at,
+                    })
+                    .exec(&mut tx)
+                    .await?;
+                }
             }
             tx.commit().await?;
             Ok(())
@@ -2936,5 +3141,218 @@ mod tests {
             ids(RunRepository::unlearned(&db, None, 10).await.unwrap()),
             ["run-b"]
         );
+    }
+
+    // ── run projection ───────────────────────────────────────────────────────
+
+    /// One finished turn's worth of events: a question, a round, a tool call
+    /// that settled, the recall that shaped it, the reply, and the terminal
+    /// event. Enough that every projected table has something in it.
+    async fn log_a_finished_turn(db: &Db, session_id: &str, turn: &str, memory: &str) {
+        use komo_core::domain::session_event::{
+            AssistantMessageEvent, AssistantRoundEvent, MessageSource, SurfacePlacement,
+            ToolCallSettledEvent, ToolCallStartedEvent, ToolOutcome, UserMessageEvent,
+        };
+        let kinds = vec![
+            SessionEventKind::TurnStarted {
+                turn_id: turn.into(),
+                resumed_from: None,
+            },
+            SessionEventKind::UserMessage(UserMessageEvent {
+                turn_id: turn.into(),
+                content: "what time is it".into(),
+                source: MessageSource::User,
+                surface: SurfacePlacement::append(),
+            }),
+            SessionEventKind::AssistantRound(AssistantRoundEvent {
+                turn_id: turn.into(),
+                round: 0,
+                response_id: "resp-1".into(),
+                blocks: serde_json::json!([]),
+                tokens_in: 120,
+                tokens_out: 30,
+                tokens_cached: 100,
+            }),
+            SessionEventKind::ToolCallStarted(ToolCallStartedEvent {
+                turn_id: turn.into(),
+                call_id: "c1".into(),
+                call_index: 0,
+                tool: "time".into(),
+                args: "{}".into(),
+            }),
+            SessionEventKind::ToolCallSettled(ToolCallSettledEvent {
+                turn_id: turn.into(),
+                call_id: "c1".into(),
+                call_index: 0,
+                outcome: ToolOutcome::Succeeded,
+                result: "09:00".into(),
+                error: String::new(),
+                elapsed_ms: 12,
+                structured: serde_json::Value::Null,
+                output_paths: Vec::new(),
+            }),
+            SessionEventKind::TurnMemories {
+                turn_id: turn.into(),
+                memories: komo_core::domain::run::RecalledMemories {
+                    pinned: Vec::new(),
+                    recall: vec![memory.to_string()],
+                },
+            },
+            SessionEventKind::AssistantMessage(AssistantMessageEvent {
+                turn_id: turn.into(),
+                content: "it is 09:00".into(),
+                tool_note: String::new(),
+                surface: SurfacePlacement::append(),
+            }),
+            SessionEventKind::TurnCompleted {
+                turn_id: turn.into(),
+            },
+        ];
+        SessionEventRepository::append(db, session_id, kinds)
+            .await
+            .unwrap();
+        SessionEventRepository::durable_flush(db, session_id)
+            .await
+            .unwrap();
+    }
+
+    /// Commit the session's whole log as the projector would after a turn.
+    async fn project(db: &Db, session_id: &str) {
+        let events = SessionEventRepository::events(db, session_id)
+            .await
+            .unwrap();
+        let through = events.last().map(|e| e.seq).unwrap_or(0);
+        let runs = project_runs(session_id, &events);
+        RunProjectionStore::commit(db, session_id, &runs, through)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_ledger_rebuilds_from_the_log_alone() {
+        let db = Db::connect(&sqlite_url("komo_projection.db"))
+            .await
+            .unwrap();
+        log_a_finished_turn(&db, "s-proj", "t1", "m1").await;
+
+        project(&db, "s-proj").await;
+
+        let runs = RunRepository::list(&db, 10).await.unwrap();
+        assert_eq!(runs.len(), 1, "the turn the log holds");
+        let run = &runs[0];
+        assert_eq!(run.id, "t1");
+        assert_eq!(run.session_id, "s-proj");
+        assert_eq!(run.input, "what time is it");
+        assert_eq!(run.final_output, "it is 09:00");
+        assert_eq!(run.status, RunStatus::Done);
+        assert!(!run.recoverable, "a completed turn is not resumable");
+        assert_eq!(
+            (run.tokens_in, run.tokens_out, run.tokens_cached),
+            (120, 30, 100)
+        );
+        assert_eq!(run.memories.recall, vec!["m1".to_string()]);
+
+        let steps = RunRepository::steps(&db, "t1").await.unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].tool_name, "time");
+        assert_eq!(steps[0].result, "09:00");
+        assert_eq!(steps[0].elapsed_ms, 12);
+
+        // The two derived indexes every operator surface reads.
+        let uses = RunRepository::runs_using_memory(&db, "m1", 10)
+            .await
+            .unwrap();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].run_id, "t1");
+        let audit = RunRepository::steps_by_tool(&db, "time", 10).await.unwrap();
+        assert_eq!(audit.len(), 1);
+        let pending = RunRepository::unlearned(&db, None, 10).await.unwrap();
+        assert_eq!(pending.len(), 1, "nobody has learned from it yet");
+    }
+
+    /// A commit runs after every turn and again on a rebuild, over rows it has
+    /// already written. Duplicating a step would double the tool's history in
+    /// `skills audit`, and duplicating a link would double `memory used`.
+    #[tokio::test]
+    async fn committing_the_same_fold_twice_changes_nothing() {
+        let db = Db::connect(&sqlite_url("komo_projection_idem.db"))
+            .await
+            .unwrap();
+        log_a_finished_turn(&db, "s-idem", "t1", "m1").await;
+
+        project(&db, "s-idem").await;
+        // Same watermark: the second call is the one that must not double-write.
+        project(&db, "s-idem").await;
+        // And once more with the watermark ignored, as a rebuild does.
+        db.rebuild_run_projection().await.unwrap();
+
+        assert_eq!(RunRepository::list(&db, 10).await.unwrap().len(), 1);
+        assert_eq!(RunRepository::steps(&db, "t1").await.unwrap().len(), 1);
+        assert_eq!(
+            RunRepository::runs_using_memory(&db, "m1", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The two row-held fields. `outcome` is revised by a *later* turn and the
+    /// log never carries it; `learned` is a watermark that may predate the
+    /// events that now record it. A rebuild that overwrote either would throw
+    /// away the user's own verdict, or re-extract every turn ever learned from.
+    #[tokio::test]
+    async fn a_rebuild_keeps_what_the_log_does_not_know() {
+        let db = Db::connect(&sqlite_url("komo_projection_merge.db"))
+            .await
+            .unwrap();
+        log_a_finished_turn(&db, "s-merge", "t1", "m1").await;
+        project(&db, "s-merge").await;
+
+        RunRepository::set_outcome(&db, "t1", "{\"verdict\":\"success\"}")
+            .await
+            .unwrap();
+        RunRepository::mark_learned(&db, &["t1".to_string()])
+            .await
+            .unwrap();
+
+        db.rebuild_run_projection().await.unwrap();
+
+        let run = RunRepository::get(&db, "t1").await.unwrap().unwrap();
+        assert_eq!(run.outcome, "{\"verdict\":\"success\"}");
+        assert!(run.learned, "a learned turn must not return to the backlog");
+        assert!(
+            RunRepository::unlearned(&db, None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The watermark exists so a session whose log has not moved costs nothing
+    /// to re-commit. A stale one must still be able to catch up.
+    #[tokio::test]
+    async fn a_commit_that_would_not_advance_the_watermark_is_skipped() {
+        let db = Db::connect(&sqlite_url("komo_projection_mark.db"))
+            .await
+            .unwrap();
+        log_a_finished_turn(&db, "s-mark", "t1", "m1").await;
+        project(&db, "s-mark").await;
+
+        // A fold the projection has already committed, offered again with a
+        // *lower* watermark: it must not be treated as new.
+        let events = SessionEventRepository::events(&db, "s-mark").await.unwrap();
+        let mut folded = project_runs("s-mark", &events);
+        folded[0].run.input = "rewritten behind the log's back".into();
+        RunProjectionStore::commit(&db, "s-mark", &folded, 0)
+            .await
+            .unwrap();
+        let run = RunRepository::get(&db, "t1").await.unwrap().unwrap();
+        assert_eq!(run.input, "what time is it");
+
+        // A second turn moves the log on, and the projection follows.
+        log_a_finished_turn(&db, "s-mark", "t2", "m2").await;
+        project(&db, "s-mark").await;
+        assert_eq!(RunRepository::list(&db, 10).await.unwrap().len(), 2);
     }
 }

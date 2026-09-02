@@ -21,9 +21,37 @@
 //!   `Failed` with an interrupted error is the reconciler's job at startup, not
 //!   a fact the log states.
 
+use async_trait::async_trait;
+
 use super::cancel::CANCELLED_ERROR;
 use super::run::{RUN_FIELD_CAP, Run, RunStatus, RunStep, truncate};
 use super::session_event::{MessageSource, SessionEvent, SessionEventKind, ToolOutcome};
+
+/// Where a folded ledger lands: the query tables `komo run`, `skills audit` and
+/// `memory used` read.
+///
+/// The write half of this module. A commit is **idempotent** — it is replayed
+/// after every turn and again by a full rebuild, over rows that may already
+/// hold most of what it is committing.
+#[async_trait]
+pub trait RunProjectionStore: Send + Sync {
+    /// Commit one session's folded runs, which the log holds `through` this seq.
+    ///
+    /// `through` is the projection's watermark, and a commit that would not
+    /// advance it is skipped: a session gains events constantly and the fold is
+    /// over the whole log, so re-committing an unchanged one is pure cost.
+    ///
+    /// Row-held fields are **merged, never overwritten**: [`Run::outcome`] is
+    /// revised by a later turn and the log does not carry it, and
+    /// [`Run::learned`] only ever advances — a rebuild must not un-retire a
+    /// turn whose watermark event predates the log it can still read.
+    async fn commit(
+        &self,
+        session_id: &str,
+        runs: &[ProjectedRun],
+        through: u64,
+    ) -> anyhow::Result<()>;
+}
 
 /// One turn, as the log records it.
 #[derive(Debug, Clone)]
