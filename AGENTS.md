@@ -86,12 +86,17 @@ reject two consecutive user messages on replay. Keeping that true at each write
 site took three separate patches; it is now one function, testable without a
 database. **Add a new read path through `projected`, never `entries`.**
 
-A **windowed** read (`find_windowed`, every turn) reads only the file's
-tail — reading a whole conversation to discard all but its last few
-messages costs IO and parsing on the reply path that grows for as long as
-the session lives. It falls back to the full read when the tail does not
-hold the window, so the window is never short; the fold rules resolve
-against the most recent user message, which a window always contains.
+A **windowed** read (`find_windowed`, every turn) is served from the session's
+**surface checkpoint** (`sessions/<id>/surface.json`, `SurfaceProjection`) plus
+the events appended since — reading a whole conversation to discard all but its
+last few messages costs IO and parsing on the reply path that grows for as long
+as the session lives. The checkpoint is a **cache, never an authority**: a
+version mismatch, a retention cut that moved `truncated_before`, an unparseable
+file, or a tail that will not fold onto it all mean "re-fold the log", and the
+log always wins. It is refreshed at `turn_boundary` (best-effort), and folding a
+prefix then the rest provably gives the same history as folding everything —
+at *any* split point, which is why `SurfaceContent` carries the turn that put
+each node on the surface.
 
 Schema-change rules (toasty's `push_schema` runs only for **new** db files, and
 is not idempotent):

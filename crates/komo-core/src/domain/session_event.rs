@@ -547,52 +547,55 @@ pub fn derive_messages(
     events: &[SessionEvent],
     dense_from: u64,
 ) -> Result<Vec<Message>, FoldError> {
-    let surface = fold_surface(events, dense_from)?;
-    let mut by_seq: std::collections::HashMap<u64, &SessionEvent> =
-        std::collections::HashMap::with_capacity(events.len());
-    for event in events {
-        by_seq.insert(event.seq, event);
+    SurfaceProjection::fold(events, dense_from)?.messages()
+}
+
+/// What one surface node contributes to the replayed conversation.
+///
+/// The log stays the authority on what an event *says*; this is that content
+/// projected — which is what a checkpoint can carry across a process without
+/// re-reading the events it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceContent {
+    pub role: SurfaceRole,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool_note: String,
+    /// The turn that put this node on the surface. Carried so a pristine cancel
+    /// can take its own back even when the node it removes was folded by an
+    /// earlier read — which is what makes a checkpoint safe to take anywhere.
+    pub turn: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SurfaceRole {
+    User,
+    /// Something the user said while the turn was already running.
+    Injected,
+    Assistant,
+}
+
+/// One event's contribution to the surface, or `None` if it makes no message.
+pub fn surface_content(event: &SessionEvent) -> Option<SurfaceContent> {
+    match &event.kind {
+        SessionEventKind::UserMessage(m) => Some(SurfaceContent {
+            role: match m.source {
+                MessageSource::Injected => SurfaceRole::Injected,
+                _ => SurfaceRole::User,
+            },
+            text: m.content.clone(),
+            tool_note: String::new(),
+            turn: m.turn_id.clone(),
+        }),
+        SessionEventKind::AssistantMessage(m) => Some(SurfaceContent {
+            role: SurfaceRole::Assistant,
+            text: m.content.clone(),
+            tool_note: m.tool_note.clone(),
+            turn: m.turn_id.clone(),
+        }),
+        _ => None,
     }
-    let mut out: Vec<Message> = Vec::with_capacity(surface.nodes().len());
-    for seq in surface.nodes() {
-        let Some(event) = by_seq.get(seq) else {
-            // The surface only ever holds seqs it saw, so this is unreachable
-            // through `fold_surface` — but a caller assembling a surface by
-            // hand must not silently get a short history.
-            return Err(FoldError::InvalidReplacement {
-                seq: *seq,
-                reason: "surface node has no event".to_string(),
-            });
-        };
-        match &event.kind {
-            // Something the user said while the turn was already running belongs
-            // to that turn's input, not to a turn of its own: two consecutive
-            // user messages is exactly what a transcript may not contain, and
-            // several providers reject it on replay.
-            SessionEventKind::UserMessage(m) if m.source == MessageSource::Injected => {
-                match out.last_mut().filter(|last| last.role == Role::User) {
-                    Some(last) => {
-                        last.content.push('\n');
-                        last.content.push_str(&m.content);
-                    }
-                    None => out.push(Message::user(&m.content)),
-                }
-            }
-            SessionEventKind::UserMessage(m) => out.push(Message::user(&m.content)),
-            SessionEventKind::AssistantMessage(m) => {
-                out.push(Message::assistant(&m.content).with_tool_note(&m.tool_note))
-            }
-            // `fold_surface` only admits the two message kinds; anything else on
-            // the surface means the fold and this projection disagree.
-            _ => {
-                return Err(FoldError::InvalidReplacement {
-                    seq: *seq,
-                    reason: "surface node is not a message event".to_string(),
-                });
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// Records one turn's events into its session's log.
@@ -750,7 +753,7 @@ pub const KNOWN_EVENT_TYPES: &[&str] = &[
 ///
 /// Holds seqs, not content: the log stays the authority on what an event says,
 /// and this answers only *which* events a later turn replays, in what order.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Surface {
     nodes: Vec<u64>,
     /// Committed positional replacements, so an incremental consumer can tell
@@ -828,11 +831,30 @@ impl Surface {
 /// the missing seqs named are gone. That is a truncation, not a log that lost
 /// them, so only their order is checked. From `dense_from` on, a hole is a hole.
 pub fn fold_surface(events: &[SessionEvent], dense_from: u64) -> Result<Surface, FoldError> {
-    let mut surface = Surface::default();
-    // Which turn put each node on the surface, so a pristine cancel can take
-    // its own back without touching anything else.
-    let mut owner: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
-    let mut expected = dense_from;
+    fold_surface_from(
+        Surface::default(),
+        &mut std::collections::HashMap::new(),
+        events,
+        dense_from,
+        dense_from,
+    )
+}
+
+/// Continue a surface fold: `events` must begin at `expected`, and `surface` is
+/// what folding everything below it produced.
+///
+/// `owner` says which turn put each node already on `surface` there — the
+/// pristine-cancel rule's input, and the reason a checkpoint may be taken at any
+/// point rather than only at a turn boundary. It is extended as the fold goes.
+pub fn fold_surface_from(
+    surface: Surface,
+    owner: &mut std::collections::HashMap<u64, String>,
+    events: &[SessionEvent],
+    dense_from: u64,
+    expected: u64,
+) -> Result<Surface, FoldError> {
+    let mut surface = surface;
+    let mut expected = expected;
     let mut previous: Option<u64> = None;
     for event in events {
         if event.seq < dense_from {
@@ -870,6 +892,145 @@ pub fn fold_surface(events: &[SessionEvent], dense_from: u64) -> Result<Surface,
         }
     }
     Ok(surface)
+}
+
+/// Version of the surface projection's shape and meaning. A checkpoint written
+/// by any other version is ignored and re-folded: the log is the authority, so
+/// the cost of a mismatch is time, never a wrong history.
+pub const SURFACE_PROJECTION_VERSION: u32 = 1;
+
+/// The conversation surface, folded and carryable.
+///
+/// A **cache, never an authority.** Deleting it changes nothing but the time
+/// the next read takes; the events it was folded from are still there. What it
+/// buys is that a long-lived session stops re-parsing its whole log on every
+/// turn just to hand the model the last few messages.
+///
+/// It carries content as well as node seqs, because the events below the tail
+/// are exactly what an incremental read is trying not to read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceProjection {
+    /// Shape version — see [`SURFACE_PROJECTION_VERSION`].
+    pub v: u32,
+    /// The highest seq folded in, or `None` for a log with no events yet.
+    pub through_seq: Option<u64>,
+    /// The log's `truncated_before` when this was folded. A retention cut moves
+    /// it, and every seq below it means something different afterwards, so a
+    /// checkpoint from before the cut is not resumable.
+    pub dense_from: u64,
+    pub surface: Surface,
+    /// The content of each node **on the surface**, in no particular order.
+    /// Shadowed nodes are dropped: what a summary covered is read from the log,
+    /// not from here.
+    pub content: Vec<(u64, SurfaceContent)>,
+}
+
+impl SurfaceProjection {
+    /// Fold a whole log — the cold path, and the one a missing or unusable
+    /// checkpoint falls back to.
+    pub fn fold(events: &[SessionEvent], dense_from: u64) -> Result<Self, FoldError> {
+        Self {
+            v: SURFACE_PROJECTION_VERSION,
+            through_seq: None,
+            dense_from,
+            surface: Surface::default(),
+            content: Vec::new(),
+        }
+        .extend_from(events, dense_from)
+    }
+
+    /// Whether this checkpoint can be continued over a log whose
+    /// `truncated_before` is `dense_from`.
+    pub fn resumable(&self, dense_from: u64) -> bool {
+        self.v == SURFACE_PROJECTION_VERSION && self.dense_from == dense_from
+    }
+
+    /// The seq a resuming read must ask the log for.
+    pub fn read_from(&self) -> u64 {
+        self.through_seq
+            .map_or(self.dense_from, |through| through + 1)
+    }
+
+    /// Fold `tail` — which must begin at [`Self::read_from`] — onto this.
+    pub fn extend(&self, tail: &[SessionEvent]) -> Result<Self, FoldError> {
+        self.extend_from(tail, self.read_from())
+    }
+
+    fn extend_from(&self, events: &[SessionEvent], expected: u64) -> Result<Self, FoldError> {
+        let mut content: std::collections::HashMap<u64, SurfaceContent> =
+            self.content.iter().cloned().collect();
+        let mut owner: std::collections::HashMap<u64, String> = content
+            .iter()
+            .map(|(seq, node)| (*seq, node.turn.clone()))
+            .collect();
+        let surface = fold_surface_from(
+            self.surface.clone(),
+            &mut owner,
+            events,
+            self.dense_from,
+            expected,
+        )?;
+        for event in events {
+            if let Some(node) = surface_content(event) {
+                content.insert(event.seq, node);
+            }
+        }
+        // Only what the surface still holds: a shadowed node's content is dead
+        // weight in a file that is rewritten every turn.
+        let live: Vec<(u64, SurfaceContent)> = surface
+            .nodes()
+            .iter()
+            .filter_map(|seq| content.remove(seq).map(|node| (*seq, node)))
+            .collect();
+        Ok(Self {
+            v: SURFACE_PROJECTION_VERSION,
+            through_seq: events.last().map(|event| event.seq).or(self.through_seq),
+            dense_from: self.dense_from,
+            surface,
+            content: live,
+        })
+    }
+
+    /// The messages a later turn replays.
+    pub fn messages(&self) -> Result<Vec<Message>, FoldError> {
+        let content: std::collections::HashMap<u64, &SurfaceContent> = self
+            .content
+            .iter()
+            .map(|(seq, node)| (*seq, node))
+            .collect();
+        let mut out: Vec<Message> = Vec::with_capacity(self.surface.nodes().len());
+        for seq in self.surface.nodes() {
+            let Some(node) = content.get(seq) else {
+                // The surface only ever holds nodes this folded, so this is
+                // unreachable through `fold` — but a caller assembling one by
+                // hand must not silently get a short history.
+                return Err(FoldError::InvalidReplacement {
+                    seq: *seq,
+                    reason: "surface node has no content".to_string(),
+                });
+            };
+            match node.role {
+                // Something the user said while the turn was already running
+                // belongs to that turn's input, not to a turn of its own: two
+                // consecutive user messages is exactly what a transcript may
+                // not contain, and several providers reject it on replay.
+                SurfaceRole::Injected => {
+                    match out.last_mut().filter(|last| last.role == Role::User) {
+                        Some(last) => {
+                            last.content.push('\n');
+                            last.content.push_str(&node.text);
+                        }
+                        None => out.push(Message::user(&node.text)),
+                    }
+                }
+                SurfaceRole::User => out.push(Message::user(&node.text)),
+                SurfaceRole::Assistant => {
+                    out.push(Message::assistant(&node.text).with_tool_note(&node.tool_note))
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -1201,6 +1362,90 @@ mod tests {
                 surface: SurfacePlacement::append(),
             }),
         )
+    }
+
+    /// The property the checkpoint rests on: folding a prefix, carrying it, and
+    /// folding the rest gives the history the cold read gives. Split at *every*
+    /// point, including inside a turn and across a compaction, because a cache
+    /// that is right only at convenient boundaries is a cache that hands the
+    /// model a conversation that never happened.
+    #[test]
+    fn a_checkpoint_plus_its_tail_is_the_whole_log() {
+        let events = vec![
+            said(0, "turn-1", "q1", MessageSource::User),
+            assistant(1, "a1"),
+            said(2, "turn-2", "q2", MessageSource::User),
+            said(3, "turn-2", "and also this", MessageSource::Injected),
+            assistant(4, "a2"),
+            // A compaction shadows the first exchange.
+            SessionEvent::new(
+                5,
+                at("2026-08-31T00:00:00Z"),
+                SessionEventKind::UserMessage(UserMessageEvent {
+                    turn_id: "turn-3".into(),
+                    content: "earlier: q1/a1".into(),
+                    source: MessageSource::Compaction,
+                    surface: SurfacePlacement::replace(0, 1, vec![0, 1]),
+                }),
+            ),
+            // A turn that asked and was stopped before it did anything.
+            said(6, "turn-4", "never mind".into(), MessageSource::User),
+            cancelled(7, "turn-4", true),
+            said(8, "turn-5", "q3", MessageSource::User),
+            assistant(9, "a3"),
+        ];
+
+        // `Message` is not comparable, so compare what it carries.
+        fn shape(messages: &[Message]) -> Vec<(String, String, String)> {
+            messages
+                .iter()
+                .map(|m| {
+                    (
+                        format!("{:?}", m.role),
+                        m.content.clone(),
+                        m.tool_note.clone(),
+                    )
+                })
+                .collect()
+        }
+
+        let cold = SurfaceProjection::fold(&events, 0).unwrap();
+        let expected = shape(&cold.messages().unwrap());
+        assert_eq!(
+            expected
+                .iter()
+                .map(|(_, content, _)| content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["earlier: q1/a1", "q2\nand also this", "a2", "q3", "a3"],
+        );
+
+        for split in 0..=events.len() {
+            let head = SurfaceProjection::fold(&events[..split], 0).unwrap();
+            assert!(head.resumable(0));
+            let warm = head
+                .extend(&events[split..])
+                .unwrap_or_else(|e| panic!("split at {split}: {e}"));
+            assert_eq!(
+                shape(&warm.messages().unwrap()),
+                expected,
+                "a checkpoint after {split} events must not change the history"
+            );
+            assert_eq!(warm.surface, cold.surface, "split at {split}");
+        }
+    }
+
+    /// A checkpoint written before a retention cut is not resumable: every seq
+    /// below the new `truncated_before` means something different afterwards.
+    #[test]
+    fn a_truncation_retires_the_checkpoint_that_predates_it() {
+        let folded = SurfaceProjection::fold(&[said(0, "t", "q", MessageSource::User)], 0).unwrap();
+        assert!(folded.resumable(0));
+        assert!(!folded.resumable(4), "the log has been cut since");
+        let stale = SurfaceProjection {
+            v: SURFACE_PROJECTION_VERSION + 1,
+            ..folded
+        };
+        assert!(!stale.resumable(0), "and another shape is another meaning");
     }
 
     #[test]

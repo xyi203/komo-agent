@@ -17,11 +17,18 @@ use std::sync::Arc;
 
 use komo_core::domain::message::Message;
 use komo_core::domain::session_event::{
-    SESSION_EVENT_VERSION, SessionEvent, SessionEventKind, SessionHeader, derive_messages,
+    SESSION_EVENT_VERSION, SessionEvent, SessionEventKind, SessionHeader, SurfaceProjection,
 };
 use tokio::sync::Mutex;
 
 use super::session_log::{LogError, RetentionBase, SESSION_RETAINED_BYTES, SessionLog};
+
+/// The conversation surface, folded, beside the log it was folded from.
+///
+/// A cache and nothing more: delete it and the next read costs a full fold
+/// instead of a tail read. It is what keeps a long-lived session from
+/// re-parsing its whole log every turn just to replay the last few messages.
+const SURFACE_FILE: &str = "surface.json";
 
 type Result<T> = std::result::Result<T, LogError>;
 
@@ -82,11 +89,70 @@ impl SessionEventStore {
 
     /// Every message a later turn would replay, oldest first.
     pub async fn messages(&self, session_id: &str) -> Result<Vec<Message>> {
+        match self.surface(session_id).await? {
+            Some(projection) => Ok(projection.messages()?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The session's folded surface: its checkpoint plus whatever the log has
+    /// added since, or the whole log when no checkpoint is usable.
+    ///
+    /// Every disagreement resolves toward the log. A checkpoint from another
+    /// shape version, from before a retention cut, or one the tail will not
+    /// fold onto is dropped and re-folded — the cost of a stale cache is time,
+    /// never a history that never happened.
+    async fn surface(&self, session_id: &str) -> Result<Option<SurfaceProjection>> {
         let Some(log) = self.existing(session_id).await? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
+        let dense_from = log.truncated_before().await;
+        if let Some(checkpoint) = self
+            .read_checkpoint(session_id)
+            .await
+            .filter(|checkpoint| checkpoint.resumable(dense_from))
+        {
+            let tail = log.read_from(checkpoint.read_from()).await?;
+            match checkpoint.extend(&tail) {
+                Ok(projection) => return Ok(Some(projection)),
+                Err(error) => tracing::warn!(
+                    %error,
+                    session_id,
+                    "the surface checkpoint does not fold onto the log; re-folding it"
+                ),
+            }
+        }
         let events = log.load().await?;
-        Ok(derive_messages(&events, log.truncated_before().await)?)
+        Ok(Some(SurfaceProjection::fold(&events, dense_from)?))
+    }
+
+    /// Write the session's surface checkpoint.
+    ///
+    /// Called at a turn boundary, so the next turn's read is a tail read. Its
+    /// own cost is the fold it just did plus one small write, and it may fail
+    /// freely: the log already holds everything this describes.
+    pub async fn checkpoint_surface(&self, session_id: &str) -> Result<()> {
+        let Some(projection) = self.surface(session_id).await? else {
+            return Ok(());
+        };
+        let dir = self.dir_for(session_id);
+        let bytes = serde_json::to_vec(&projection)
+            .map_err(|e| LogError::Corrupt(format!("surface checkpoint: {e}")))?;
+        // Written aside and renamed: a half-written cache would be read as a
+        // whole one, and the fold would then disagree with the log.
+        let staged = dir.join(format!("{SURFACE_FILE}.tmp"));
+        tokio::fs::write(&staged, &bytes).await?;
+        tokio::fs::rename(&staged, dir.join(SURFACE_FILE)).await?;
+        Ok(())
+    }
+
+    /// The stored checkpoint, or `None` for anything that is not one — missing,
+    /// truncated, written by another shape. Never an error: a cache that cannot
+    /// be read is a cache that is not used.
+    async fn read_checkpoint(&self, session_id: &str) -> Option<SurfaceProjection> {
+        let path = self.dir_for(session_id).join(SURFACE_FILE);
+        let bytes = tokio::fs::read(&path).await.ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     /// The most recent `limit` messages, still oldest first. `0` means all.
@@ -366,6 +432,86 @@ mod tests {
             events.iter().filter(|e| e.seq <= 3).count(),
             2,
             "only q0 and a0 survive the cut, not the turn markers around them"
+        );
+    }
+
+    /// Three turns, each in its own segment, and a checkpoint over all of them.
+    async fn checkpointed(name: &str, id: &str) -> SessionEventStore {
+        let store = store(name);
+        let log = store.open(id, header(id)).await.unwrap();
+        for turn in 0..3 {
+            store
+                .append(
+                    id,
+                    header(id),
+                    vec![
+                        said(
+                            &format!("t{turn}"),
+                            &format!("q{turn}"),
+                            MessageSource::User,
+                        ),
+                        answered(&format!("t{turn}"), &format!("a{turn}")),
+                    ],
+                )
+                .await
+                .unwrap();
+            log.durable_flush().await.unwrap();
+            assert!(log.seal_now().await.unwrap());
+        }
+        store.checkpoint_surface(id).await.unwrap();
+        store
+    }
+
+    fn texts(messages: &[Message]) -> Vec<String> {
+        messages.iter().map(|m| m.content.clone()).collect()
+    }
+
+    /// The checkpoint is a cache, and this is what that has to mean: delete it
+    /// and the conversation is identical, only re-folded. The authoritative
+    /// `RetentionBase` is deliberately left alone — losing *that* is a hole,
+    /// and the loader is supposed to say so.
+    #[tokio::test]
+    async fn deleting_the_surface_checkpoint_changes_nothing_it_says() {
+        let id = "019fad15-8199-7461-9d48-0a6c779f1c8d";
+        let store = checkpointed("cache_optional", id).await;
+        let warm = store.messages(id).await.unwrap();
+        assert_eq!(texts(&warm), ["q0", "a0", "q1", "a1", "q2", "a2"]);
+
+        let path = store.dir_for(id).join(SURFACE_FILE);
+        assert!(path.exists(), "a turn boundary wrote one");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(texts(&store.messages(id).await.unwrap()), texts(&warm));
+
+        // A checkpoint from another shape is not a checkpoint.
+        std::fs::write(&path, br#"{"v":999,"through_seq":0,"dense_from":0}"#).unwrap();
+        assert_eq!(texts(&store.messages(id).await.unwrap()), texts(&warm));
+        // Nor is a half-written one.
+        std::fs::write(&path, b"{\"v\":1,\"thro").unwrap();
+        assert_eq!(texts(&store.messages(id).await.unwrap()), texts(&warm));
+    }
+
+    /// What the checkpoint is *for*: the segments it covers are not read again.
+    /// Proven by making the oldest one unreadable — a warm read does not notice,
+    /// and the cold read it falls back to reports the hole rather than serving a
+    /// short history.
+    #[tokio::test]
+    async fn a_warm_read_does_not_open_the_segments_its_checkpoint_covers() {
+        let id = "019fad15-8199-7461-9d48-0a6c779f1c8d";
+        let store = checkpointed("warm_read", id).await;
+        let warm = store.messages(id).await.unwrap();
+
+        let oldest = store.dir_for(id).join("000000.jsonl");
+        std::fs::rename(&oldest, oldest.with_extension("jsonl.gone")).unwrap();
+        assert_eq!(
+            texts(&store.messages(id).await.unwrap()),
+            texts(&warm),
+            "the checkpoint already held what that segment says"
+        );
+
+        std::fs::remove_file(store.dir_for(id).join(SURFACE_FILE)).unwrap();
+        assert!(
+            store.messages(id).await.is_err(),
+            "and a cold read must report the missing segment, not read past it"
         );
     }
 

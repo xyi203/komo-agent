@@ -531,6 +531,26 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
 - **验证**：任意 projection checkpoint 置旧或删除后，冷读结果不变；此测试不得删除权威
   RetentionBase。
 
+**conversation surface 部分已完成**：`SurfaceProjection`（core）= 版本号 +
+`through_seq` + `dense_from` + `Surface` + 每个活节点的投影内容，落在
+`sessions/<id>/surface.json`，先写 `.tmp` 再 rename。读路径
+（`messages`/`windowed`，也就是每轮 `find_windowed`）先试 checkpoint 再补
+`read_from(through+1)` 那一段；版本不符、`dense_from` 变了（retention 切过）、
+解析失败、tail 折不上去——任何一条都退回全量 fold 并 warn，日志永远赢。
+写在 `turn_boundary` 里，best-effort。
+
+- `SurfaceContent` 带 `turn` 字段，所以 pristine cancel 不再依赖「checkpoint 只在
+  turn 边界写」这条隐含前提：在**任何**位置切开都得到同一段历史，
+  `a_checkpoint_plus_its_tail_is_the_whole_log` 遍历每个切点验证（含 compaction
+  replace 和 pristine cancel）。
+- `a_warm_read_does_not_open_the_segments_its_checkpoint_covers` 把最老的段
+  改名成读不到，热读毫无察觉；删掉 checkpoint 之后冷读直接报错——证明「没读那个段」
+  不是「读到了个短历史」。
+- 还没做：session summary 和 run ledger 的 checkpoint。ledger 那份现在不需要——
+  收尾只折自己那一段（见 2.1），全量读只在滚段时发生。
+- 仍然是 O(surface) 的：`windowed` 依旧先投影出整条 surface 再切尾巴，为的是不改
+  「窗口 = 全量投影的最后 N 条」这个语义。省掉的是 O(日志字节) 的 JSON 解析。
+
 #### 3.2 `surfaceOp` + compaction
 
 - 给 user/final-assistant event 加 surface 声明并实现严格 replacement 验证；tool settle 只进入

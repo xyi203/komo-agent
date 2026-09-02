@@ -753,6 +753,13 @@ impl SessionEventRepository for Db {
     }
 
     async fn turn_boundary(&self, session_id: &str) -> anyhow::Result<bool> {
+        // Refresh the surface checkpoint here and nowhere else: a turn boundary
+        // is where the log is quiet, and the next turn's history read is what
+        // the checkpoint is for. Best-effort — the log already holds everything
+        // it describes, so a failed write costs the next read a full fold.
+        if let Err(error) = self.events.checkpoint_surface(session_id).await {
+            info!(%error, session_id, "could not refresh the surface checkpoint (non-fatal)");
+        }
         Ok(self.events.seal(session_id).await?)
     }
 
