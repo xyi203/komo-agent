@@ -1614,16 +1614,39 @@ impl Db {
                         // advances: both are row-held, and the fold overwriting
                         // them would drop a verdict the user gave after the turn.
                         let learned = record.learned || run.learned;
+                        // A turn with no terminal event folds as *running*, and
+                        // whether it is running or dead is the one thing the log
+                        // cannot say — the startup reconciler rules on that and
+                        // writes it here. So the fold's silence never un-decides
+                        // it: without this, the next turn in the session would
+                        // put every interrupted run back to "running".
+                        let undecided = matches!(run.status, RunStatus::Running)
+                            && record.status != RunStatus::Running.as_str();
+                        let status = if undecided {
+                            record.status.clone()
+                        } else {
+                            run.status.as_str().to_string()
+                        };
+                        let error = if undecided {
+                            record.error.clone()
+                        } else {
+                            run.error.clone()
+                        };
+                        let ended_at = if undecided {
+                            record.ended_at
+                        } else {
+                            run.ended_at.unwrap_or(0)
+                        };
                         record
                             .update()
                             .input(run.input.clone())
                             .plan(run.plan.clone())
-                            .status(run.status.as_str().to_string())
+                            .status(status)
                             .final_output(run.final_output.clone())
-                            .error(run.error.clone())
+                            .error(error)
                             .recoverable(run.recoverable)
                             .started_at(run.started_at)
-                            .ended_at(run.ended_at.unwrap_or(0))
+                            .ended_at(ended_at)
                             .tokens_in(run.tokens_in)
                             .tokens_out(run.tokens_out)
                             .tokens_cached(run.tokens_cached)
@@ -3446,6 +3469,59 @@ mod tests {
         assert_eq!(
             runs[0].id, "t-new",
             "and the turn nobody pruned is still here"
+        );
+    }
+
+    /// Whether an open turn is running or dead is the one fact the log cannot
+    /// hold — the startup reconciler rules on it. The fold's silence must not
+    /// overturn that ruling, or the next turn in the session puts every
+    /// interrupted run back to "running" and nothing is ever resumable.
+    #[tokio::test]
+    async fn a_reconciled_run_is_not_reopened_by_the_next_commit() {
+        let db = Db::connect(&sqlite_url("komo_projection_interrupted.db"))
+            .await
+            .unwrap();
+        // An open turn: `turn/started` with no terminal event.
+        let events = vec![SessionEvent::new(
+            0,
+            time::OffsetDateTime::now_utc(),
+            SessionEventKind::TurnStarted {
+                turn_id: "t-open".into(),
+                resumed_from: None,
+            },
+        )];
+        let folded = project_runs("s-open", &events);
+        RunProjectionStore::commit(&db, "s-open", &folded, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            RunRepository::get(&db, "t-open")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Running
+        );
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        assert_eq!(
+            RunRepository::reconcile_interrupted(&db, now)
+                .await
+                .unwrap(),
+            1
+        );
+
+        // The same fold again, as the session's next turn would commit it.
+        RunProjectionStore::commit(&db, "s-open", &folded, 5)
+            .await
+            .unwrap();
+
+        let run = RunRepository::get(&db, "t-open").await.unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.error, INTERRUPTED_ERROR);
+        assert!(
+            run.recoverable,
+            "and it is still the turn resume can pick up"
         );
     }
 

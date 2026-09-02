@@ -15,11 +15,11 @@
 //!
 //! - [`Run::outcome`] is revisable by what the user says in a *later* turn, so
 //!   it is row-held state merged over the projection, never derived from it.
-//! - [`Run::recoverable`] folds as *interrupted*, which is not the same as the
-//!   reconciled row: a turn with no terminal event is either running right now
-//!   or died, and only the process can tell those apart. Translating one into
-//!   `Failed` with an interrupted error is the reconciler's job at startup, not
-//!   a fact the log states.
+//! - [`Run::recoverable`] folds as *interrupted and unclaimed*, which is not
+//!   the same as the reconciled row: a turn with no terminal event is either
+//!   running right now or died, and only the process can tell those apart.
+//!   Translating one into `Failed` with an interrupted error is the
+//!   reconciler's job at startup, not a fact the log states.
 
 use async_trait::async_trait;
 
@@ -230,7 +230,20 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
         }
     }
 
+    // A continuation's own `turn/started` **is** the claim on the turn it picked
+    // up: seq assignment is what serializes two would-be resumers, so the log
+    // decides which of them owns the recovery rather than a row update racing
+    // another reader. Once claimed, a turn is not offered again — resuming a
+    // turn twice re-runs work the first continuation already did.
+    let claimed: Vec<String> = runs
+        .iter()
+        .filter_map(|projected| projected.run.resumed_from.clone())
+        .collect();
+
     for projected in &mut runs {
+        if claimed.contains(&projected.run.id) {
+            projected.run.recoverable = false;
+        }
         // The LLM owns tool dispatch, so the plan is a description of what the
         // turn turned out to do, not a decision made before it ran.
         projected.run.plan = match projected.steps.len() {
@@ -528,6 +541,34 @@ mod tests {
             call_started(1, 100, "ghost", "c1", "read"),
         ];
         assert!(project_runs("s1", &events).is_empty());
+    }
+
+    #[test]
+    fn a_claimed_turn_is_not_offered_for_resume_again() {
+        // The continuation's own `turn/started` is the claim. Without it a
+        // crashed turn stays resumable forever and every restart re-runs it.
+        let events = vec![
+            started(0, 100, "t1"),
+            asked(1, 100, "t1", "go"),
+            ev(
+                2,
+                200,
+                SessionEventKind::TurnStarted {
+                    turn_id: "t2".into(),
+                    resumed_from: Some("t1".into()),
+                },
+            ),
+        ];
+        let runs = project_runs("s1", &events);
+        assert!(
+            !runs[0].run.recoverable,
+            "t1 has a continuation, so it is not the log's open turn any more"
+        );
+        assert!(
+            runs[1].run.recoverable,
+            "t2 has no terminal event of its own yet"
+        );
+        assert_eq!(runs[1].run.resumed_from.as_deref(), Some("t1"));
     }
 
     #[test]

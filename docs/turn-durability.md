@@ -473,6 +473,12 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
    唯一能解释「为什么这一轮从没被学过」的记录。fold 见 `run_projection`。
 4. `reconcile_interrupted` / `mark_resumed` 变成「无终止事件」+ 一个认领事件；
    认领靠日志 seq 分配天然串行化，比现在的行更新更可靠。
+   **fold 侧已完成**：续跑自己的 `turn/started{resumed_from}` 就是那条认领事件，
+   被认领的 turn 不再 recoverable，两个想续跑的人由 seq 分先后，不再靠行更新去抢。
+   `mark_resumed` 因此在切换时可以直接消失。反过来「开着的 turn 是活的还是死的」
+   是日志唯一说不出来的事，仍由启动 reconcile 判：投影因此多一条 merge 规则——
+   fold 说 running、行上已是终止状态时，保留行的判决，否则这个 session 的下一轮
+   会把每个 interrupted run 重新写回 running。
 
 
 - state.db 的 Run/RunStep 表保留为查询索引，不再由 runtime 和 executor 直接作为事实源写入。
