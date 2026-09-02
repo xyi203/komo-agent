@@ -1285,6 +1285,8 @@ mod tests {
         assert_eq!(run.error, CANCELLED_ERROR);
         assert!(!run.recoverable);
         assert!(run.ended_at.is_some());
+
+        assert_ledger_matches_log(&db, "cancel-mid").await;
     }
 
     #[tokio::test]
@@ -1367,6 +1369,8 @@ mod tests {
             "both halves belong to the turn's user message, got {:?}",
             messages[0].content
         );
+
+        assert_ledger_matches_log(&db, "cli:interject").await;
     }
 
     /// A cancel that lands before any tool ran leaves nothing behind: the
@@ -1401,6 +1405,10 @@ mod tests {
         let run = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(run.error, CANCELLED_ERROR);
+
+        // The run is still in the ledger even though the conversation reads as
+        // if the turn never happened — and so it must be in the projection.
+        assert_ledger_matches_log(&db, &run.session_id).await;
     }
 
     #[tokio::test]
@@ -1466,76 +1474,92 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].tool_name, "time");
         assert!(steps[0].ok);
+
+        assert_ledger_matches_log(&db, "cli:s1").await;
     }
 
-    #[tokio::test]
-    async fn the_event_log_alone_reproduces_the_ledger_rows() {
+    /// Assert the run ledger rows for `session_id` are exactly what folding its
+    /// event log produces.
+    ///
+    /// The claim the projection rests on: the rows are a query index, so if the
+    /// fold disagrees with the writer on a real turn, dropping the authoritative
+    /// write loses whatever the two disagree about. Called from the tests that
+    /// produce each turn shape rather than from one fixture of its own — a
+    /// cancel, a failure and a tool round exercise different writer paths.
+    async fn assert_ledger_matches_log(db: &Db, session_id: &str) {
         use komo_core::domain::run_projection::project_runs;
 
-        // The claim the projection rests on. The rows are a query index; if the
-        // fold disagrees with the writer on a real turn, dropping the
-        // authoritative write loses whatever the two disagree about.
-        let db = Arc::new(
-            Db::connect(&sqlite_url("komo_rt_projection.db"))
-                .await
-                .unwrap(),
-        );
-        let (rt, _) = scripted_runtime(
-            db.clone(),
-            vec![
-                tool_calls(vec![call("time", "{}")]),
-                Step::Final("the time is now".into()),
-            ],
-            vec![Arc::new(TimeTool)],
-            30,
-        );
-        rt.handle_input("cli:s1", "hi".into()).await.unwrap();
-
-        let written = RunRepository::list(&*db, 10).await.unwrap();
-        let written_steps = RunRepository::steps(&*db, &written[0].id).await.unwrap();
-        let events = SessionEventRepository::events(&*db, "cli:s1")
+        let events = SessionEventRepository::events(db, session_id)
             .await
             .unwrap();
-        let projected = project_runs("cli:s1", &events);
+        let projected = project_runs(session_id, &events);
+        let written: Vec<_> = RunRepository::list(db, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.session_id == session_id)
+            .rev()
+            .collect();
 
-        assert_eq!(projected.len(), written.len());
-        let (run, steps) = (&projected[0].run, &projected[0].steps);
-        let row = &written[0];
-        assert_eq!(run.id, row.id);
-        assert_eq!(run.session_id, row.session_id);
-        assert_eq!(run.input, row.input);
-        assert_eq!(run.plan, row.plan);
-        assert_eq!(run.status, row.status);
-        assert_eq!(run.final_output, row.final_output);
-        assert_eq!(run.error, row.error);
-        assert_eq!(run.recoverable, row.recoverable);
-        assert_eq!(run.started_at, row.started_at);
-        // Not the same stamp: the row takes `now()` when the runtime finishes
-        // the turn, the fold takes the terminal event's own timestamp, and the
-        // two are separated by the append between them. This divergence is the
-        // double write, and it goes away with it — what matters is that both
-        // agree the turn ended, and when, to the second the ledger renders.
-        assert!(run.ended_at.is_some() && row.ended_at.is_some());
-        assert!((run.ended_at.unwrap() - row.ended_at.unwrap()).abs() <= 1);
-        assert_eq!(run.tokens_in, row.tokens_in);
-        assert_eq!(run.tokens_out, row.tokens_out);
-        assert_eq!(run.tokens_cached, row.tokens_cached);
-        assert_eq!(run.resumed_from, row.resumed_from);
-        assert_eq!(run.memories, row.memories);
+        assert_eq!(projected.len(), written.len(), "run count");
+        for (folded, row) in projected.iter().zip(&written) {
+            let run = &folded.run;
+            assert_eq!(run.id, row.id);
+            assert_eq!(run.session_id, row.session_id);
+            assert_eq!(run.input, row.input, "input of {}", row.id);
+            assert_eq!(run.plan, row.plan, "plan of {}", row.id);
+            assert_eq!(run.status, row.status, "status of {}", row.id);
+            assert_eq!(run.final_output, row.final_output, "reply of {}", row.id);
+            assert_eq!(run.error, row.error, "error of {}", row.id);
+            assert_eq!(
+                run.recoverable, row.recoverable,
+                "recoverable of {}",
+                row.id
+            );
+            assert_eq!(run.tokens_in, row.tokens_in, "tokens of {}", row.id);
+            assert_eq!(run.tokens_out, row.tokens_out);
+            assert_eq!(run.tokens_cached, row.tokens_cached);
+            assert_eq!(run.resumed_from, row.resumed_from);
+            assert_eq!(run.memories, row.memories);
+            // Not the same stamps: the row takes `now()` when the runtime opens
+            // and closes the turn, the fold takes the bracketing events' own
+            // timestamps, and each pair is separated by the append between them.
+            // That divergence *is* the double write, and it goes away with it —
+            // what has to agree is that the turn started, and whether it ended.
+            assert!(
+                (run.started_at - row.started_at).abs() <= 1,
+                "started_at of {}",
+                row.id
+            );
+            assert_eq!(run.ended_at.is_some(), row.ended_at.is_some());
+            if let (Some(folded_at), Some(row_at)) = (run.ended_at, row.ended_at) {
+                assert!((folded_at - row_at).abs() <= 1, "ended_at of {}", row.id);
+            }
 
-        assert_eq!(steps.len(), written_steps.len());
-        for (folded, row) in steps.iter().zip(&written_steps) {
-            assert_eq!(folded.run_id, row.run_id);
-            assert_eq!(folded.seq, row.seq);
-            assert_eq!(folded.tool_name, row.tool_name);
-            assert_eq!(folded.args, row.args);
-            assert_eq!(folded.result, row.result);
-            assert_eq!(folded.error, row.error);
-            assert_eq!(folded.ok, row.ok);
-            assert_eq!(folded.uncertain, row.uncertain);
-            assert_eq!(folded.elapsed_ms, row.elapsed_ms);
-            assert_eq!(folded.structured, row.structured);
-            assert_eq!(folded.output_paths, row.output_paths);
+            // The rows are exactly the calls that *settled*. A call the turn
+            // died inside has no row at all — the step is written at settle —
+            // which is the fact the log keeps and the ledger cannot.
+            let rows = RunRepository::steps(db, &row.id).await.unwrap();
+            let settled: Vec<_> = folded.steps.iter().filter(|s| s.settled).collect();
+            assert_eq!(
+                settled.len(),
+                rows.len(),
+                "settled step count of {}",
+                row.id
+            );
+            for (folded, row) in settled.into_iter().map(|s| &s.step).zip(&rows) {
+                assert_eq!(folded.run_id, row.run_id);
+                assert_eq!(folded.seq, row.seq);
+                assert_eq!(folded.tool_name, row.tool_name);
+                assert_eq!(folded.args, row.args);
+                assert_eq!(folded.result, row.result);
+                assert_eq!(folded.error, row.error);
+                assert_eq!(folded.ok, row.ok);
+                assert_eq!(folded.uncertain, row.uncertain);
+                assert_eq!(folded.elapsed_ms, row.elapsed_ms);
+                assert_eq!(folded.structured, row.structured);
+                assert_eq!(folded.output_paths, row.output_paths);
+            }
         }
     }
 
@@ -1564,6 +1588,8 @@ mod tests {
 
         let steps = RunRepository::steps(&*db, &runs[0].id).await.unwrap();
         assert!(steps.is_empty());
+
+        assert_ledger_matches_log(&db, "cli:s2").await;
     }
 
     #[tokio::test]
@@ -1703,6 +1729,8 @@ mod tests {
         // The run is recorded as failed.
         let runs = RunRepository::list(&*db, 10).await.unwrap();
         assert_eq!(runs[0].status, RunStatus::Failed);
+
+        assert_ledger_matches_log(&db, "cli:sf").await;
     }
 
     #[tokio::test]

@@ -23,7 +23,21 @@ use super::session_event::{MessageSource, SessionEvent, SessionEventKind, ToolOu
 #[derive(Debug, Clone)]
 pub struct ProjectedRun {
     pub run: Run,
-    pub steps: Vec<RunStep>,
+    pub steps: Vec<ProjectedStep>,
+}
+
+/// One call, and whether the log ever saw it finish.
+///
+/// The ledger cannot express this: a step row is written *at settle*, so a call
+/// the process died in the middle of leaves no row at all — the record says the
+/// turn never made the call. The log brackets every call, so the projection can
+/// tell "never dispatched" from "dispatched and we lost the answer", which is
+/// the question recovery has to answer and the reason the two halves are
+/// separate events.
+#[derive(Debug, Clone)]
+pub struct ProjectedStep {
+    pub step: RunStep,
+    pub settled: bool,
 }
 
 /// Fold one session's events into the runs they record, oldest first.
@@ -37,6 +51,12 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
     // however long the tool took, and the settle lands in completion order, so
     // the two halves are matched by id rather than by adjacency.
     let mut open: Vec<(String, String, usize, usize)> = Vec::new();
+    // The turn's reply, staged until the turn *completes*. A cancelled or failed
+    // turn also leaves an `assistant/message` — a placeholder that keeps the
+    // transcript alternating — but that is what the conversation shows, not an
+    // answer the turn produced, and the ledger has always left `final_output`
+    // empty for both.
+    let mut replies: Vec<String> = Vec::new();
 
     for event in events {
         let Some(turn_id) = event.turn_id_of_work() else {
@@ -61,6 +81,7 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
                 run,
                 steps: Vec::new(),
             });
+            replies.push(String::new());
             continue;
         }
 
@@ -82,24 +103,27 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
                 projected.run.tokens_cached += round.tokens_cached;
             }
             SessionEventKind::AssistantMessage(message) => {
-                projected.run.final_output = truncate(&message.content, RUN_FIELD_CAP);
+                replies[at_index] = truncate(&message.content, RUN_FIELD_CAP);
             }
             SessionEventKind::ToolCallStarted(call) => {
                 let seq = projected.steps.len() as i64;
-                projected.steps.push(RunStep {
-                    run_id: turn_id.to_string(),
-                    seq,
-                    tool_name: call.tool.clone(),
-                    args: call.args.clone(),
-                    result: String::new(),
-                    error: String::new(),
-                    ok: false,
-                    uncertain: false,
-                    started_at: at,
-                    ended_at: at,
-                    elapsed_ms: 0,
-                    structured: serde_json::Value::Null,
-                    output_paths: Vec::new(),
+                projected.steps.push(ProjectedStep {
+                    settled: false,
+                    step: RunStep {
+                        run_id: turn_id.to_string(),
+                        seq,
+                        tool_name: call.tool.clone(),
+                        args: call.args.clone(),
+                        result: String::new(),
+                        error: String::new(),
+                        ok: false,
+                        uncertain: false,
+                        started_at: at,
+                        ended_at: at,
+                        elapsed_ms: 0,
+                        structured: serde_json::Value::Null,
+                        output_paths: Vec::new(),
+                    },
                 });
                 open.push((
                     turn_id.to_string(),
@@ -116,7 +140,8 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
                     continue;
                 };
                 let (.., step_index) = open.remove(found);
-                let step = &mut projected.steps[step_index];
+                projected.steps[step_index].settled = true;
+                let step = &mut projected.steps[step_index].step;
                 step.result = call.result.clone();
                 step.error = call.error.clone();
                 step.ok = call.outcome == ToolOutcome::Succeeded;
@@ -127,6 +152,7 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
                 step.output_paths = call.output_paths.clone();
             }
             SessionEventKind::TurnCompleted { .. } => {
+                projected.run.final_output = std::mem::take(&mut replies[at_index]);
                 projected.run.status = RunStatus::Done;
                 projected.run.ended_at = Some(at);
                 projected.run.recoverable = false;
@@ -299,9 +325,9 @@ mod tests {
         assert_eq!(run.ended_at, Some(103));
         assert!(!run.recoverable);
         assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].tool_name, "read");
-        assert!(steps[0].ok);
-        assert_eq!(steps[0].elapsed_ms, 12);
+        assert_eq!(steps[0].step.tool_name, "read");
+        assert!(steps[0].step.ok);
+        assert_eq!(steps[0].step.elapsed_ms, 12);
     }
 
     #[test]
@@ -318,9 +344,13 @@ mod tests {
         assert_eq!(projected[0].run.status, RunStatus::Running);
         assert!(projected[0].run.recoverable);
         assert_eq!(projected[0].run.ended_at, None);
-        // The call is there, unsettled — which is what resume needs to know.
+        // The call is there, and marked as never having finished — the ledger
+        // could not say this at all: its step row is written at settle, so a
+        // call the process died inside leaves no row, and the record claims the
+        // turn never made it.
         assert_eq!(projected[0].steps.len(), 1);
-        assert!(!projected[0].steps[0].ok);
+        assert!(!projected[0].steps[0].settled);
+        assert!(!projected[0].steps[0].step.ok);
     }
 
     #[test]
@@ -357,14 +387,15 @@ mod tests {
             call_settled(4, 102, "t1", "a", ToolOutcome::Succeeded),
         ];
         let steps = &project_runs("s1", &events)[0].steps;
-        assert_eq!(steps[0].tool_name, "read");
-        assert!(steps[0].ok);
-        assert_eq!(steps[1].tool_name, "shell");
+        assert_eq!(steps[0].step.tool_name, "read");
+        assert!(steps[0].step.ok);
+        assert!(steps.iter().all(|s| s.settled));
+        assert_eq!(steps[1].step.tool_name, "shell");
         assert!(
-            steps[1].uncertain,
+            steps[1].step.uncertain,
             "an uncertain call may still have landed"
         );
-        assert!(!steps[1].ok);
+        assert!(!steps[1].step.ok);
     }
 
     #[test]
