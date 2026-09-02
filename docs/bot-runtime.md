@@ -7,7 +7,7 @@
 依据三份材料，按可信度排序：
 
 1. 对现有代码的逐条核对（§1）。
-2. `.scratch/turn-durability/PRD.md`（主仓）——session 权威事件日志。本 PRD 的一切等待/恢复都建在
+2. [`docs/turn-durability.md`](turn-durability.md)——session 权威事件日志。本 PRD 的一切等待/恢复都建在
    它的第一、二批之上，不另起一套持久化。
 3. Grok Bot 0.18 渲染层契约（`/Users/xiangyi/01-code/grok-bot/frontend/src/recovered/`）。
    **只有前端**，后端 coordinator 源码不在本地；从 UI 契约反推数据模型，看得到形状，看不到实现。
