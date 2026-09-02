@@ -542,10 +542,12 @@ impl SurfacePlacement {
 /// Tool activity reaches the model as the assistant message's `tool_note`, not
 /// as replayed rounds — see [`AssistantMessageEvent::tool_note`].
 ///
-/// `first_seq` is 0 for a complete log, or a retention base's
-/// `truncated_before` for a truncated one.
-pub fn derive_messages(events: &[SessionEvent], first_seq: u64) -> Result<Vec<Message>, FoldError> {
-    let surface = fold_surface(events, first_seq)?;
+/// `dense_from` is the log's `truncated_before` — see [`fold_surface`].
+pub fn derive_messages(
+    events: &[SessionEvent],
+    dense_from: u64,
+) -> Result<Vec<Message>, FoldError> {
+    let surface = fold_surface(events, dense_from)?;
     let mut by_seq: std::collections::HashMap<u64, &SessionEvent> =
         std::collections::HashMap::with_capacity(events.len());
     for event in events {
@@ -817,21 +819,38 @@ impl Surface {
     }
 }
 
-/// Fold a whole log: check `seq` contiguity from `first_seq` and build the
-/// surface. `first_seq` is 0 for a complete log, or a retention base's
-/// `truncated_before` for a truncated one.
-pub fn fold_surface(events: &[SessionEvent], first_seq: u64) -> Result<Surface, FoldError> {
+/// Fold a whole log: check `seq` contiguity from `dense_from` and build the
+/// surface. `dense_from` is the log's `truncated_before` — 0 for a log that has
+/// never been truncated.
+///
+/// Events **below** `dense_from` are a retention base's survivors, and their
+/// seqs have holes on purpose: the base keeps what still matters and the events
+/// the missing seqs named are gone. That is a truncation, not a log that lost
+/// them, so only their order is checked. From `dense_from` on, a hole is a hole.
+pub fn fold_surface(events: &[SessionEvent], dense_from: u64) -> Result<Surface, FoldError> {
     let mut surface = Surface::default();
     // Which turn put each node on the surface, so a pristine cancel can take
     // its own back without touching anything else.
     let mut owner: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
-    for (expected, event) in (first_seq..).zip(events) {
-        if event.seq != expected {
+    let mut expected = dense_from;
+    let mut previous: Option<u64> = None;
+    for event in events {
+        if event.seq < dense_from {
+            if let Some(previous) = previous.filter(|p| event.seq <= *p) {
+                return Err(FoldError::SeqGap {
+                    expected: previous + 1,
+                    found: event.seq,
+                });
+            }
+        } else if event.seq != expected {
             return Err(FoldError::SeqGap {
                 expected,
                 found: event.seq,
             });
+        } else {
+            expected += 1;
         }
+        previous = Some(event.seq);
         if let Some(placement) = event.surface() {
             surface.apply(event.seq, placement)?;
             if let Some(turn) = event.turn_id() {
@@ -1255,6 +1274,40 @@ mod tests {
         let events = [user(100, "hi"), assistant(101, "hello")];
         let surface = fold_surface(&events, 100).unwrap();
         assert_eq!(surface.nodes(), &[100, 101]);
+    }
+
+    #[test]
+    fn a_base_is_sparse_on_purpose_but_the_retained_tail_is_not() {
+        // A retention base keeps what still matters, so the seqs it did not keep
+        // are missing *by decision*. Above the cut the same absence means the
+        // log lost something, and a reader that served it would be inventing a
+        // conversation. One boundary tells the two apart.
+        let base_then_tail = [user(0, "q1"), user(2, "q2"), user(4, "q3")];
+        assert_eq!(
+            fold_surface(&base_then_tail, 4).unwrap().nodes(),
+            &[0, 2, 4]
+        );
+        // The same events read as a complete log: seq 1 is now a hole.
+        assert_eq!(
+            fold_surface(&base_then_tail, 0),
+            Err(FoldError::SeqGap {
+                expected: 1,
+                found: 2
+            })
+        );
+        // A hole in the retained tail is refused however the base was cut.
+        let torn = [user(0, "q1"), user(4, "q3"), user(6, "q4")];
+        assert_eq!(
+            fold_surface(&torn, 4),
+            Err(FoldError::SeqGap {
+                expected: 5,
+                found: 6
+            })
+        );
+        // Sparse is not the same as unordered: the base is written in seq order
+        // and read back in it, so a reversal is a corrupt file, not a cut.
+        let unordered = [user(2, "q2"), user(0, "q1"), user(4, "q3")];
+        assert!(fold_surface(&unordered, 4).is_err());
     }
 
     #[test]

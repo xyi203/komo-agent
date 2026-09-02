@@ -261,6 +261,14 @@ impl SessionLog {
         self.state.lock().await.manifest.header.clone()
     }
 
+    /// The seq at which this log is contiguous. Everything below it was
+    /// truncated and is represented by the retention base, whose surviving
+    /// events are deliberately sparse — pass this to the folds, which is how
+    /// they tell a truncation from a hole.
+    pub async fn truncated_before(&self) -> u64 {
+        self.state.lock().await.manifest.truncated_before
+    }
+
     /// Assign and buffer a batch of events, returning the seqs they were given.
     ///
     /// Buffered, not written: a caller that needs these bytes to have survived a
@@ -735,6 +743,44 @@ mod tests {
             events: vec![SessionEvent::now(1, say("[summary of old-1 and old-2]"))],
         };
         (dir, log, base)
+    }
+
+    #[tokio::test]
+    async fn a_base_that_kept_only_what_still_matters_still_reads() {
+        // A real base is **sparse**: it holds the surface's messages and the
+        // latest envelope, not every event below the cut. Its seqs therefore
+        // have holes, by design — the events those seqs named are gone on
+        // purpose, which is not the same as a log that lost them.
+        let dir = dir("sparse_base");
+        let log = open(&dir).await;
+        log.append_batch(vec![say("q1"), say("a1"), say("q2"), say("a2")])
+            .await;
+        log.durable_flush().await.unwrap();
+        force_seal(&log).await;
+        log.append_batch(vec![say("q3")]).await;
+        log.durable_flush().await.unwrap();
+        // Keep the two questions, drop the two answers: seqs 0 and 2.
+        let base = RetentionBase {
+            through_seq: 3,
+            events: vec![
+                SessionEvent::now(0, say("q1")),
+                SessionEvent::now(2, say("q2")),
+            ],
+        };
+        log.truncate(base).await.unwrap();
+
+        let reopened = open(&dir).await;
+        let events = reopened.load().await.unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![0, 2, 4]
+        );
+        komo_core::domain::session_event::derive_messages(
+            &events,
+            reopened.truncated_before().await,
+        )
+        .expect("a sparse base is a truncation, not a hole");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

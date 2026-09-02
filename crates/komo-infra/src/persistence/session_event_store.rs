@@ -86,8 +86,7 @@ impl SessionEventStore {
             return Ok(Vec::new());
         };
         let events = log.load().await?;
-        let first = events.first().map(|e| e.seq).unwrap_or(0);
-        Ok(derive_messages(&events, first)?)
+        Ok(derive_messages(&events, log.truncated_before().await)?)
     }
 
     /// The most recent `limit` messages, still oldest first. `0` means all.
