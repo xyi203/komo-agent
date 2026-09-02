@@ -11,9 +11,19 @@
 //! So the rows become a query index over this fold. Nothing here reads the
 //! database, and the fold is total: an event log alone reproduces the ledger.
 //!
-//! What it deliberately cannot reproduce is [`Run::outcome`] — the outcome
-//! assessment is *revisable* by what the user says in a later turn, so it is
-//! held on the row and merged over the projection rather than derived from it.
+//! Three fields are **not** produced here, and each for its own reason:
+//!
+//! - [`Run::outcome`] is revisable by what the user says in a *later* turn, so
+//!   it is row-held state merged over the projection, never derived from it.
+//! - [`Run::learned`] is the learning sweep's watermark. It will fold from
+//!   `learning/completed` / `learning/skipped` once the coordinator writes them;
+//!   until then it stays row-held, because a fold that always answered `false`
+//!   would offer every run to the sweep forever.
+//! - [`Run::recoverable`] folds as *interrupted*, which is not the same as the
+//!   reconciled row: a turn with no terminal event is either running right now
+//!   or died, and only the process can tell those apart. Translating one into
+//!   `Failed` with an interrupted error is the reconciler's job at startup, not
+//!   a fact the log states.
 
 use super::cancel::CANCELLED_ERROR;
 use super::run::{RUN_FIELD_CAP, Run, RunStatus, RunStep, truncate};
@@ -170,10 +180,6 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
                 projected.run.error = CANCELLED_ERROR.to_string();
                 projected.run.ended_at = Some(at);
                 projected.run.recoverable = false;
-            }
-            SessionEventKind::LearningCompleted { .. }
-            | SessionEventKind::LearningSkipped { .. } => {
-                projected.run.learned = true;
             }
             _ => {}
         }
