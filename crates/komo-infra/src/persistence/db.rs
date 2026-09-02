@@ -3356,6 +3356,57 @@ mod tests {
         project_runs(session, &events)
     }
 
+    /// The completion criterion for making these rows a projection: `state.db`
+    /// is disposable, so deleting it entirely must cost nothing but the time to
+    /// fold the logs back. Every query an operator surface makes has to answer
+    /// the same afterwards.
+    #[tokio::test]
+    async fn a_deleted_state_db_rebuilds_the_ledger_from_the_logs() {
+        let url = sqlite_url("komo_projection_rebuild.db");
+        let path = std::path::PathBuf::from(url.trim_start_matches("turso:"));
+
+        async fn snapshot(db: &Db) -> String {
+            let runs = RunRepository::list(db, 10).await.unwrap();
+            let mut out = format!("{runs:?}");
+            for run in &runs {
+                out.push_str(&format!(
+                    "{:?}",
+                    RunRepository::steps(db, &run.id).await.unwrap()
+                ));
+            }
+            out.push_str(&format!(
+                "{:?}{:?}{:?}",
+                RunRepository::runs_using_memory(db, "m1", 10)
+                    .await
+                    .unwrap(),
+                RunRepository::steps_by_tool(db, "time", 10).await.unwrap(),
+                RunRepository::unlearned(db, None, 10).await.unwrap(),
+            ));
+            out
+        }
+
+        let before = {
+            let db = Db::connect(&url).await.unwrap();
+            log_a_finished_turn(&db, "s-a", "t1", "m1").await;
+            log_a_finished_turn(&db, "s-b", "t2", "m1").await;
+            project(&db, "s-a").await;
+            project(&db, "s-b").await;
+            snapshot(&db).await
+        };
+
+        // Drop the whole file — rows, watermarks and all. The logs under
+        // `sessions/` are untouched, and they are the authority.
+        crate::persistence::reset_test_db(&path);
+        let db = Db::connect(&url).await.unwrap();
+        assert!(
+            RunRepository::list(&db, 10).await.unwrap().is_empty(),
+            "a fresh state.db holds no ledger"
+        );
+
+        assert_eq!(db.rebuild_run_projection().await.unwrap(), 2);
+        assert_eq!(snapshot(&db).await, before);
+    }
+
     /// A pruned run must stay gone. Its log outlives it — retention keeps
     /// whatever is still resumable or unlearned — so without a tombstone the
     /// next commit hands the operator back exactly what they deleted.

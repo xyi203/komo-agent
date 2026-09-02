@@ -503,6 +503,10 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
   一个 state.db 事务，不打开 N 个 session artifact。
 - **验证**：保留 tombstone、清空 Run/RunStep 等派生表后重建，以上查询与清空前一致且被 prune
   的记录不会复活；跨 session prune 的返回计数仍精确。
+  **已完成**：`a_deleted_state_db_rebuilds_the_ledger_from_the_logs` 把整个
+  state.db 删掉再连回来，`rebuild_run_projection` 之后 `run list`/`steps`/
+  `runs_using_memory`/`steps_by_tool`/`unlearned` 与删之前逐字段一致；
+  `a_pruned_run_is_never_projected_again` 管另一半。
 
 #### 2.2 精确 resume
 
