@@ -288,6 +288,15 @@ fn run_projection_key(session_id: &str) -> String {
     format!("projection:runs:{session_id}")
 }
 
+/// The prune tombstone: runs that started before this are deliberately gone.
+///
+/// Projection control state, not a session event — `run prune` is an operator
+/// deleting an index, and broadcasting it into N session logs would make the
+/// authoritative record of what happened depend on what someone later chose
+/// not to keep. One fence rather than a row per run because prune's own unit is
+/// a cutoff: `started_at < cutoff` is exactly the set it deleted.
+const RUN_PRUNED_BEFORE_KEY: &str = "projection:runs:pruned_before";
+
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 /// The disposable session/run/pairing store, over the Turso engine with a
@@ -1298,7 +1307,10 @@ impl RunRepository for Db {
                 .exec(&mut tx)
                 .await?;
             let count = stale.len();
+            let mut newest_pruned: Option<i64> = None;
             for run in stale {
+                newest_pruned =
+                    Some(newest_pruned.map_or(run.started_at, |at: i64| at.max(run.started_at)));
                 let run_id = run.id.clone();
                 let steps = toasty::query!(RunStepRecord FILTER .run_id == #run_id)
                     .exec(&mut tx)
@@ -1316,6 +1328,38 @@ impl RunRepository for Db {
                     link.delete().exec(&mut tx).await?;
                 }
                 run.delete().exec(&mut tx).await?;
+            }
+            // The tombstone, in the same transaction as the deletes: a rebuild
+            // reads the log, and without this every pruned run comes back.
+            //
+            // Bounded by what was *actually* deleted rather than by `cutoff`,
+            // which `--before` will happily accept in the future: the newest run
+            // that went is the exact edge of the deleted set, since everything
+            // that survived started at or after the cutoff above it.
+            if let Some(newest) = newest_pruned {
+                let fence = newest + 1;
+                match SettingRecord::get_by_id(&mut tx, RUN_PRUNED_BEFORE_KEY).await {
+                    // Monotonic: a later prune with an older cutoff must not
+                    // unfence what an earlier one deleted.
+                    Ok(mut record) => {
+                        let held = record.value.parse::<i64>().unwrap_or(i64::MIN);
+                        if fence > held {
+                            record
+                                .update()
+                                .value(fence.to_string())
+                                .exec(&mut tx)
+                                .await?;
+                        }
+                    }
+                    Err(_) => {
+                        toasty::create!(SettingRecord {
+                            id: RUN_PRUNED_BEFORE_KEY.to_string(),
+                            value: fence.to_string(),
+                        })
+                        .exec(&mut tx)
+                        .await?;
+                    }
+                }
             }
             tx.commit().await?;
             Ok(count)
@@ -1544,11 +1588,21 @@ impl Db {
         if runs.is_empty() {
             return Ok(());
         }
+        // Runs an operator pruned are not resurrected, however long their log
+        // outlives them.
+        let pruned_before = self
+            .setting_get(RUN_PRUNED_BEFORE_KEY)
+            .await?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(i64::MIN);
         with_write_retry(|| async {
             let mut conn = self.inner.connection().await?;
             let mut tx = conn.transaction().await?;
             for projected in runs {
                 let run = &projected.run;
+                if run.started_at < pruned_before {
+                    continue;
+                }
                 let memories = if run.memories.is_empty() {
                     String::new()
                 } else {
@@ -3327,6 +3381,101 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Two turns half a month apart, as bare open/close events. Timestamps a
+    /// prune cutoff can actually fall between — which the real log cannot give
+    /// a test, since it stamps every append with the same second.
+    fn folded_turns(session: &str, turns: &[(&str, i64)]) -> Vec<ProjectedRun> {
+        let events: Vec<_> = turns
+            .iter()
+            .enumerate()
+            .flat_map(|(i, (turn, at))| {
+                let at = time::OffsetDateTime::from_unix_timestamp(*at).unwrap();
+                [
+                    SessionEvent::new(
+                        i as u64 * 2,
+                        at,
+                        SessionEventKind::TurnStarted {
+                            turn_id: (*turn).into(),
+                            resumed_from: None,
+                        },
+                    ),
+                    SessionEvent::new(
+                        i as u64 * 2 + 1,
+                        at,
+                        SessionEventKind::TurnCompleted {
+                            turn_id: (*turn).into(),
+                        },
+                    ),
+                ]
+            })
+            .collect();
+        project_runs(session, &events)
+    }
+
+    /// A pruned run must stay gone. Its log outlives it — retention keeps
+    /// whatever is still resumable or unlearned — so without a tombstone the
+    /// next commit hands the operator back exactly what they deleted.
+    #[tokio::test]
+    async fn a_pruned_run_is_never_projected_again() {
+        let db = Db::connect(&sqlite_url("komo_projection_prune.db"))
+            .await
+            .unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let folded = folded_turns("s-prune", &[("t-old", now - 30 * 86_400), ("t-new", now)]);
+        RunProjectionStore::commit(&db, "s-prune", &folded, 3)
+            .await
+            .unwrap();
+        assert_eq!(RunRepository::list(&db, 10).await.unwrap().len(), 2);
+
+        assert_eq!(
+            RunRepository::prune(&db, now - 86_400).await.unwrap(),
+            1,
+            "only the older turn is stale"
+        );
+
+        // The same fold, offered again with a watermark that advances — which is
+        // what a rebuild, or the next turn in this session, does.
+        RunProjectionStore::commit(&db, "s-prune", &folded, 99)
+            .await
+            .unwrap();
+
+        let runs = RunRepository::list(&db, 10).await.unwrap();
+        assert_eq!(runs.len(), 1, "the tombstone outranks the fold");
+        assert_eq!(
+            runs[0].id, "t-new",
+            "and the turn nobody pruned is still here"
+        );
+    }
+
+    /// `run prune --before` takes any date, including one past every run there
+    /// is. The fence still has to describe what was deleted rather than the
+    /// cutoff asked for, or every later turn falls behind it.
+    #[tokio::test]
+    async fn a_prune_of_everything_does_not_fence_off_later_turns() {
+        let db = Db::connect(&sqlite_url("komo_projection_prune_all.db"))
+            .await
+            .unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let old = folded_turns("s-all", &[("t-old", now - 30 * 86_400)]);
+        RunProjectionStore::commit(&db, "s-all", &old, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            RunRepository::prune(&db, now + 86_400).await.unwrap(),
+            1,
+            "a future cutoff prunes everything that exists"
+        );
+
+        let later = folded_turns("s-all", &[("t-later", now)]);
+        RunProjectionStore::commit(&db, "s-all", &later, 9)
+            .await
+            .unwrap();
+        let runs = RunRepository::list(&db, 10).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, "t-later");
     }
 
     /// The watermark exists so a session whose log has not moved costs nothing

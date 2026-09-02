@@ -457,8 +457,14 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
 
 **切换前还要决的四件事**（都不是 fold 的问题，是写入端的）：
 
-1. `prune` 删掉的 run 会在 rebuild 时复活，需要 `run/pruned` 之类的墓碑。
-2. `outcome` 是可修订的，投影必须 merge 而不是覆盖。
+1. ~~`prune` 删掉的 run 会在 rebuild 时复活~~ —— **已完成**：墓碑是一条
+   projection control 设置 `projection:runs:pruned_before`，和删除同一个
+   state.db 事务，不进任何 session 日志。界不是 `cutoff` 而是**真正删掉的那批里
+   最新的 `started_at` + 1**：`--before` 收任何日期（包括未来），按 cutoff 设界
+   会把这次 prune 之后的每一轮也挡在投影外面；而活下来的 run 全都 ≥ cutoff >
+   被删的最大值，所以这个界恰好就是被删集合的边。单调，只增。
+2. ~~`outcome` 是可修订的，投影必须 merge 而不是覆盖~~ —— **已完成**：
+   `write_projection` 根本不写 `outcome` 列，`learned` 只做 OR。
 3. ~~`learned` 没有任何人写 `learning/completed`/`skipped`~~ —— **已完成**：
    `LearningCoordinator` 的 retire 现在逐 turn 写一条 completed 或
    skipped(reason)，durable flush 之后才动 `Run.learned` 行；事件写不进去就整批
