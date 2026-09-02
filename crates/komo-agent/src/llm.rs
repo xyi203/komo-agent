@@ -558,6 +558,7 @@ impl LlmClient for ProviderLlm {
             usage: TokenUsage::default(),
             memories,
             degraded: false,
+            replayed: Vec::new(),
             deltas,
             rounds: 0,
         };
@@ -573,7 +574,17 @@ impl LlmClient for ProviderLlm {
         deltas: Option<Arc<dyn DeltaSink>>,
         recorder: Option<Arc<dyn TurnRecorder>>,
     ) -> anyhow::Result<Box<dyn TurnDriver>> {
-        let rebuilt = rebuild_from_events(session, events, turn_id)?;
+        // Which tools recovery may simply run again. Read off the same catalog
+        // the round was dispatched from, so a tool that stops being idempotent
+        // stops being replayed with it.
+        let catalog = self.tools.as_ref().map(|tools| tools.snapshot());
+        let idempotent = |name: &str| {
+            catalog
+                .as_ref()
+                .and_then(|catalog| catalog.get(name))
+                .is_some_and(|tool| tool.idempotent())
+        };
+        let rebuilt = rebuild_from_events(session, events, turn_id, &idempotent)?;
         let turn_loop = TurnLoop {
             client: self.client.clone(),
             turn: TurnModel {
@@ -593,6 +604,7 @@ impl LlmClient for ProviderLlm {
             // interrupted run's row already holds what was injected.
             memories: RecalledMemories::default(),
             degraded: false,
+            replayed: Vec::new(),
             deltas,
             rounds: 0,
         };
@@ -621,14 +633,19 @@ struct RebuiltTurn {
 /// request cannot re-derive — the model settings and the rendered prompt — was
 /// snapshotted, in `request/header`.
 ///
-/// Rounds are replayed in `seq` order, but each round's **results are ordered by
-/// `call_index`**, never by the seq their settle landed on: a round runs
-/// concurrently, so settle order is completion order, and rebuilding in it would
-/// hand the provider a different request than the live turn sent.
+/// Rounds are replayed in `seq` order, and each round's **results are ordered by
+/// its own recorded blocks**, never by the seq their settle landed on: a round
+/// runs concurrently, so settle order is completion order, and rebuilding in it
+/// would hand the provider a different request than the live turn sent.
+///
+/// `idempotent` answers whether a tool may simply be run again — the newest
+/// round's unsettled calls are re-dispatched through it rather than reported as
+/// lost (see [`TurnStart::Replay`]).
 fn rebuild_from_events(
     session: &Session,
     events: &[SessionEvent],
     turn_id: &str,
+    idempotent: &dyn Fn(&str) -> bool,
 ) -> anyhow::Result<RebuiltTurn> {
     let last_seq = events.last().map(|e| e.seq).unwrap_or(0);
     let header = fold_request_header(events, last_seq)
@@ -641,7 +658,6 @@ fn rebuild_from_events(
     struct Round {
         id: String,
         blocks: Vec<AssistantBlock>,
-        dispatched: Vec<(u32, String)>,
         settled: std::collections::HashMap<String, String>,
     }
     let mut rounds: Vec<Round> = Vec::new();
@@ -654,16 +670,8 @@ fn rebuild_from_events(
                 id: round.response_id.clone(),
                 blocks: serde_json::from_value(round.blocks.clone())
                     .context("parsing a recorded assistant round")?,
-                dispatched: Vec::new(),
                 settled: std::collections::HashMap::new(),
             }),
-            SessionEventKind::ToolCallStarted(call) => {
-                if let Some(round) = rounds.last_mut() {
-                    round
-                        .dispatched
-                        .push((call.call_index, call.call_id.clone()));
-                }
-            }
             SessionEventKind::ToolCallSettled(call) => {
                 if let Some(round) = rounds.last_mut() {
                     let text = if call.error.is_empty() {
@@ -689,53 +697,85 @@ fn rebuild_from_events(
     }
 
     let mut lost_calls = false;
-    for round in &rounds {
+    let mut replay: Option<(Vec<ToolCallReq>, Vec<ReplaySlot>)> = None;
+    let last = rounds.len().saturating_sub(1);
+    for (n, round) in rounds.iter().enumerate() {
         history.push(Turn::Assistant {
             id: (!round.id.is_empty()).then(|| round.id.clone()),
             blocks: round.blocks.clone(),
         });
-        if round.dispatched.is_empty() {
+        // The round's own blocks are the call list, not its `tool/call-started`
+        // events: the blocks are what the model sent — verbatim, in provider
+        // order, with unredacted arguments — so a call rebuilt from them is the
+        // call the live turn made. The started events are the ledger's redacted
+        // copy, which is the wrong thing to re-issue.
+        let Step::ToolCalls { calls, .. } = blocks_to_step(&round.blocks) else {
             continue;
-        }
-        let mut ordered = round.dispatched.clone();
-        ordered.sort_by_key(|(index, _)| *index);
-        let results: Vec<UserBlock> = ordered
-            .iter()
-            .map(|(_, call_id)| {
-                let text = round.settled.get(call_id).cloned().unwrap_or_else(|| {
-                    lost_calls = true;
-                    INTERRUPTED_RESULT_NOTE.clone()
-                });
-                UserBlock::ToolResult {
-                    id: call_id.clone(),
-                    call_id: Some(call_id.clone()),
-                    text,
+        };
+        let mut slots: Vec<ReplaySlot> = Vec::new();
+        let mut rerun = Vec::new();
+        for call in calls {
+            let key = call.call_id.clone().unwrap_or_else(|| call.id.clone());
+            let known = match round.settled.get(&key) {
+                Some(text) => Some(text.clone()),
+                // Unsettled. Only the newest round is still in flight — an
+                // earlier round's results must have been sent or the round
+                // after it would not exist — and only an idempotent tool may
+                // simply be run again. Anything else is the model's call to
+                // make, so it gets told.
+                None if n == last && idempotent(&call.name) => {
+                    rerun.push(call);
+                    None
                 }
-            })
-            .collect();
-        history.push(Turn::User(results));
+                None => {
+                    lost_calls = true;
+                    Some(INTERRUPTED_RESULT_NOTE.clone())
+                }
+            };
+            slots.push((
+                key.clone(),
+                known.map(|text| UserBlock::ToolResult {
+                    id: key.clone(),
+                    call_id: Some(key),
+                    text,
+                }),
+            ));
+        }
+        if rerun.is_empty() {
+            history.push(Turn::User(
+                slots.into_iter().filter_map(|(_, block)| block).collect(),
+            ));
+        } else {
+            // Held back: this round's results message is only complete once the
+            // replayed calls have answered, and it is `step` that assembles it.
+            replay = Some((rerun, slots));
+        }
     }
 
     // Where did the interruption land? A round whose calls all settled and that
     // produced no further round is a turn that had answered and only failed to
     // land it; anything else continues.
-    let start = match history.last() {
-        None => anyhow::bail!("nothing to resume: the turn recorded no history"),
-        Some(Turn::Assistant { blocks, .. }) if !lost_calls => {
-            let text = blocks
-                .iter()
-                .filter_map(|block| match block {
-                    AssistantBlock::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .collect::<String>();
-            anyhow::ensure!(
-                !text.trim().is_empty(),
-                "interrupted turn ended on an empty assistant round"
-            );
-            TurnStart::Final(text)
+    let start = if let Some((calls, slots)) = replay {
+        TurnStart::Replay { calls, slots }
+    } else {
+        match history.last() {
+            None => anyhow::bail!("nothing to resume: the turn recorded no history"),
+            Some(Turn::Assistant { blocks, .. }) if !lost_calls => {
+                let text = blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        AssistantBlock::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                anyhow::ensure!(
+                    !text.trim().is_empty(),
+                    "interrupted turn ended on an empty assistant round"
+                );
+                TurnStart::Final(text)
+            }
+            _ => TurnStart::Continue,
         }
-        _ => TurnStart::Continue,
     };
 
     Ok(RebuiltTurn {
@@ -754,14 +794,55 @@ const INTERJECTION_PREFIX: &str = "The user sent this while you were working —
      take it into account before your next step:\n";
 
 /// What a tool call whose result was lost to the interruption gets fed back as
-/// on resume. The tools themselves are never re-run here: a mutation cannot be
-/// assumed idempotent, so whether to re-issue the call is the model's decision.
+/// on resume. This is the answer for a tool that is *not* idempotent — one that
+/// is gets re-dispatched instead ([`TurnStart::Replay`]). A mutation cannot be
+/// assumed repeatable, so whether to re-issue it stays the model's decision.
 static INTERRUPTED_RESULT_NOTE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "[This call's result was lost when the process was interrupted before it finished. {}]",
         komo_core::domain::tool::UNCERTAIN_OUTCOME_ADVICE
     )
 });
+
+/// One call's place in a replayed round's results message: `None` is the hole a
+/// re-dispatched call fills, `Some` a result the interrupted process already had.
+type ReplaySlot = (String, Option<UserBlock>);
+
+/// Close a replayed round: drop what just ran into the holes the interrupted
+/// process left, in the order the model issued the calls.
+///
+/// Order is the point. The results could be concatenated in any order and still
+/// answer every call, but the round's message would then differ from the one the
+/// live turn was assembling — and `rebuild == live` is what lets a second
+/// interruption resume from here, and what keeps the provider's cached prefix.
+fn fill_replay_slots(slots: Vec<ReplaySlot>, mut fresh: Vec<UserBlock>) -> Vec<UserBlock> {
+    let mut blocks = Vec::with_capacity(slots.len());
+    for (id, known) in slots {
+        if let Some(block) = known {
+            blocks.push(block);
+            continue;
+        }
+        let at = fresh.iter().position(|block| match block {
+            UserBlock::ToolResult { id: got, .. } => *got == id,
+            _ => false,
+        });
+        match at {
+            Some(at) => blocks.push(fresh.remove(at)),
+            // The executor answers every call it is handed, so this is
+            // unreachable — but an open hole is the one shape a provider
+            // rejects outright, so it is filled rather than left.
+            None => blocks.push(UserBlock::ToolResult {
+                id: id.clone(),
+                call_id: Some(id),
+                text: INTERRUPTED_RESULT_NOTE.clone(),
+            }),
+        }
+    }
+    // A result that matched no slot would otherwise be dropped, and a dropped
+    // tool result is the other shape a provider rejects.
+    blocks.append(&mut fresh);
+    blocks
+}
 
 /// How a [`TurnLoop`] opens: a fresh turn sends its prompt; a resumed one
 /// picks up from whatever state the journal ended in.
@@ -776,6 +857,19 @@ enum TurnStart {
     /// its final answer, it just never reached the transcript. No request at
     /// all — hand the answer back.
     Final(String),
+    /// Resumed into a round that was still running: `calls` never settled and
+    /// their tools are idempotent, so they are simply re-dispatched instead of
+    /// costing the model a round to be told their results were lost.
+    ///
+    /// `slots` is the round's results message with a hole where each of those
+    /// calls goes — held back because a round sends *one* results message, and
+    /// `step` can only assemble it once the re-dispatched calls have answered.
+    /// Keeping the holes in place is what makes the message it finally sends
+    /// byte-identical to the one the interrupted turn was building.
+    Replay {
+        calls: Vec<ToolCallReq>,
+        slots: Vec<ReplaySlot>,
+    },
     /// `first()` already ran.
     Started,
 }
@@ -812,6 +906,10 @@ struct TurnLoop {
     /// is *still* too large the shortfall is structural and retrying only burns
     /// another round-trip on a request that cannot fit.
     degraded: bool,
+    /// A resumed round's results message under construction — see
+    /// [`TurnStart::Replay`]. Empty for every turn but one resumed into a round
+    /// that was still running.
+    replayed: Vec<ReplaySlot>,
     /// Where to stream this turn's output as it is produced. `None` when nothing
     /// is watching, which is most turns — and then no per-chunk work happens at
     /// all.
@@ -1109,6 +1207,16 @@ impl TurnDriver for TurnLoop {
             TurnStart::Prompt(prompt) => self.run(prompt).await,
             TurnStart::Continue => self.complete_committed().await,
             TurnStart::Final(text) => Ok(Step::Final(text)),
+            TurnStart::Replay { calls, slots } => {
+                self.replayed = slots;
+                // No narration: the text that went with these calls is already
+                // in history on the round that issued them, and repeating it
+                // would show the user the same sentence twice.
+                Ok(Step::ToolCalls {
+                    calls,
+                    text: String::new(),
+                })
+            }
             TurnStart::Started => anyhow::bail!("turn driver already started"),
         }
     }
@@ -1130,6 +1238,9 @@ impl TurnDriver for TurnLoop {
                 text: r.content,
             })
             .collect();
+        if !self.replayed.is_empty() {
+            blocks = fill_replay_slots(std::mem::take(&mut self.replayed), blocks);
+        }
         // What the user said while this round ran, appended to the same user
         // message as a plain text block — after the results, so the model reads
         // the outcome first and the new instruction last (the position it acts
@@ -1761,7 +1872,7 @@ mod tests {
             started_event(2, "read", 0),
             settled_event(3, "read", 0, "file contents"),
         ];
-        let rebuilt = rebuild_from_events(&session, &events, "t1").unwrap();
+        let rebuilt = rebuild_from_events(&session, &events, "t1", &|_| false).unwrap();
         // The envelope came from the header, not from a stored copy of history.
         assert_eq!(rebuilt.model, "gpt-test");
         assert_eq!(rebuilt.preamble, "SYSTEM");
@@ -1788,7 +1899,7 @@ mod tests {
             settled_event(6, "a", 0, "first"),
             settled_event(7, "b", 1, "second"),
         ];
-        let rebuilt = rebuild_from_events(&session, &events, "t1").unwrap();
+        let rebuilt = rebuild_from_events(&session, &events, "t1", &|_| false).unwrap();
         let Some(Turn::User(blocks)) = rebuilt.history.last() else {
             panic!("the round's results close the history");
         };
@@ -1814,7 +1925,7 @@ mod tests {
             started_event(3, "b", 1),
             settled_event(4, "a", 0, "landed"),
         ];
-        let rebuilt = rebuild_from_events(&session, &events, "t1").unwrap();
+        let rebuilt = rebuild_from_events(&session, &events, "t1", &|_| false).unwrap();
         let Some(Turn::User(blocks)) = rebuilt.history.last() else {
             panic!("results close the history");
         };
@@ -1831,12 +1942,140 @@ mod tests {
     }
 
     #[test]
+    fn an_unsettled_idempotent_call_is_re_dispatched_instead_of_reported_lost() {
+        // The interrupted turn's own answer to "did this run?" — for a tool
+        // that can simply be run again, re-running it is cheaper and more
+        // accurate than spending a model round to say the result was lost.
+        let session = asked("go");
+        let events = vec![
+            header_event(0),
+            round_event(1, "", &["a", "b"]),
+            started_event(2, "a", 0),
+            started_event(3, "b", 1),
+            settled_event(4, "a", 0, "landed"),
+        ];
+        let rebuilt = rebuild_from_events(&session, &events, "t1", &|name| name == "b").unwrap();
+        let TurnStart::Replay { calls, slots } = rebuilt.start else {
+            panic!("the unsettled idempotent call should be re-dispatched");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "b");
+        // The round's results message is held back whole: it is one message and
+        // it cannot be sent until every call in it has answered.
+        assert!(matches!(
+            rebuilt.history.last(),
+            Some(Turn::Assistant { .. })
+        ));
+        assert_eq!(slots.len(), 2);
+        assert!(slots[0].1.is_some(), "the settled call keeps its result");
+        assert!(slots[1].1.is_none(), "the replayed call leaves a hole");
+    }
+
+    #[test]
+    fn a_non_idempotent_call_in_the_same_round_still_gets_the_note() {
+        // Replay is per tool, not per round: one call being safe to repeat says
+        // nothing about the one beside it.
+        let session = asked("go");
+        let events = vec![
+            header_event(0),
+            round_event(1, "", &["read", "shell"]),
+            started_event(2, "read", 0),
+            started_event(3, "shell", 1),
+        ];
+        let rebuilt = rebuild_from_events(&session, &events, "t1", &|name| name == "read").unwrap();
+        let TurnStart::Replay { calls, slots } = rebuilt.start else {
+            panic!("expected a replay");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        let Some(UserBlock::ToolResult { text, .. }) = &slots[1].1 else {
+            panic!("the non-idempotent call keeps a recorded result");
+        };
+        assert!(text.contains("interrupted"));
+    }
+
+    #[test]
+    fn only_the_newest_round_is_replayed() {
+        // An earlier round's results must have been sent, or the round after it
+        // would not exist. An unsettled call there is a lost event, not work in
+        // flight, and re-running it would change a request already answered.
+        let session = asked("go");
+        let events = vec![
+            header_event(0),
+            round_event(1, "", &["a"]),
+            started_event(2, "a", 0),
+            round_event(3, "", &["b"]),
+            started_event(4, "b", 1),
+        ];
+        let rebuilt = rebuild_from_events(&session, &events, "t1", &|_| true).unwrap();
+        let TurnStart::Replay { calls, .. } = rebuilt.start else {
+            panic!("expected a replay of the newest round");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "b");
+        // The stale round closed with the note rather than being re-run.
+        let stale = rebuilt
+            .history
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::User(blocks) => Some(blocks),
+                _ => None,
+            })
+            .nth(1)
+            .expect("the first round's results are in history");
+        assert!(matches!(
+            stale.first(),
+            Some(UserBlock::ToolResult { text, .. }) if text.contains("interrupted")
+        ));
+    }
+
+    #[test]
+    fn a_replayed_round_closes_in_the_order_the_model_issued_the_calls() {
+        // Not in the order the results arrived: the message has to match the
+        // one the interrupted turn was assembling.
+        let block = |id: &str, text: &str| UserBlock::ToolResult {
+            id: id.into(),
+            call_id: Some(id.into()),
+            text: text.into(),
+        };
+        let slots: Vec<ReplaySlot> = vec![
+            ("a".into(), Some(block("a", "first"))),
+            ("b".into(), None),
+            ("c".into(), Some(block("c", "third"))),
+            ("d".into(), None),
+        ];
+        // The replay answered d before b.
+        let fresh = vec![block("d", "fourth"), block("b", "second")];
+        let texts: Vec<String> = fill_replay_slots(slots, fresh)
+            .into_iter()
+            .map(|b| match b {
+                UserBlock::ToolResult { text, .. } => text,
+                _ => panic!("results only"),
+            })
+            .collect();
+        assert_eq!(texts, vec!["first", "second", "third", "fourth"]);
+    }
+
+    #[test]
+    fn a_replayed_call_that_came_back_with_nothing_still_fills_its_slot() {
+        // Unreachable in practice — the executor answers every call it is
+        // handed — but an open hole is the one shape a provider rejects.
+        let slots: Vec<ReplaySlot> = vec![("a".into(), None)];
+        let blocks = fill_replay_slots(slots, vec![]);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            UserBlock::ToolResult { text, .. } if text.contains("interrupted")
+        ));
+    }
+
+    #[test]
     fn a_turn_that_had_already_answered_hands_the_answer_back() {
         // The reply was produced and only the ledger close was lost. Re-issuing
         // the request would pay for an answer that already exists.
         let session = asked("go");
         let events = vec![header_event(0), round_event(1, "all done", &[])];
-        let rebuilt = rebuild_from_events(&session, &events, "t1").unwrap();
+        let rebuilt = rebuild_from_events(&session, &events, "t1", &|_| false).unwrap();
         match rebuilt.start {
             TurnStart::Final(text) => assert_eq!(text, "all done"),
             TurnStart::Continue => panic!("expected the answer back, not a continuation"),
@@ -1849,7 +2088,9 @@ mod tests {
         // Without the envelope the continuation would be a *different* request:
         // a re-assembled prompt whose memory recall and clock have moved on.
         let session = asked("go");
-        assert!(rebuild_from_events(&session, &[round_event(0, "hi", &[])], "t1").is_err());
+        assert!(
+            rebuild_from_events(&session, &[round_event(0, "hi", &[])], "t1", &|_| false).is_err()
+        );
     }
 
     #[test]
@@ -1860,7 +2101,7 @@ mod tests {
             round.turn_id = "t0".into();
         }
         let events = vec![header_event(0), other];
-        let rebuilt = rebuild_from_events(&session, &events, "t1").unwrap();
+        let rebuilt = rebuild_from_events(&session, &events, "t1", &|_| false).unwrap();
         assert_eq!(rebuilt.history.len(), 1, "only the user message survives");
     }
 
