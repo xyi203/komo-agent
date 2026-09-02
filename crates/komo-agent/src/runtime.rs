@@ -948,7 +948,7 @@ mod tests {
             &self,
             _session: &Session,
             _deltas: Option<Arc<dyn DeltaSink>>,
-            _recorder: Option<Arc<dyn TurnRecorder>>,
+            recorder: Option<Arc<dyn TurnRecorder>>,
         ) -> anyhow::Result<Box<dyn TurnDriver>> {
             // One turn per test, so hand the whole script to the driver.
             let steps = std::mem::take(&mut *self.script.lock().unwrap());
@@ -956,6 +956,8 @@ mod tests {
                 steps,
                 received: self.received.clone(),
                 interjected: self.interjected.clone(),
+                recorder,
+                round: 0,
             }))
         }
         async fn resume_turn(
@@ -979,12 +981,68 @@ mod tests {
         steps: VecDeque<Step>,
         received: Arc<Mutex<Vec<Vec<ToolOutcome>>>>,
         interjected: Arc<Mutex<Vec<String>>>,
+        /// The real driver records one `assistant/round` per provider
+        /// completion, and a fixture that skips it leaves a log claiming the
+        /// turn never called a model — which is most of what these tests read
+        /// the log back for.
+        recorder: Option<Arc<dyn TurnRecorder>>,
+        round: u32,
+    }
+
+    impl ScriptedDriver {
+        /// Record the round this step is the completion of. The scripted usage
+        /// is reported whole on the last round, the way a driver that counts
+        /// once at the end would.
+        async fn record_round(&mut self, step: &Step) {
+            let Some(recorder) = self.recorder.clone() else {
+                return;
+            };
+            let last = self.steps.is_empty();
+            let usage = if last {
+                self.usage()
+            } else {
+                TokenUsage::default()
+            };
+            let blocks = match step {
+                Step::Final(text) => serde_json::json!([{ "Text": text }]),
+                Step::ToolCalls { calls, .. } => serde_json::json!(
+                    calls
+                        .iter()
+                        .map(|c| serde_json::json!({
+                            "ToolCall": {
+                                "id": c.id,
+                                "call_id": c.call_id,
+                                "name": c.name,
+                                "args": c.args,
+                            }
+                        }))
+                        .collect::<Vec<_>>()
+                ),
+            };
+            let round = self.round;
+            self.round += 1;
+            recorder
+                .record(vec![SessionEventKind::AssistantRound(
+                    komo_core::domain::session_event::AssistantRoundEvent {
+                        turn_id: recorder.turn_id().to_string(),
+                        round,
+                        response_id: format!("resp-{round}"),
+                        blocks,
+                        tokens_in: usage.input,
+                        tokens_out: usage.output,
+                        tokens_cached: usage.cached_input,
+                    },
+                )])
+                .await;
+        }
     }
 
     #[async_trait]
     impl TurnDriver for ScriptedDriver {
         async fn first(&mut self) -> anyhow::Result<Step> {
-            Ok(self.steps.pop_front().expect("script exhausted at first()"))
+            let step = self.steps.pop_front().expect("script exhausted at first()");
+            self.record_round(&step).await;
+            Ok(step)
         }
         async fn step(
             &mut self,
@@ -995,7 +1053,9 @@ mod tests {
                 self.interjected.lock().unwrap().push(text);
             }
             self.received.lock().unwrap().push(results);
-            Ok(self.steps.pop_front().expect("script exhausted at step()"))
+            let step = self.steps.pop_front().expect("script exhausted at step()");
+            self.record_round(&step).await;
+            Ok(step)
         }
         fn usage(&self) -> TokenUsage {
             // Fixed, non-zero counts, so a test can tell "recorded" from
@@ -1115,6 +1175,11 @@ mod tests {
         for t in tools {
             executor.register(t);
         }
+        // Same wiring as `cli::wiring`: the executor records each call's two
+        // halves in the session log. Without it a fixture turn leaves a log that
+        // says the turn ran no tools, which is the one thing these tests are
+        // about.
+        let executor = executor.with_events(db.clone());
         let rt = AgentRuntime {
             llm: Arc::new(ScriptedLlm {
                 script: Mutex::new(script.into()),
@@ -1401,6 +1466,77 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].tool_name, "time");
         assert!(steps[0].ok);
+    }
+
+    #[tokio::test]
+    async fn the_event_log_alone_reproduces_the_ledger_rows() {
+        use komo_core::domain::run_projection::project_runs;
+
+        // The claim the projection rests on. The rows are a query index; if the
+        // fold disagrees with the writer on a real turn, dropping the
+        // authoritative write loses whatever the two disagree about.
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_projection.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, _) = scripted_runtime(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("time", "{}")]),
+                Step::Final("the time is now".into()),
+            ],
+            vec![Arc::new(TimeTool)],
+            30,
+        );
+        rt.handle_input("cli:s1", "hi".into()).await.unwrap();
+
+        let written = RunRepository::list(&*db, 10).await.unwrap();
+        let written_steps = RunRepository::steps(&*db, &written[0].id).await.unwrap();
+        let events = SessionEventRepository::events(&*db, "cli:s1")
+            .await
+            .unwrap();
+        let projected = project_runs("cli:s1", &events);
+
+        assert_eq!(projected.len(), written.len());
+        let (run, steps) = (&projected[0].run, &projected[0].steps);
+        let row = &written[0];
+        assert_eq!(run.id, row.id);
+        assert_eq!(run.session_id, row.session_id);
+        assert_eq!(run.input, row.input);
+        assert_eq!(run.plan, row.plan);
+        assert_eq!(run.status, row.status);
+        assert_eq!(run.final_output, row.final_output);
+        assert_eq!(run.error, row.error);
+        assert_eq!(run.recoverable, row.recoverable);
+        assert_eq!(run.started_at, row.started_at);
+        // Not the same stamp: the row takes `now()` when the runtime finishes
+        // the turn, the fold takes the terminal event's own timestamp, and the
+        // two are separated by the append between them. This divergence is the
+        // double write, and it goes away with it — what matters is that both
+        // agree the turn ended, and when, to the second the ledger renders.
+        assert!(run.ended_at.is_some() && row.ended_at.is_some());
+        assert!((run.ended_at.unwrap() - row.ended_at.unwrap()).abs() <= 1);
+        assert_eq!(run.tokens_in, row.tokens_in);
+        assert_eq!(run.tokens_out, row.tokens_out);
+        assert_eq!(run.tokens_cached, row.tokens_cached);
+        assert_eq!(run.resumed_from, row.resumed_from);
+        assert_eq!(run.memories, row.memories);
+
+        assert_eq!(steps.len(), written_steps.len());
+        for (folded, row) in steps.iter().zip(&written_steps) {
+            assert_eq!(folded.run_id, row.run_id);
+            assert_eq!(folded.seq, row.seq);
+            assert_eq!(folded.tool_name, row.tool_name);
+            assert_eq!(folded.args, row.args);
+            assert_eq!(folded.result, row.result);
+            assert_eq!(folded.error, row.error);
+            assert_eq!(folded.ok, row.ok);
+            assert_eq!(folded.uncertain, row.uncertain);
+            assert_eq!(folded.elapsed_ms, row.elapsed_ms);
+            assert_eq!(folded.structured, row.structured);
+            assert_eq!(folded.output_paths, row.output_paths);
+        }
     }
 
     #[tokio::test]
