@@ -35,8 +35,12 @@ use komo_core::domain::{
     message::Message,
     notify::Notifier,
     reminder::{Reminder, ReminderRepository, ReminderStatus},
+    repository::SessionEventRepository,
+    run::RunStatus,
+    run_projection::project_runs,
     session::Session,
     task::{Task, TaskRepository},
+    wakeup::{WakeupDispatch, WakeupRegistration, WakeupRepository},
 };
 use komo_services::tool_execution::{with_job_grants, with_session};
 
@@ -116,6 +120,9 @@ pub struct MaintenanceSummary {
     pub skill_candidates_expired: usize,
     /// Cron-job commands that ran to a zero exit this sweep.
     pub jobs_run: usize,
+    /// Standing waits this sweep woke — a timer that came due, or a wait that
+    /// ran out and has to come back and say nobody answered.
+    pub wakeups_fired: usize,
 }
 
 /// The fixed maintenance action: learn from every finished turn the interval
@@ -393,9 +400,131 @@ const JOB_OUTPUT_CAP: usize = 3000;
 /// the breaker's minutes-scale cooldowns are meaningless on a weekly cron. Only
 /// delivery failure fails the cycle (nothing reached the operator, which *is*
 /// worth the breaker alert).
+/// How many recent sessions the startup check reads. A suspended turn is
+/// re-registered from its own log, and the sessions worth checking are the ones
+/// that were live when the process died — not every conversation komo has ever
+/// held.
+pub const SUSPEND_RECHECK_SESSIONS: usize = 20;
+
+/// Re-register the waits a crash lost, once at startup. Answers how many.
+///
+/// The two records are kept honest in both directions: the sweep drops a
+/// registration whose turn is no longer waiting, and this adds one back for a
+/// turn the log says *is* waiting and nothing is watching. Without it, a crash
+/// in the window between `turn/suspended` and the registration write leaves a
+/// turn parked forever — the log says it is waiting and nobody is coming.
+///
+/// The wait itself is read back out of the `turn/suspended` event, which is why
+/// that event carries the `wakeup` and its deadline. **Grants are not
+/// recoverable this way** — they were the suspending turn's, and only the
+/// registration held them — so a re-registered unattended turn wakes able to
+/// ask but not to act, which is the safe end of that trade.
+///
+/// Best-effort throughout: a session whose log cannot be read is warned about
+/// and skipped, never fatal. Nothing here may keep the gateway from starting.
+pub async fn reregister_suspended_turns(
+    events: &Arc<dyn SessionEventRepository>,
+    wakeups: &Arc<dyn WakeupRepository>,
+    limit: usize,
+    now: i64,
+) -> usize {
+    use komo_core::domain::session_event::SessionEventKind;
+
+    let known = match wakeups.list().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(%error, "could not read standing wakeups; skipping the suspended-turn check");
+            return 0;
+        }
+    };
+    let ids = match events.session_ids().await {
+        Ok(ids) => ids,
+        Err(error) => {
+            warn!(%error, "could not list sessions; skipping the suspended-turn check");
+            return 0;
+        }
+    };
+    // Newest first — the ids are UUIDv7, so their order is chronological — and
+    // only as far back as the bound.
+    let recent: Vec<String> = ids.into_iter().rev().take(limit).collect();
+
+    let mut added = 0;
+    for session_id in recent {
+        let log = match events.events(&session_id).await {
+            Ok(log) => log,
+            Err(error) => {
+                warn!(%error, session = %session_id, "could not read a session log; skipping it");
+                continue;
+            }
+        };
+        for projected in project_runs(&session_id, &log) {
+            if projected.run.status != RunStatus::Suspended {
+                continue;
+            }
+            let turn_id = projected.run.id.clone();
+            if known
+                .iter()
+                .any(|r| r.session_id == session_id && r.turn_id.as_deref() == Some(&*turn_id))
+            {
+                continue;
+            }
+            // The suspension itself says what it is waiting for. The newest one
+            // wins: a turn that suspended, woke and suspended again is waiting
+            // for the second thing.
+            let Some(suspended) = log
+                .iter()
+                .rev()
+                .filter_map(|event| match &event.kind {
+                    SessionEventKind::TurnSuspended(s) if s.turn_id == turn_id => Some(s),
+                    _ => None,
+                })
+                .next()
+            else {
+                continue;
+            };
+            let registration = WakeupRegistration::new(&session_id, suspended.wakeup.clone(), now)
+                .continuing(&turn_id)
+                .expiring_at(suspended.expires_at.or_else(|| {
+                    komo_core::domain::wakeup::default_expiry_secs(&suspended.wakeup)
+                        .map(|secs| now + secs)
+                }));
+            match wakeups.save(&registration).await {
+                Ok(()) => {
+                    warn!(
+                        session = %session_id,
+                        turn = %turn_id,
+                        "re-registered a suspended turn nothing was watching"
+                    );
+                    added += 1;
+                }
+                Err(error) => {
+                    warn!(%error, session = %session_id, turn = %turn_id, "failed to re-register a suspended turn")
+                }
+            }
+        }
+    }
+    added
+}
+
+/// What the sweep needs to fire a standing wait: the registrations, the log to
+/// check them against, and whoever knows how to wake a turn.
+///
+/// Held together because firing one without any of the three is not a partial
+/// feature, it is a wrong one: a wake with no log check resumes turns that
+/// already came back, and a claim with no dispatch loses the wait.
+pub struct WakeupWiring {
+    pub registrations: Arc<dyn WakeupRepository>,
+    pub events: Arc<dyn SessionEventRepository>,
+    pub dispatch: Arc<dyn WakeupDispatch>,
+}
+
 pub struct CronJobSweep {
     pub jobs: Arc<dyn CronJobRepository>,
     pub notifier: Arc<dyn Notifier>,
+    /// Standing waits, read on the same tick as the jobs (docs/bot-runtime.md
+    /// §3.3: one scheduler). `None` = nothing suspends turns yet, so there is
+    /// nothing to wake.
+    pub wakeups: Option<WakeupWiring>,
     /// The unattended, tool-capable agent that runs `CronAction::Agent` jobs
     /// (wiring's `cron_runtime`: full tool set, policy-gated with a deny-all
     /// inner approver — a `Risk::Normal` action passes only through an
@@ -498,6 +627,9 @@ impl Maintenance for CronJobSweep {
                 warn!(%error, job = %job.name, "failed to record cron job outcome");
             }
         }
+        if let Some(wiring) = &self.wakeups {
+            summary.wakeups_fired = self.fire_due_wakeups(wiring, now).await;
+        }
         if delivery_failures > 0 {
             anyhow::bail!("{delivery_failures} cron job notification(s) failed to deliver");
         }
@@ -506,6 +638,96 @@ impl Maintenance for CronJobSweep {
 }
 
 impl CronJobSweep {
+    /// Wake every standing registration whose moment has come, and answer how
+    /// many. Never fails the sweep: a wait that could not be woken this tick is
+    /// still registered, and the next tick tries again.
+    ///
+    /// Two rules, in this order:
+    ///
+    /// 1. **Claim before firing.** `take` answers `false` when the row is
+    ///    already gone, so two sweeps racing one registration — or a sweep
+    ///    racing an arriving `/approve` — wake it exactly once.
+    /// 2. **The log decides whether it is still waiting.** A registration is
+    ///    the authority on *when* to come back, never on what the turn is
+    ///    doing: one pointing at a turn that already resumed (or ended) is
+    ///    stale, and firing it would run the same work twice. It is dropped —
+    ///    the claim above already removed it — and named in the log.
+    async fn fire_due_wakeups(&self, wiring: &WakeupWiring, now: i64) -> usize {
+        let registrations = match wiring.registrations.list().await {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(%error, "failed to read standing wakeups; nothing woken this tick");
+                return 0;
+            }
+        };
+        let mut fired = 0;
+        for registration in registrations {
+            let Some(cause) = registration.due_cause(now) else {
+                continue;
+            };
+            match wiring.registrations.take(&registration.id).await {
+                Ok(true) => {}
+                // Somebody else got there first — an arriving answer, or
+                // another sweep. Not an error, and not ours to fire.
+                Ok(false) => continue,
+                Err(error) => {
+                    warn!(%error, id = %registration.id, "failed to claim a wakeup; leaving it for the next tick");
+                    continue;
+                }
+            }
+            if !self.still_waiting(wiring, &registration).await {
+                warn!(
+                    id = %registration.id,
+                    session = %registration.session_id,
+                    turn = ?registration.turn_id,
+                    "dropping a wakeup whose turn is no longer waiting"
+                );
+                continue;
+            }
+            match wiring.dispatch.fire(&registration, cause).await {
+                Ok(()) => {
+                    info!(
+                        id = %registration.id,
+                        session = %registration.session_id,
+                        cause = cause.as_str(),
+                        "woke a suspended turn"
+                    );
+                    fired += 1;
+                }
+                Err(error) => {
+                    warn!(%error, id = %registration.id, cause = cause.as_str(), "failed to wake a turn")
+                }
+            }
+        }
+        fired
+    }
+
+    /// Whether the log still says this registration's turn is suspended.
+    ///
+    /// A registration with no turn starts a fresh one, so there is nothing to
+    /// check — it is always live. A log that cannot be read answers **no**:
+    /// waking a turn on a guess is the failure this check exists to prevent.
+    async fn still_waiting(
+        &self,
+        wiring: &WakeupWiring,
+        registration: &WakeupRegistration,
+    ) -> bool {
+        let Some(turn_id) = &registration.turn_id else {
+            return true;
+        };
+        let events = match wiring.events.events(&registration.session_id).await {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(%error, session = %registration.session_id, "could not read the log to check a wakeup");
+                return false;
+            }
+        };
+        project_runs(&registration.session_id, &events)
+            .iter()
+            .find(|projected| projected.run.id == *turn_id)
+            .is_some_and(|projected| projected.run.status == RunStatus::Suspended)
+    }
+
     /// Dispatch one due job to its action, returning (title, body, success,
     /// ledger session of an agent run — `None` for command jobs).
     async fn execute(&self, job: &CronJob) -> (String, String, bool, Option<String>) {
@@ -1293,8 +1515,329 @@ where
 mod tests {
     use super::*;
     use komo_core::domain::reminder::{Reminder, ReminderStatus};
+    use komo_core::domain::session_event::WakeupCause;
     use komo_core::domain::task::{Task, TaskStatus};
     use std::sync::Mutex;
+
+    // ── standing wakeups ─────────────────────────────────────────────────────
+
+    /// A dispatcher that records what it was asked to wake.
+    #[derive(Default)]
+    struct RecordingWake(Mutex<Vec<(String, WakeupCause)>>);
+
+    #[async_trait]
+    impl WakeupDispatch for RecordingWake {
+        async fn fire(
+            &self,
+            registration: &WakeupRegistration,
+            cause: WakeupCause,
+        ) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((registration.id.clone(), cause));
+            Ok(())
+        }
+    }
+
+    /// A `komo.db` of this test's own, holding both the registrations and the
+    /// session log they are checked against.
+    async fn wakeup_store(name: &str) -> Arc<komo_infra::persistence::db::Db> {
+        let home = std::env::temp_dir().join(format!("komo-wksweep-{name}"));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        Arc::new(
+            komo_infra::persistence::db::Db::connect(&format!(
+                "turso:{}",
+                home.join("komo.db").display()
+            ))
+            .await
+            .unwrap(),
+        )
+    }
+
+    /// A turn in the log that opened and then stopped to wait.
+    async fn log_a_suspended_turn(
+        db: &Arc<komo_infra::persistence::db::Db>,
+        session: &str,
+        turn: &str,
+    ) {
+        use komo_core::domain::session_event::{SessionEventKind, TurnSuspendedEvent, Wakeup};
+        SessionEventRepository::append(
+            db.as_ref(),
+            session,
+            vec![
+                SessionEventKind::TurnStarted {
+                    turn_id: turn.into(),
+                    resumed_from: None,
+                },
+                SessionEventKind::TurnSuspended(TurnSuspendedEvent {
+                    turn_id: turn.into(),
+                    wakeup: Wakeup::UserReply,
+                    summary: "waiting for an answer".into(),
+                    expires_at: None,
+                }),
+            ],
+        )
+        .await
+        .unwrap();
+        SessionEventRepository::durable_flush(db.as_ref(), session)
+            .await
+            .unwrap();
+    }
+
+    fn wakeup_sweep(
+        db: &Arc<komo_infra::persistence::db::Db>,
+        dispatch: Arc<RecordingWake>,
+    ) -> CronJobSweep {
+        CronJobSweep {
+            jobs: db.clone(),
+            notifier: Arc::new(FakeNotifier::default()),
+            runtime: None,
+            wakeups: Some(WakeupWiring {
+                registrations: db.clone(),
+                events: db.clone(),
+                dispatch,
+            }),
+        }
+    }
+
+    /// A due timer wakes its turn once, and the registration is gone with it —
+    /// so the next tick has nothing to fire. Two wakes for one wait would run
+    /// the same continuation twice.
+    #[tokio::test]
+    async fn a_due_wakeup_fires_once_and_then_is_gone() {
+        use komo_core::domain::session_event::Wakeup;
+
+        let db = wakeup_store("fires-once").await;
+        log_a_suspended_turn(&db, "s1", "run-1").await;
+        let now = 1_700_000_000;
+        let registration =
+            WakeupRegistration::new("s1", Wakeup::At { at: now }, now - 60).continuing("run-1");
+        WakeupRepository::save(db.as_ref(), &registration)
+            .await
+            .unwrap();
+
+        let dispatch = Arc::new(RecordingWake::default());
+        let sweep = wakeup_sweep(&db, dispatch.clone());
+
+        assert_eq!(
+            sweep
+                .fire_due_wakeups(sweep.wakeups.as_ref().unwrap(), now)
+                .await,
+            1
+        );
+        assert_eq!(
+            *dispatch.0.lock().unwrap(),
+            vec![(registration.id.clone(), WakeupCause::Time)]
+        );
+
+        // Nothing left to claim, so a second tick wakes nothing.
+        assert_eq!(
+            sweep
+                .fire_due_wakeups(sweep.wakeups.as_ref().unwrap(), now)
+                .await,
+            0
+        );
+        assert_eq!(dispatch.0.lock().unwrap().len(), 1, "no second wake");
+        assert!(
+            WakeupRepository::list(db.as_ref())
+                .await
+                .unwrap()
+                .is_empty(),
+            "the claim retired it"
+        );
+    }
+
+    /// The log is the authority on what a turn is doing. A registration
+    /// pointing at a turn that already came back is stale — firing it would
+    /// re-run work the continuation already did — so it is dropped, not fired.
+    #[tokio::test]
+    async fn a_wakeup_for_a_turn_that_already_resumed_is_dropped() {
+        use komo_core::domain::session_event::{
+            SessionEventKind, Wakeup, WakeupCause as Cause, WakeupFiredEvent,
+        };
+
+        let db = wakeup_store("stale").await;
+        log_a_suspended_turn(&db, "s1", "run-1").await;
+        // …and then it was woken by something else — an arriving `/approve`,
+        // say — which is exactly the race the check exists for.
+        SessionEventRepository::append(
+            db.as_ref(),
+            "s1",
+            vec![SessionEventKind::WakeupFired(WakeupFiredEvent {
+                turn_id: "run-1".into(),
+                wakeup_id: String::new(),
+                cause: Cause::Approve,
+                payload: String::new(),
+            })],
+        )
+        .await
+        .unwrap();
+        SessionEventRepository::durable_flush(db.as_ref(), "s1")
+            .await
+            .unwrap();
+
+        let now = 1_700_000_000;
+        let registration =
+            WakeupRegistration::new("s1", Wakeup::At { at: now }, now - 60).continuing("run-1");
+        WakeupRepository::save(db.as_ref(), &registration)
+            .await
+            .unwrap();
+
+        let dispatch = Arc::new(RecordingWake::default());
+        let sweep = wakeup_sweep(&db, dispatch.clone());
+
+        assert_eq!(
+            sweep
+                .fire_due_wakeups(sweep.wakeups.as_ref().unwrap(), now)
+                .await,
+            0
+        );
+        assert!(
+            dispatch.0.lock().unwrap().is_empty(),
+            "a turn that is running again must not be woken"
+        );
+        assert!(
+            WakeupRepository::list(db.as_ref())
+                .await
+                .unwrap()
+                .is_empty(),
+            "and the stale registration is dropped rather than retried forever"
+        );
+    }
+
+    /// A wait that ran out comes back as `expired` rather than being deleted: a
+    /// question nobody answered has to reach the turn that asked it.
+    #[tokio::test]
+    async fn a_wait_that_ran_out_wakes_as_expired() {
+        use komo_core::domain::session_event::Wakeup;
+
+        let db = wakeup_store("expired").await;
+        log_a_suspended_turn(&db, "s1", "run-1").await;
+        let created = 1_700_000_000;
+        let registration =
+            WakeupRegistration::new("s1", Wakeup::UserReply, created).continuing("run-1");
+        let deadline = registration.expires_at.unwrap();
+        WakeupRepository::save(db.as_ref(), &registration)
+            .await
+            .unwrap();
+
+        let dispatch = Arc::new(RecordingWake::default());
+        let sweep = wakeup_sweep(&db, dispatch.clone());
+        let wiring = sweep.wakeups.as_ref().unwrap();
+
+        assert_eq!(sweep.fire_due_wakeups(wiring, deadline - 1).await, 0);
+        assert_eq!(sweep.fire_due_wakeups(wiring, deadline).await, 1);
+        assert_eq!(
+            dispatch.0.lock().unwrap()[0].1,
+            WakeupCause::Expired,
+            "and the turn is told nobody answered"
+        );
+    }
+
+    /// The other direction of the same invariant: a turn the log says is
+    /// waiting, with nothing registered to wake it, is a turn parked forever.
+    /// The startup check adds the wait back, reading it out of the suspension
+    /// itself.
+    #[tokio::test]
+    async fn a_suspended_turn_nothing_is_watching_is_re_registered() {
+        use komo_core::domain::session_event::Wakeup;
+
+        let db = wakeup_store("recheck").await;
+        log_a_suspended_turn(&db, "s1", "run-1").await;
+        let events: Arc<dyn SessionEventRepository> = db.clone();
+        let wakeups: Arc<dyn WakeupRepository> = db.clone();
+        let now = 1_700_000_000;
+
+        assert_eq!(
+            reregister_suspended_turns(&events, &wakeups, 20, now).await,
+            1
+        );
+        let registered = WakeupRepository::list(db.as_ref()).await.unwrap();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].turn_id.as_deref(), Some("run-1"));
+        assert_eq!(
+            registered[0].wakeup,
+            Wakeup::UserReply,
+            "read back out of the suspension, not guessed"
+        );
+        assert_eq!(
+            registered[0].expires_at,
+            Some(now + 7 * 86_400),
+            "and it gets its variant's deadline, so it cannot hang forever"
+        );
+
+        // Idempotent: a second startup finds the wait already watched.
+        assert_eq!(
+            reregister_suspended_turns(&events, &wakeups, 20, now).await,
+            0
+        );
+        assert_eq!(WakeupRepository::list(db.as_ref()).await.unwrap().len(), 1);
+    }
+
+    /// A turn that is not waiting must not have a wait invented for it.
+    #[tokio::test]
+    async fn a_running_or_finished_turn_is_not_re_registered() {
+        use komo_core::domain::session_event::SessionEventKind;
+
+        let db = wakeup_store("recheck-none").await;
+        SessionEventRepository::append(
+            db.as_ref(),
+            "s1",
+            vec![
+                SessionEventKind::TurnStarted {
+                    turn_id: "run-1".into(),
+                    resumed_from: None,
+                },
+                SessionEventKind::TurnCompleted {
+                    turn_id: "run-1".into(),
+                },
+                SessionEventKind::TurnStarted {
+                    turn_id: "run-2".into(),
+                    resumed_from: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        SessionEventRepository::durable_flush(db.as_ref(), "s1")
+            .await
+            .unwrap();
+
+        let events: Arc<dyn SessionEventRepository> = db.clone();
+        let wakeups: Arc<dyn WakeupRepository> = db.clone();
+        assert_eq!(
+            reregister_suspended_turns(&events, &wakeups, 20, 1_700_000_000).await,
+            0,
+            "one finished turn and one still running: neither is waiting"
+        );
+    }
+
+    /// A wake with no turn to continue starts one, so there is nothing in the
+    /// log to check it against — it must not be dropped for that.
+    #[tokio::test]
+    async fn a_wakeup_that_starts_a_fresh_turn_needs_no_suspended_turn() {
+        use komo_core::domain::session_event::Wakeup;
+
+        let db = wakeup_store("fresh").await;
+        let now = 1_700_000_000;
+        WakeupRepository::save(
+            db.as_ref(),
+            &WakeupRegistration::new("s1", Wakeup::At { at: now }, now - 60),
+        )
+        .await
+        .unwrap();
+
+        let dispatch = Arc::new(RecordingWake::default());
+        let sweep = wakeup_sweep(&db, dispatch.clone());
+        assert_eq!(
+            sweep
+                .fire_due_wakeups(sweep.wakeups.as_ref().unwrap(), now)
+                .await,
+            1
+        );
+    }
 
     // ── MemoryMonitorSweep ────────────────────────────────────────────────────
 
@@ -1483,6 +2026,7 @@ mod tests {
             jobs: repo.clone(),
             notifier: notifier.clone(),
             runtime,
+            wakeups: None,
         };
         (sweep, repo, notifier)
     }

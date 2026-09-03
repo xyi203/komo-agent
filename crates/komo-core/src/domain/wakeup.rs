@@ -116,6 +116,22 @@ impl WakeupRegistration {
     }
 }
 
+/// Who knows how to actually wake something up.
+///
+/// The sweep owns *when* (the clock, the claim, and checking the log agrees the
+/// turn is still waiting); this owns *what happens next* — continue the
+/// suspended turn, or start a fresh one carrying what the wake brought. Split
+/// because the scheduler lives in the daemon and the turn lives in the runtime,
+/// and neither should have to know the other's shape.
+#[async_trait::async_trait]
+pub trait WakeupDispatch: Send + Sync {
+    async fn fire(
+        &self,
+        registration: &WakeupRegistration,
+        cause: WakeupCause,
+    ) -> anyhow::Result<()>;
+}
+
 #[async_trait::async_trait]
 pub trait WakeupRepository: Send + Sync {
     async fn save(&self, registration: &WakeupRegistration) -> anyhow::Result<()>;

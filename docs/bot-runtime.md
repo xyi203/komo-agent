@@ -428,8 +428,30 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   验证：`a_suspended_turn_is_waiting_rather_than_interrupted`（suspended 前后各切一刀，
   判定分别是 interrupted / waiting）、`a_fired_wakeup_takes_the_turn_out_of_waiting`、
   `reconciliation_leaves_a_suspended_turn_alone`。
-- **5.2 唤醒登记**：`WakeupRegistration` 表进 cron.db；`CronJobSweep` 增加登记的 claim-before-fire；
-  fire 时核对日志。验证：登记指向已恢复的 turn 被丢弃并 warn；重复 fire 不重复恢复。
+- **5.2 唤醒登记** —— **已完成**：`wakeup_records` 进 `komo.db`（ADR 0004 合库后就是同一个库，
+  Q3 那个「放哪」的问题自然消失了；表用 `ensure_table` 建，DDL 与 `push_schema` 逐字节对拍——
+  索引名第一次就猜错了，那条测试当场抓住）。`Wakeup` 变体在行上摊平：`kind` 判别，
+  载荷列各归各位，读不出来的载荷退化成 `UserReply`（会过期、会回来说没人答）而不是丢行。
+  `take` 就是那个认领：行已经没了就答 `false`，所以两个 sweep、或者 sweep 和刚到的 `/approve`
+  抢同一条登记，只有一个能 fire。`take_for_turn` 让一个 turn 手上所有等待一起退休——
+  被审批唤醒的 turn 不该再被盯着同一件事的定时器唤醒第二次。
+  `CronJobSweep` 同一个 tick 顺带扫登记（`WakeupWiring` 三件套：登记、日志、dispatch，
+  少一件就不是「功能不全」而是「行为错误」）。顺序是**先认领、再核对日志**：
+  日志说这个 turn 已经不在等了，就丢弃并 warn，因为 fire 它等于把续跑干过的活再干一遍；
+  读不出日志一律判「不在等」——凭猜去唤醒正是这条检查要防的。
+  反向核对做在 gateway 启动：`reregister_suspended_turns` 扫最近
+  `SUSPEND_RECHECK_SESSIONS` 个 session，日志说挂起、却没人盯着的 turn 把等待补回来，
+  等待本身从它自己的 `turn/suspended` 事件读（这就是那个事件带 `wakeup` 和 `expires_at` 的原因）。
+  **grants 补不回来**——它只存在登记里，所以补登记醒来的无人值守 turn 能问、不能动，
+  这是这个取舍安全的那一端。
+  验证：`a_due_wakeup_fires_once_and_then_is_gone`（第二次 tick 什么都不唤醒）、
+  `a_wakeup_for_a_turn_that_already_resumed_is_dropped`、`a_wait_that_ran_out_wakes_as_expired`、
+  `a_wakeup_that_starts_a_fresh_turn_needs_no_suspended_turn`、
+  `a_suspended_turn_nothing_is_watching_is_re_registered`（幂等）、
+  `a_running_or_finished_turn_is_not_re_registered`，加 store 侧四条（五种变体往返、
+  无 turn 的登记、认领两次成功一次、按 turn 一起退休）。
+  **dispatch 还没有实现者**：`wakeups: None` 挂在 sweep 上，等 5.3 把挂起路径接上来——
+  现在还没有任何东西会写登记，所以生产行为一字未变。
 - **5.3 审批改造**：`ChatApprover` / TUI approver / `PolicyApprover` 的等待从 oneshot 改为挂起；
   `/approve <id>` 跨 session；过期路径。验证：gateway 重启后 `/approve` 仍能恢复并执行；
   24h 过期后模型收到拒绝；`Risk::Dangerous` 仍 `Once`。

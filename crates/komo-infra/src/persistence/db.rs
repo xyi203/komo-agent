@@ -8,6 +8,7 @@ use tracing::info;
 use crate::memory::memory_db::MemoryRecord;
 use crate::persistence::cron::CronJobRecord;
 use crate::persistence::kanban::TaskRecord;
+use crate::persistence::wakeup::{WAKEUP_TABLE, WAKEUP_TABLE_DDL, WakeupRecord};
 use crate::persistence::{
     DEFAULT_POOL_SIZE, drop_retired_columns, ensure_columns, ensure_table, prepare_turso_path,
     session_event_store::SessionEventStore, turso_marker_path, with_write_retry,
@@ -416,6 +417,7 @@ impl Db {
             ensure_columns(p, "run_step_records", STEP_COLUMNS).await?;
             ensure_table(p, INBOX_TABLE, INBOX_TABLE_DDL).await?;
             ensure_table(p, RUN_MEMORY_TABLE, RUN_MEMORY_TABLE_DDL).await?;
+            ensure_table(p, WAKEUP_TABLE, WAKEUP_TABLE_DDL).await?;
             // The durable tables keep their own schema knowledge in their own
             // modules; they are migrated in place and never dropped to be
             // rebuilt. (`task_records` has gained no column since it was
@@ -445,7 +447,8 @@ impl Db {
                 // Durable, and formerly one file each (docs/adr/0004).
                 TaskRecord,
                 CronJobRecord,
-                MemoryRecord
+                MemoryRecord,
+                WakeupRecord
             ))
             .max_pool_size(DEFAULT_POOL_SIZE)
             .build(driver)
@@ -866,6 +869,10 @@ impl SessionEventRepository for Db {
 
     async fn surface(&self, session_id: &str) -> anyhow::Result<Option<SurfaceProjection>> {
         Ok(self.events.surface(session_id).await?)
+    }
+
+    async fn session_ids(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self.events.session_ids().await?)
     }
 
     async fn turn_boundary(&self, session_id: &str) -> anyhow::Result<bool> {
@@ -2216,6 +2223,56 @@ mod tests {
             .unwrap();
         drop(db);
         assert_eq!(table_schema_sql(&old, RUN_MEMORY_TABLE).await, reference);
+    }
+
+    /// The wakeup table arrived after `komo.db` did, so an existing file only
+    /// gets it through `ensure_table` — which has to build exactly what
+    /// `push_schema` would, index included, or the sweep queries a table with
+    /// the right name and the wrong shape.
+    #[tokio::test]
+    async fn wakeup_table_ddl_matches_push_schema() {
+        let fresh = std::env::temp_dir().join("komo_wakeup_ddl_fresh.db");
+        crate::persistence::reset_test_db(&fresh);
+        let db = Db::connect(&format!("turso:{}", fresh.display()))
+            .await
+            .unwrap();
+        drop(db);
+        let reference = table_schema_sql(&fresh, WAKEUP_TABLE).await;
+        assert!(!reference.is_empty(), "push_schema created the table");
+
+        let old = std::env::temp_dir().join("komo_wakeup_ddl_old.db");
+        crate::persistence::reset_test_db(&old);
+        let db = Db::connect(&format!("turso:{}", old.display()))
+            .await
+            .unwrap();
+        drop(db);
+        {
+            let raw = turso::Builder::new_local(old.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+            let conn = raw.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+            conn.execute("DROP TABLE \"wakeup_records\"", ())
+                .await
+                .unwrap();
+        }
+        let db = Db::connect(&format!("turso:{}", old.display()))
+            .await
+            .unwrap();
+        // And it is usable, not merely present.
+        komo_core::domain::wakeup::WakeupRepository::save(
+            &db,
+            &komo_core::domain::wakeup::WakeupRegistration::new(
+                "s1",
+                komo_core::domain::session_event::Wakeup::UserReply,
+                1_000,
+            ),
+        )
+        .await
+        .unwrap();
+        drop(db);
+        assert_eq!(table_schema_sql(&old, WAKEUP_TABLE).await, reference);
     }
 
     #[tokio::test]

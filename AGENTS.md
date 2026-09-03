@@ -65,6 +65,7 @@ connect and renamed `<name>.merged-backup`.
 | `komo.db` · `task_records` | cross-session tasks | durable |
 | `komo.db` · `memory_records` | long-term memories | durable — **additive changes only** |
 | `komo.db` · `cron_job_records` | scheduled cron jobs | durable |
+| `komo.db` · `wakeup_records` | standing wakeups — one row per suspended turn's wait | durable |
 | `~/.komo/sessions/` | transcripts — one append-only `.jsonl` per session | disposable |
 | `~/.komo/permissions.json` | saved approval grants | durable |
 | `~/.komo/checkpoints/` | pre-images of files a run changed (7-day retention) | disposable |
@@ -714,7 +715,15 @@ call the same functions, which is what keeps validation from forking.
   crash never re-fires a slot; a slot missed by more than the job's **own
   interval** is abandoned rather than fired at the wrong hour — `is_due` has no
   upper bound on lateness, and the host is a laptop. `--skip-missed` opts a job
-  out of running late at all), `TaskSweep`, `BriefingSweep` (opt-in; aux-model
+  out of running late at all; the same tick also fires **standing wakeups** —
+  `WakeupWiring`, docs/bot-runtime.md §3.3's one scheduler — claiming each
+  registration before firing it (`take` answers `false` when it is already
+  gone, so two sweeps or a sweep racing an arriving `/approve` wake it once)
+  and checking the **log** before it does: a registration pointing at a turn
+  that already resumed is stale and is dropped, because firing it would re-run
+  the continuation's work. `reregister_suspended_turns` closes the loop the
+  other way at startup — a turn the log says is waiting with nothing watching
+  it gets its wait back, read out of its own `turn/suspended`), `TaskSweep`, `BriefingSweep` (opt-in; aux-model
   runtime with read-only tools + deny-all unattended approver; degrades to
   tool-less `complete` on error; stamps a per-day watermark
   (`BriefingMarkRepository`, a settings row) so a gateway restarted across

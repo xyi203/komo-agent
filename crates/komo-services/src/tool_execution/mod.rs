@@ -1237,6 +1237,9 @@ mod tests {
 
     #[async_trait]
     impl SessionEventRepository for CountingEvents {
+        async fn session_ids(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
         async fn append(
             &self,
             _session_id: &str,

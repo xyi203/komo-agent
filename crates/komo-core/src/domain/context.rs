@@ -575,6 +575,10 @@ mod approval_gate_tests {
 
     #[async_trait::async_trait]
     impl SessionEventRepository for Recording {
+        async fn session_ids(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
         async fn surface(
             &self,
             _s: &str,

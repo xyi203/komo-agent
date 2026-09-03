@@ -8,8 +8,9 @@ use crate::{
     cli::wiring,
     domain::{
         approval::Approver, cron::CronJobRepository, gateway::MessageHandler, home::HomeRepository,
-        notify::Notifier, pairing::PairingRepository, repository::SessionRepository,
-        run::RunRepository, task::TaskRepository, todo::SessionTodoRepository,
+        notify::Notifier, pairing::PairingRepository, repository::SessionEventRepository,
+        repository::SessionRepository, run::RunRepository, task::TaskRepository,
+        todo::SessionTodoRepository, wakeup::WakeupRepository,
     },
     infra::messaging::{
         api::ApiChannel, home_notifier::HomeNotifier, macos_notifier::MacosNotifier,
@@ -59,6 +60,22 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "reconciled interrupted runs on startup"),
         Err(error) => tracing::warn!(%error, "failed to reconcile interrupted runs"),
+    }
+    // The other half of the crash-residue check: a turn the log says is
+    // suspended with nothing registered to wake it. Best-effort, like the
+    // reconciliation above — a repair that fails must not block startup.
+    let events: Arc<dyn SessionEventRepository> = db.clone();
+    let wakeups: Arc<dyn WakeupRepository> = db.clone();
+    match komo_agent::daemon::reregister_suspended_turns(
+        &events,
+        &wakeups,
+        komo_agent::daemon::SUSPEND_RECHECK_SESSIONS,
+        now,
+    )
+    .await
+    {
+        0 => {}
+        n => tracing::info!(count = n, "re-registered suspended turns on startup"),
     }
     // Tasks and cron jobs are tables in the same database now (docs/adr/0004);
     // the sweeps still take them as their own repositories.

@@ -142,6 +142,14 @@ pub trait SessionEventRepository: Send + Sync {
     /// served out of.
     async fn surface(&self, session_id: &str) -> anyhow::Result<Option<SurfaceProjection>>;
 
+    /// Every session that has a log, oldest first.
+    ///
+    /// Ids only — a caller that wants a session's *contents* asks for them per
+    /// session. This exists for the sweeps that have to look across all of
+    /// them (a rebuild, the startup check for waits a crash lost) without
+    /// loading every conversation to find out which ones matter.
+    async fn session_ids(&self) -> anyhow::Result<Vec<String>>;
+
     /// A completed turn just became durable — a safe point for the log to do its
     /// own upkeep.
     ///

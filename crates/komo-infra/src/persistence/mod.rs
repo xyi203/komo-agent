@@ -10,6 +10,7 @@ pub mod db;
 pub mod kanban;
 pub mod session_event_store;
 pub mod session_log;
+pub mod wakeup;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

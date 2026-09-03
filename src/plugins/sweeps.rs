@@ -196,6 +196,10 @@ impl Plugin for CronJobsPlugin {
                 notifier: cx.notifier.clone(),
                 // Agent-mode jobs run on the unattended full-tool cron runtime.
                 runtime: Some(cx.cron_runtime.clone()),
+                // Standing waits ride the same tick (docs/bot-runtime.md §3.3).
+                // `None` until something suspends a turn — nothing writes a
+                // registration yet, so there is nothing here to wake.
+                wakeups: None,
             }),
             alert: Some(cx.notifier.clone()),
         });

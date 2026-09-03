@@ -1774,6 +1774,10 @@ mod tests {
 
     #[async_trait]
     impl SessionEventRepository for ReadSpy {
+        async fn session_ids(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.session_ids().await
+        }
+
         async fn surface(
             &self,
             session_id: &str,
@@ -1857,6 +1861,10 @@ mod tests {
 
     #[async_trait]
     impl SessionEventRepository for RetentionSpy {
+        async fn session_ids(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.session_ids().await
+        }
+
         async fn surface(
             &self,
             session_id: &str,

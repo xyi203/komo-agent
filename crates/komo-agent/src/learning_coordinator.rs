@@ -763,6 +763,10 @@ mod tests {
 
     #[async_trait]
     impl SessionEventRepository for FakeEvents {
+        async fn session_ids(&self) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
         async fn surface(
             &self,
             _session_id: &str,
