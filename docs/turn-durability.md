@@ -656,20 +656,46 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
 
 ## 6. 完成判据
 
+九条全部满足，每条后面是兜住它的测试。
+
 1. 保留 projection-control tombstones、清空其余 session/run projection 表后，能从
    SessionHeader + RetentionBase + retained SessionEvents 重建所有未过期查询结果。
+   —— `a_deleted_state_db_rebuilds_the_ledger_from_the_logs`（整个 state.db 删掉再重建，
+   五个操作面查询逐字段一致）、`a_pruned_run_is_never_projected_again`。
 2. 删除任何 projection checkpoint 后，模型历史不变；删除 RetentionBase 必须被加载器拒绝为
    权威缺口，不能静默退回残缺日志。
+   —— `deleting_the_surface_checkpoint_changes_nothing_it_says`、
+   `a_missing_retention_base_refuses_instead_of_serving_the_tail`。
 3. 长生命周期 session 持续写入并触发多次 segment roll/truncate 后，retained bytes 回到上限内；
    在 truncate 每个提交点注入崩溃都能恢复。
+   —— `a_log_over_budget_sheds_its_oldest_segment_and_still_reads`、
+   `a_crash_before_the_manifest_leaves_the_log_exactly_as_it_was`、
+   `a_crash_before_the_delete_costs_space_and_nothing_else`、
+   `truncate_never_cuts_into_the_active_segment`。
 4. 连续十轮相同 system prompt/tool schemas 只写一次 initial `request/header`；change/resume 的
    full snapshot 能在任意 seq 重建当时 request state。
+   —— `ten_identical_rounds_write_one_header_and_the_change_writes_a_second`、
+   `a_header_fold_answers_with_the_envelope_in_force_at_that_seq`。
 5. 一轮 10 个 tool calls 的 started barrier 只做一次 durable flush；tool 按任意完成顺序 settle，
    live 与 rebuild 仍按 `call_index` 产生 byte-identical 的 provider-order results。
+   —— `a_round_makes_its_whole_dispatch_intent_durable_in_one_barrier`（十个调用、一次
+   flush、call_index 按 provider 顺序）、`results_rebuild_in_call_order_not_in_the_order_they_settled`、
+   `settles_match_their_call_by_id_not_by_arrival_order`。
 6. 在 approval requested 前、等待中、deny/allow durable 前后、tool settle 前后分别注入崩溃：
    requested 后无 resolved 的调用判 not-started 并重新审批，durable deny 重建拒绝结果，durable
    allow 后未 settle 才判 uncertain。
+   —— `domain::context::approval_gate_tests` 五条（记不下就不问、allow 必须先 durable、
+   deny 不用自己的 fsync、durable 失败即拒绝、没有日志时照常审批）、
+   `a_call_that_never_settled_comes_back_as_an_uncertain_outcome`、
+   `an_unsettled_idempotent_call_is_re_dispatched_instead_of_reported_lost`。
 7. 一个 session 的 retained event seq 与 `truncated_before` 连续，两个 ingress 不会并发提交同一序号。
+   —— `a_seq_gap_refuses_the_log`、`a_base_is_sparse_on_purpose_but_the_retained_tail_is_not`、
+   `one_session_gets_one_handle_so_seqs_are_never_handed_out_twice`。
 8. 新 turn 不再写旧 transcript、turn journal 和直接 RunStep 权威路径；新 session 不再生成
    `tool-output/index.jsonl`。
+   —— 结构性：`RunRepository` 上那四个写入方法已经删除（2.1），
+   `tool_output_store` 的 index 写入点已经删除（1.6）。
 9. `cargo test --workspace` 通过，并有长会话 windowed read 的回归测试，避免每轮全量 fold。
+   —— 21 个 test binary 全绿；
+   `a_warm_read_does_not_open_the_segments_its_checkpoint_covers`（把最老的段改名成读不到，
+   热读毫无察觉）、`a_turn_settles_from_its_own_start_not_the_whole_log`。

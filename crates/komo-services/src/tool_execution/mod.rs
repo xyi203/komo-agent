@@ -1228,6 +1228,107 @@ mod tests {
             .remove(0)
     }
 
+    /// Counts what reached the log, and how many barriers it took.
+    #[derive(Default)]
+    struct CountingEvents {
+        appended: Mutex<Vec<SessionEventKind>>,
+        flushes: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SessionEventRepository for CountingEvents {
+        async fn append(
+            &self,
+            _session_id: &str,
+            kinds: Vec<SessionEventKind>,
+        ) -> anyhow::Result<Vec<komo_core::domain::session_event::SessionEvent>> {
+            self.appended.lock().unwrap().extend(kinds);
+            Ok(Vec::new())
+        }
+        async fn durable_flush(&self, _session_id: &str) -> anyhow::Result<()> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        async fn events(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Vec<komo_core::domain::session_event::SessionEvent>> {
+            Ok(Vec::new())
+        }
+        async fn events_from(
+            &self,
+            _session_id: &str,
+            _seq: u64,
+        ) -> anyhow::Result<Vec<komo_core::domain::session_event::SessionEvent>> {
+            Ok(Vec::new())
+        }
+        async fn surface(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<komo_core::domain::session_event::SurfaceProjection>> {
+            Ok(None)
+        }
+        async fn turn_boundary(&self, _session_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn retain(&self, _session_id: &str, _keep_from: u64) -> anyhow::Result<Option<u64>> {
+            Ok(None)
+        }
+    }
+
+    /// One round, **one** barrier: every call's dispatch intent is batched and
+    /// made durable once, before any tool runs. An fsync per call would put a
+    /// disk write between every dispatch in a round that exists to run them at
+    /// once — and the recovery rule needs only that the intent landed before
+    /// the effects, not that it landed ten times.
+    #[tokio::test]
+    async fn a_round_makes_its_whole_dispatch_intent_durable_in_one_barrier() {
+        let events = Arc::new(CountingEvents::default());
+        let mut executor = executor(vec![Arc::new(EchoTool)], ToolExecutionConfig::default());
+        executor = executor.with_events(events.clone());
+        let context = ledgered();
+
+        let calls: Vec<ToolCallReq> = (0..10)
+            .map(|i| ToolCallReq {
+                id: format!("id-{i}"),
+                call_id: Some(format!("call-{i}")),
+                name: "echo".into(),
+                args: format!("\"hi {i}\""),
+            })
+            .collect();
+        let outcomes = executor.execute_round(&calls, &context).await;
+        assert_eq!(outcomes.len(), 10);
+
+        let appended = events.appended.lock().unwrap();
+        let started = appended
+            .iter()
+            .filter(|kind| matches!(kind, SessionEventKind::ToolCallStarted(_)))
+            .count();
+        let settled = appended
+            .iter()
+            .filter(|kind| matches!(kind, SessionEventKind::ToolCallSettled(_)))
+            .count();
+        assert_eq!(started, 10, "every call declares itself before it runs");
+        assert_eq!(settled, 10, "and settles on its own");
+        assert_eq!(
+            events.flushes.load(Ordering::Relaxed),
+            1,
+            "the started barrier is one flush for the whole round; settles ride \
+             the next one"
+        );
+        // The order the continuation is rebuilt in comes from `call_index`, so
+        // the started events have to carry the provider's order, not completion
+        // order.
+        let indexes: Vec<u32> = appended
+            .iter()
+            .filter_map(|kind| match kind {
+                SessionEventKind::ToolCallStarted(call) => Some(call.call_index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indexes, (0..10).collect::<Vec<u32>>());
+    }
+
     #[test]
     fn the_catalog_is_name_sorted_regardless_of_registration_order() {
         // The tool schemas are serialized into every request; a provider
