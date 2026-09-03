@@ -22,9 +22,8 @@ use komo_core::domain::checkpoint::CheckpointStore;
 use komo_core::domain::embedding::EmbeddingClient;
 use komo_core::domain::skill::SkillOffer;
 use komo_infra::embedding::{GatedEmbedder, OllamaEmbedder};
-use komo_infra::memory::memory_db::MemoryDb;
 use komo_infra::permissions_store::PermissionsStore;
-use komo_infra::persistence::{db::Db, kanban::KanbanDb};
+use komo_infra::persistence::db::Db;
 use komo_infra::skills::FsSkillStore;
 use komo_services::clarify::ClarifyState;
 use komo_services::memory_enrichment::MemoryEnricher;
@@ -35,7 +34,7 @@ use std::sync::Arc;
 
 use crate::domain::{
     approval::Approver, cron::CronJobRepository, llm::LlmClient, memory::MemoryRepository,
-    repository::SkillRepository, reviewer::Reviewer, workspace::Workspace,
+    repository::SkillRepository, reviewer::Reviewer, task::TaskRepository, workspace::Workspace,
 };
 use crate::plugins::{self, Scope, ToolCx, ToolRegistry};
 use komo_config::ConfigSnapshot;
@@ -200,22 +199,25 @@ pub(crate) fn build_embedder(
     Some(gated)
 }
 
-/// Build the agent against `db` (sessions/messages/etc.), `kanban` (durable
-/// tasks, a separate file) and `cron_jobs` (durable scheduled jobs, ditto),
-/// gating side-effecting tools through `approver`. Every setting comes from the
-/// caller's one resolved `config` snapshot — wiring never re-reads config.toml,
-/// the env, or `.env`.
+/// Build the agent against `db` — sessions, tasks, memories, cron jobs, the
+/// ledger, all of it (docs/adr/0004) — gating side-effecting tools through
+/// `approver`. Every setting comes from the caller's one resolved `config`
+/// snapshot — wiring never re-reads config.toml, the env, or `.env`.
 ///
-/// The stores are passed in rather than opened here because Turso takes an
-/// exclusive lock per file: the gateway already holds all three open and must
-/// hand its own handles over.
+/// The store is passed in rather than opened here because Turso takes an
+/// exclusive lock per file: the gateway already holds it open and must hand its
+/// own handle over.
 pub async fn build(
     config: &ConfigSnapshot,
     db: Arc<Db>,
-    kanban: Arc<KanbanDb>,
-    cron_jobs: Arc<dyn CronJobRepository>,
     approver: Arc<dyn Approver>,
 ) -> anyhow::Result<Wiring> {
+    // One file, one handle, three repository traits over it. Named separately
+    // because the things they mean are still separate — durable tasks, durable
+    // jobs, durable memories — even though they are now tables in the same
+    // database.
+    let kanban: Arc<dyn TaskRepository> = db.clone();
+    let cron_jobs: Arc<dyn CronJobRepository> = db.clone();
     // An unusable model selection (bad KOMO_* value, unknown provider,
     // missing API key) can't produce a working agent — fail here like the old
     // strict resolver did.
@@ -257,19 +259,18 @@ pub async fn build(
     // resolves the answer through this shared state.
     let clarify = Arc::new(ClarifyState::new());
 
-    // Memories live in their own SQLite file (~/.komo/memory.db), shared by the
-    // `memory` tool, the reflective reviewer, the L1 pinned injection, and the
-    // briefing sweep. On first run it seeds itself from any legacy markdown
-    // memories under ~/.komo/memory/ (a one-time, no-op-once-populated import).
-    let memory_db = MemoryDb::connect(&config.runtime.memory_db_url).await?;
-    let imported = memory_db
+    // Memories are `memory_records` in `komo.db`, shared by the `memory` tool,
+    // the reflective reviewer, the L1 pinned injection and the briefing sweep.
+    // On first run they seed themselves from any legacy markdown memories under
+    // ~/.komo/memory/ (a one-time, no-op-once-populated import).
+    let imported = db
         .import_legacy_markdown(&config.runtime.home.join("memory"))
         .await
         .unwrap_or(0);
     if imported > 0 {
-        tracing::info!(imported, "migrated legacy markdown memories into memory.db");
+        tracing::info!(imported, "migrated legacy markdown memories into komo.db");
     }
-    let memory_repo: Arc<dyn MemoryRepository> = Arc::new(memory_db);
+    let memory_repo: Arc<dyn MemoryRepository> = db.clone();
 
     // The delegate tool runs a separate, tool-less sub-agent on the (optionally
     // cheaper) aux model. It gets a minimal identity-only preamble — no tools,

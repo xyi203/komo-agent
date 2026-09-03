@@ -110,14 +110,10 @@ const DEFAULT_API_PORT: u16 = 8765;
 pub struct RuntimeConfig {
     /// The `~/.komo` home directory the snapshot was resolved against.
     pub home: PathBuf,
-    /// `turso:` URL of the disposable session/state db (`state.db`).
+    /// `turso:` URL of the one database (`komo.db`) — sessions, tasks,
+    /// memories, cron jobs and the rest. Durability is a property of each
+    /// *table* now, not of which file it sits in (docs/adr/0004).
     pub db_url: String,
-    /// `turso:` URL of the durable task db (`kanban.db`).
-    pub kanban_db_url: String,
-    /// `turso:` URL of the durable memory db (`memory.db`).
-    pub memory_db_url: String,
-    /// `turso:` URL of the durable scheduled-job db (`cron.db`).
-    pub cron_db_url: String,
     /// Provider/model selection plus the agent-loop knobs that ride with it.
     pub model: ModelConfig,
     /// Reviewer cadence: run the reflective reviewer every N user turns.
@@ -761,10 +757,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         .unwrap_or(true);
 
     let runtime = RuntimeConfig {
-        db_url: db_url("state.db"),
-        kanban_db_url: db_url("kanban.db"),
-        memory_db_url: db_url("memory.db"),
-        cron_db_url: db_url("cron.db"),
+        db_url: db_url("komo.db"),
         home,
         model,
         review_interval: env
@@ -1635,21 +1628,9 @@ mod tests {
     }
 
     #[test]
-    fn db_urls_derive_from_home() {
+    fn the_db_url_derives_from_home() {
         let snap = ConfigSnapshot::from_sources(with_deepseek_key(sources()));
-        assert_eq!(snap.runtime.db_url, "turso:/tmp/komo-test-home/state.db");
-        assert_eq!(
-            snap.runtime.kanban_db_url,
-            "turso:/tmp/komo-test-home/kanban.db"
-        );
-        assert_eq!(
-            snap.runtime.memory_db_url,
-            "turso:/tmp/komo-test-home/memory.db"
-        );
-        assert_eq!(
-            snap.runtime.cron_db_url,
-            "turso:/tmp/komo-test-home/cron.db"
-        );
+        assert_eq!(snap.runtime.db_url, "turso:/tmp/komo-test-home/komo.db");
     }
 
     #[test]

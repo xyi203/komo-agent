@@ -1,29 +1,24 @@
-//! The kanban store: durable cross-session tasks, in their **own** SQLite file
-//! (`~/.komo/kanban.db`), separate from the session/message db (`state.db`).
+//! Kanban tasks: `task_records` in `komo.db`, and the [`TaskRepository`] over
+//! them.
 //!
-//! Sessions, messages, and the session-scoped todo are disposable developer
-//! state — `state.db` is documented as deletable to reset, and a toasty schema
-//! change forces deleting it. Kanban tasks are real personal data that must
-//! survive that reset, so they live in a separate file with an independent
-//! lifecycle. `KanbanDb` is the only place toasty appears for tasks (mirroring
-//! `Db`'s role for everything else).
+//! Tasks are **durable** personal data — schema changes here are additive and
+//! nothing ever deletes the table to reset it. That used to be expressed by
+//! keeping them in their own file (`kanban.db`); it is a table-level rule now
+//! (docs/adr/0004), so this module holds the model, the queries and the
+//! one-time import from the old file, and `Db` owns the connection.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use toasty_driver_turso::Turso;
-use tracing::info;
 
-use crate::persistence::{
-    DEFAULT_POOL_SIZE, prepare_turso_path, sqlite_backup_path, turso_marker_path, with_write_retry,
-};
+use super::db::Db;
+use crate::persistence::with_write_retry;
 use komo_core::domain::task::{Task, TaskRepository, parse_task_status};
 
 // Optional i64 fields use 0 as the "unset" sentinel (same convention as `Db`).
 #[derive(Debug, toasty::Model)]
-struct TaskRecord {
+pub(crate) struct TaskRecord {
     #[key]
     id: String,
     title: String,
@@ -39,81 +34,32 @@ struct TaskRecord {
     completed_at: i64,
 }
 
-/// Connection to the kanban database. Holds only `TaskRecord`; everything else
-/// lives in `Db`.
+/// Every task in a legacy `kanban.db`, for the one-time merge into `komo.db`.
 ///
-/// Backed by the Turso engine with a per-operation connection pool: `inner` is a
-/// plain `Arc<toasty::Db>` (no outer `Mutex`), every method checks out a pooled
-/// `Connection`, and writes retry on an MVCC commit conflict. Tasks are durable
-/// data, so a legacy SQLite file is migrated row-by-row (see `connect`).
-pub struct KanbanDb {
-    inner: Arc<toasty::Db>,
-}
-
-impl KanbanDb {
-    pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        // Durable tasks must survive the engine switch: `prepare_turso_path`
-        // stages a legacy SQLite file aside (kept as `.sqlite-backup`), and its
-        // rows are extracted and reloaded into a fresh Turso db below, guarded by
-        // a `.turso` marker. Same shape as `MemoryDb::connect`.
-        let (path, is_new) = prepare_turso_path(url)?;
-
-        let driver = match &path {
-            Some(p) => Turso::file(p).concurrent_writes(),
-            None => Turso::in_memory().concurrent_writes(),
-        };
-        let db = toasty::Db::builder()
-            .models(toasty::models!(TaskRecord))
-            .max_pool_size(DEFAULT_POOL_SIZE)
-            .build(driver)
-            .await?;
-
-        if is_new {
-            db.push_schema().await?;
-        }
-
-        let me = Self {
-            inner: Arc::new(db),
-        };
-
-        if let Some(p) = &path {
-            let pending = sqlite_backup_path(p);
-            let marker = turso_marker_path(p);
-            if pending.exists() && !marker.exists() {
-                let rows = extract_sqlite_rows(&pending).await?;
-                let count = rows.len();
-                for task in &rows {
-                    me.save(task).await?;
-                }
-                std::fs::write(&marker, b"migrated from sqlite\n").ok();
-                info!(count, backup = %pending.display(), "migrated kanban.db sqlite → turso");
-            } else if is_new {
-                std::fs::write(&marker, b"turso-native\n").ok();
-            }
-        }
-
-        Ok(me)
-    }
-}
-
-/// Read every task row from a legacy SQLite db file (toasty's SQLite driver),
-/// faithfully — including closed tasks — so the migration preserves the full
-/// board, not just the open subset.
-async fn extract_sqlite_rows(backup: &Path) -> anyhow::Result<Vec<Task>> {
-    let url = format!("sqlite:{}", backup.display());
+/// Reads through the same model the live store uses, so a file written by any
+/// build that had these columns is readable. A pre-Turso SQLite file is opened
+/// with the SQLite driver instead — that migration ran per-store before the
+/// merge, and dropping the path would strand anyone who had not upgraded
+/// through it.
+pub(crate) async fn import_from(path: &Path) -> anyhow::Result<Vec<Task>> {
+    let url = match super::turso_marker_path(path).exists() {
+        true => format!("turso:{}", path.display()),
+        false => format!("sqlite:{}", path.display()),
+    };
     let db = toasty::Db::builder()
         .models(toasty::models!(TaskRecord))
         .connect(&url)
         .await
-        .with_context(|| format!("opening legacy sqlite db at {}", backup.display()))?;
+        .with_context(|| format!("opening {} to merge it in", path.display()))?;
     let mut conn = db.connection().await?;
     let rows = toasty::query!(TaskRecord).exec(&mut conn).await?;
+    // Closed tasks included: the merge preserves the whole board, not the open
+    // subset.
     rows.into_iter().map(task_from_record).collect()
-    // `db` drops here, releasing the backup file.
 }
 
 #[async_trait]
-impl TaskRepository for KanbanDb {
+impl TaskRepository for Db {
     async fn save(&self, task: &Task) -> anyhow::Result<()> {
         with_write_retry(|| async {
             let mut conn = self.inner.connection().await?;
@@ -225,15 +171,18 @@ mod tests {
     use super::*;
     use komo_core::domain::task::TaskStatus;
 
+    /// A `komo.db` in a home of this test's own — `Db::connect` scans its
+    /// directory for legacy files to merge.
     fn sqlite_url(name: &str) -> String {
-        let path = std::env::temp_dir().join(name);
-        crate::persistence::reset_test_db(&path);
-        format!("turso:{}", path.display())
+        let home = std::env::temp_dir().join(format!("komo-kb-{name}"));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        format!("turso:{}", home.join("komo.db").display())
     }
 
     #[tokio::test]
     async fn task_roundtrip_and_update() {
-        let db = KanbanDb::connect(&sqlite_url("komo_kanban_repo_test.db"))
+        let db = Db::connect(&sqlite_url("komo_kanban_repo_test.db"))
             .await
             .unwrap();
         let mut task = Task::new("send weekly report".to_string());
@@ -264,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_returns_none_for_unknown_id() {
-        let db = KanbanDb::connect(&sqlite_url("komo_kanban_find_test.db"))
+        let db = Db::connect(&sqlite_url("komo_kanban_find_test.db"))
             .await
             .unwrap();
         assert!(db.find("task-nope").await.unwrap().is_none());
@@ -272,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_by_source_message_id_matches_source_and_key() {
-        let db = KanbanDb::connect(&sqlite_url("komo_kanban_dedup_test.db"))
+        let db = Db::connect(&sqlite_url("komo_kanban_dedup_test.db"))
             .await
             .unwrap();
         let mut task = Task::new("call Bob".to_string());

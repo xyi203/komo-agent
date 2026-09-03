@@ -1,5 +1,10 @@
-//! Persistence infra: the toasty-backed connections (state.db, kanban.db),
-//! now over the Turso engine with a per-operation connection pool.
+//! Persistence infra: the one toasty-backed connection (`komo.db`) over the
+//! Turso engine, with a per-operation connection pool.
+//!
+//! `db` owns the connection and the session/run tables; `kanban`, `cron` and
+//! (next door) `memory::memory_db` each hold one durable table's model and its
+//! repository impl **for that same `Db`** — one file per domain, one database
+//! (docs/adr/0004).
 pub mod cron;
 pub mod db;
 pub mod kanban;
@@ -152,8 +157,8 @@ pub(crate) async fn ensure_columns(
 /// raw-connection window (before the pooled driver opens the file).
 ///
 /// `push_schema` only runs for brand-new files and is not idempotent, so
-/// without this a new *table* meant deleting the db file — acceptable for
-/// genuinely disposable data, but state.db also carries every chat transcript.
+/// without this a new *table* meant deleting the db file — which is available
+/// for nothing now: `komo.db` holds the durable tables too.
 /// `ddl` must be the exact statements `push_schema` would emit for the model
 /// (lock the parity with a test); they run only when `table` is absent.
 pub(crate) async fn ensure_table(path: &Path, table: &str, ddl: &[&str]) -> anyhow::Result<()> {
@@ -209,8 +214,8 @@ pub(crate) fn prepare_turso_path(url: &str) -> anyhow::Result<(Option<PathBuf>, 
 /// If `path` is a legacy SQLite file (no Turso marker, no backup staged yet),
 /// move it aside to its `.sqlite-backup` so Turso opens a fresh db at `path`.
 /// Idempotent: a no-op once a marker or backup exists, or the file is absent.
-/// Callers that preserve data re-import from the backup afterward (memory db);
-/// callers over disposable data (state.db) just leave the backup as a safety net.
+/// The rows are re-imported from the backup afterwards where they matter
+/// (`memory_db::import_from`); the backup is kept either way as a safety net.
 pub(crate) fn stage_sqlite_backup(path: &Path) -> anyhow::Result<()> {
     let marker = turso_marker_path(path);
     let backup = sqlite_backup_path(path);

@@ -5,6 +5,9 @@ use async_trait::async_trait;
 use toasty_driver_turso::Turso;
 use tracing::info;
 
+use crate::memory::memory_db::MemoryRecord;
+use crate::persistence::cron::CronJobRecord;
+use crate::persistence::kanban::TaskRecord;
 use crate::persistence::{
     DEFAULT_POOL_SIZE, drop_retired_columns, ensure_columns, ensure_table, prepare_turso_path,
     session_event_store::SessionEventStore, turso_marker_path, with_write_retry,
@@ -13,8 +16,10 @@ use crate::persistence::{
 use komo_core::domain::{
     briefing::BriefingMarkRepository,
     context::SessionOrigin,
+    cron::CronJobRepository,
     home::HomeRepository,
     inbox::{InboundOrigin, InboxClaim, InboxRepository},
+    memory::MemoryRepository,
     message::Message,
     pairing::{
         APPROVE_LOCKOUT_SECS, APPROVE_MAX_FAILURES, ApproveOutcome, PAIRING_CODE_TTL_SECS,
@@ -29,6 +34,7 @@ use komo_core::domain::{
         SESSION_EVENT_VERSION, SessionEvent, SessionEventKind, SessionHeader, SurfaceProjection,
     },
     skill::Skill,
+    task::TaskRepository,
     todo::{SessionTodoRepository, TodoItem},
 };
 
@@ -315,7 +321,10 @@ const RUN_PRUNED_BEFORE_KEY: &str = "projection:runs:pruned_before";
 /// reads/writes run concurrently. Concurrently-written tables (the run ledger)
 /// use [`with_write_retry`] for MVCC commit conflicts.
 pub struct Db {
-    inner: Arc<toasty::Db>,
+    /// The one connection pool. `pub(crate)` because the repository impls for
+    /// `Db` are one file per domain (`kanban`, `cron`, `memory::memory_db`) —
+    /// the tables share a database, not a module.
+    pub(crate) inner: Arc<toasty::Db>,
     /// The session event logs — files rather than rows, one directory per
     /// session. Session *metadata* is still a row here: it is updated (title,
     /// status, model), and a log is the wrong shape for a value that changes.
@@ -407,6 +416,12 @@ impl Db {
             ensure_columns(p, "run_step_records", STEP_COLUMNS).await?;
             ensure_table(p, INBOX_TABLE, INBOX_TABLE_DDL).await?;
             ensure_table(p, RUN_MEMORY_TABLE, RUN_MEMORY_TABLE_DDL).await?;
+            // The durable tables keep their own schema knowledge in their own
+            // modules; they are migrated in place and never dropped to be
+            // rebuilt. (`task_records` has gained no column since it was
+            // created — when it does, it gets an `ensure_schema` of its own.)
+            super::cron::ensure_schema(p).await?;
+            crate::memory::memory_db::ensure_schema(p).await?;
         }
 
         // MVCC concurrent-writes on (UUID keys throughout, so no AUTOINCREMENT).
@@ -426,7 +441,11 @@ impl Db {
                 RunRecord,
                 RunStepRecord,
                 InboxRecord,
-                RunMemoryRecord
+                RunMemoryRecord,
+                // Durable, and formerly one file each (docs/adr/0004).
+                TaskRecord,
+                CronJobRecord,
+                MemoryRecord
             ))
             .max_pool_size(DEFAULT_POOL_SIZE)
             .build(driver)
@@ -458,8 +477,86 @@ impl Db {
             inner: Arc::new(db),
             events,
         };
+
+        // The one-time merge (docs/adr/0004). Only for a `komo.db` that was
+        // just created: the old files are renamed once their rows are in, so a
+        // second run has nothing to find.
+        if is_new && let Some(p) = &path {
+            this.merge_legacy_databases(p).await?;
+        }
+
         Ok(this)
     }
+
+    /// Import `kanban.db`, `cron.db` and `memory.db` from beside `path`, then
+    /// rename each to `<name>.merged-backup`.
+    ///
+    /// Durable data, so the order is: read the old file, write every row, and
+    /// only then rename it. A crash anywhere leaves the old file where it is
+    /// and `komo.db` partially filled — the next start re-imports, and every
+    /// row carries its own id, so a re-import overwrites rather than doubles.
+    ///
+    /// A file that cannot be read is **fatal**, not skipped: starting up with
+    /// an empty task board while `kanban.db` sits there unread is the failure
+    /// nobody would notice until they went looking for a task.
+    async fn merge_legacy_databases(&self, path: &Path) -> anyhow::Result<()> {
+        let dir = path.parent().unwrap_or(Path::new("."));
+        // Never the file being opened: a `db_url` pointing at one of these
+        // names would otherwise make the store import from itself and then
+        // rename itself away.
+        let legacy = |name: &str| {
+            let candidate = dir.join(name);
+            (candidate != path && candidate.is_file()).then_some(candidate)
+        };
+
+        if let Some(tasks) = legacy("kanban.db") {
+            let rows = super::kanban::import_from(&tasks).await?;
+            for task in &rows {
+                TaskRepository::save(self, task).await?;
+            }
+            retire_merged(&tasks)?;
+            info!(count = rows.len(), "merged kanban.db into komo.db");
+        }
+
+        if let Some(jobs) = legacy("cron.db") {
+            let rows = super::cron::import_from(&jobs).await?;
+            for job in &rows {
+                CronJobRepository::save(self, job).await?;
+            }
+            retire_merged(&jobs)?;
+            info!(count = rows.len(), "merged cron.db into komo.db");
+        }
+
+        if let Some(memories) = legacy("memory.db") {
+            let rows = crate::memory::memory_db::import_from(&memories).await?;
+            for memory in &rows {
+                MemoryRepository::save(self, memory).await?;
+            }
+            retire_merged(&memories)?;
+            info!(count = rows.len(), "merged memory.db into komo.db");
+        }
+        Ok(())
+    }
+}
+
+/// Rename a merged file (and the sidecars that belong to it) aside. Kept rather
+/// than deleted: this is the operator's only copy of data that was durable by
+/// design, and the import is young code.
+fn retire_merged(path: &Path) -> anyhow::Result<()> {
+    for suffix in ["", "-log", "-wal", "-shm", ".turso"] {
+        let mut from = path.as_os_str().to_os_string();
+        from.push(suffix);
+        let from = PathBuf::from(from);
+        if !from.exists() {
+            continue;
+        }
+        let mut to = path.as_os_str().to_os_string();
+        to.push(".merged-backup");
+        to.push(suffix);
+        std::fs::rename(&from, PathBuf::from(to))
+            .map_err(|e| anyhow::anyhow!("retiring {} after the merge: {e}", from.display()))?;
+    }
+    Ok(())
 }
 
 // ── legacy skills (read-only) ─────────────────────────────────────────────────
@@ -3192,6 +3289,132 @@ mod tests {
             ids(RunRepository::unlearned(&db, None, 10).await.unwrap()),
             ["run-b"]
         );
+    }
+
+    /// ADR 0004's migration, end to end: three durable files become tables in
+    /// one, and the operator's data is all still there afterwards.
+    #[tokio::test]
+    async fn the_three_durable_files_merge_into_komo_db() {
+        use komo_core::domain::cron::{CronAction, CronJob, CronJobRepository};
+        use komo_core::domain::memory::{Memory, MemoryKind, MemoryRepository};
+        use komo_core::domain::task::{Task, TaskRepository};
+
+        let home = std::env::temp_dir().join("komo-merge-three");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+
+        // Seed each legacy file through the store that used to own it, each in
+        // a directory of its own so the seeding never merges its neighbours,
+        // then move it in beside where `komo.db` will be. The import reads only
+        // the table it came for, exactly as it would from a file written by the
+        // old per-store code.
+        let seed = |name: &'static str| {
+            let home = home.clone();
+            async move {
+                let dir = home.join(format!("seed-{name}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                let db = Db::connect(&format!("turso:{}", dir.join(name).display()))
+                    .await
+                    .unwrap();
+                (db, dir)
+            }
+        };
+        /// Move a seeded file and its sidecars in, leaving the seeding
+        /// directory empty.
+        fn install(dir: &Path, home: &Path, name: &str) {
+            for suffix in ["", "-log", "-wal", "-shm", ".turso"] {
+                let from = dir.join(format!("{name}{suffix}"));
+                if from.exists() {
+                    std::fs::rename(from, home.join(format!("{name}{suffix}"))).unwrap();
+                }
+            }
+        }
+
+        let (tasks, dir) = seed("kanban.db").await;
+        TaskRepository::save(&tasks, &Task::new("send the weekly report".to_string()))
+            .await
+            .unwrap();
+        drop(tasks);
+        install(&dir, &home, "kanban.db");
+
+        let (jobs, dir) = seed("cron.db").await;
+        CronJobRepository::save(
+            &jobs,
+            &CronJob::new(
+                "nightly",
+                "0 3 * * *",
+                CronAction::Command {
+                    command: "/opt/backup.sh".into(),
+                    args: Vec::new(),
+                    workdir: None,
+                    timeout_secs: 600,
+                },
+                0,
+            ),
+        )
+        .await
+        .unwrap();
+        drop(jobs);
+        install(&dir, &home, "cron.db");
+
+        let (memories, dir) = seed("memory.db").await;
+        MemoryRepository::save(
+            &memories,
+            &Memory::new(MemoryKind::Preference, "prefers rebase before push"),
+        )
+        .await
+        .unwrap();
+        drop(memories);
+        install(&dir, &home, "memory.db");
+
+        let db = Db::connect(&format!("turso:{}", home.join("komo.db").display()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            TaskRepository::list_open(&db)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|t| t.title)
+                .collect::<Vec<_>>(),
+            vec!["send the weekly report".to_string()]
+        );
+        assert_eq!(
+            CronJobRepository::list(&db)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|j| j.name)
+                .collect::<Vec<_>>(),
+            vec!["nightly".to_string()]
+        );
+        assert_eq!(
+            MemoryRepository::list(&db)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.content)
+                .collect::<Vec<_>>(),
+            vec!["prefers rebase before push".to_string()]
+        );
+
+        // Each old file is retired, not deleted: it was the only copy of data
+        // that was durable by design.
+        for name in ["kanban.db", "cron.db", "memory.db"] {
+            assert!(!home.join(name).exists(), "{name} must be renamed away");
+            assert!(
+                home.join(format!("{name}.merged-backup")).exists(),
+                "{name} must be kept as a backup"
+            );
+        }
+
+        // And a reconnect imports nothing a second time.
+        drop(db);
+        let again = Db::connect(&format!("turso:{}", home.join("komo.db").display()))
+            .await
+            .unwrap();
+        assert_eq!(TaskRepository::list_open(&again).await.unwrap().len(), 1);
     }
 
     // ── run projection ───────────────────────────────────────────────────────

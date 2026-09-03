@@ -13,7 +13,6 @@
 //! here: with no gateway the run executes in-process with interactive approval
 //! at the TTY, built on the very stores the operator backend already opened.
 
-use komo_infra::persistence::cron::CronDb;
 use std::sync::Arc;
 
 use crate::{
@@ -31,16 +30,11 @@ pub async fn run(
     id: Option<String>,
 ) -> anyhow::Result<()> {
     let outcome = control
-        .resume_run(id, |db, kanban, run, input| async move {
+        .resume_run(id, |db, run, input| async move {
             // Same construction as the chat TUI's local mode: interactive
             // approval at the TTY.
             let approver: Arc<dyn Approver> = Arc::new(CliApprover::new());
-            // This closure only runs on the direct path (no gateway holding the
-            // db locks), so the cron store is ours to open.
-            let cron_jobs = Arc::new(CronDb::connect(&config.runtime.cron_db_url).await?);
-            let runtime = wiring::build(config, db, kanban, cron_jobs, approver)
-                .await?
-                .runtime;
+            let runtime = wiring::build(config, db, approver).await?.runtime;
             // Journal-continue first; digest-primed fresh turn as the fallback
             // (same order as the gateway's resume endpoint).
             match runtime.resume_interrupted(&run).await? {

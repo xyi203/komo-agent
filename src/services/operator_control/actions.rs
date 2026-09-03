@@ -460,7 +460,7 @@ pub async fn apply_memory_transition(
 /// The channel scope komo's local surfaces used to write from, back when a
 /// local conversation was modelled as a chat on an `api` platform whose chat id
 /// was a fresh uuid per conversation. No new memory can carry it — a local turn
-/// has no correspondent at all now — but `memory.db` is durable, so rows written
+/// has no correspondent at all now — but memories are durable, so rows written
 /// while it could still exist and still need widening.
 const RETIRED_LOCAL_CHANNEL: &str = "api";
 

@@ -1,15 +1,20 @@
-//! The cron store: durable scheduled jobs, in their **own** SQLite file
-//! (`~/.komo/cron.db`), separate from disposable `state.db` (mirroring
-//! `kanban.db`'s rationale: a job silently vanishing on a state reset means its
-//! work silently stops happening). `CronDb` is the only place toasty appears
-//! for cron jobs. Born Turso-native — no legacy SQLite migration path.
+//! Scheduled jobs: `cron_job_records` in `komo.db`, and the
+//! [`CronJobRepository`] over them.
+//!
+//! Jobs are **durable** — a job silently vanishing means its work silently
+//! stops happening — so schema changes here are additive and the table is never
+//! dropped to reset. That was a separate file (`cron.db`) until docs/adr/0004
+//! made durability a table-level rule; this module keeps the model, the
+//! queries, the in-place schema upkeep and the one-time import from the old
+//! file, and `Db` owns the connection.
 
-use std::sync::Arc;
+use std::path::Path;
 
+use anyhow::Context;
 use async_trait::async_trait;
-use toasty_driver_turso::Turso;
 
-use crate::persistence::{DEFAULT_POOL_SIZE, prepare_turso_path, with_write_retry};
+use super::db::Db;
+use crate::persistence::with_write_retry;
 use komo_core::domain::cron::{
     CronAction, CronJob, CronJobRepository, parse_catch_up, parse_cron_job_status,
     parse_cron_run_status,
@@ -20,7 +25,7 @@ use komo_core::domain::policy::RuleSpec;
 // string; `status` is "active"/"paused"/"done"; `last_status` is
 // ""/"ok"/"failed" (same conventions as the other stores).
 #[derive(Debug, toasty::Model)]
-struct CronJobRecord {
+pub(crate) struct CronJobRecord {
     #[key]
     id: String,
     #[index]
@@ -51,61 +56,45 @@ struct CronJobRecord {
     created_at: i64,
 }
 
-/// Connection to the cron database. Holds only `CronJobRecord`.
-pub struct CronDb {
-    inner: Arc<toasty::Db>,
+/// Columns added to `cron_job_records` after a `komo.db` was created. Extend
+/// this for every new [`CronJobRecord`] column: the table is durable, so it is
+/// migrated in place and never dropped to be rebuilt.
+const EXPECTED: &[(&str, &str)] = &[
+    ("kind", "\"kind\" text NOT NULL DEFAULT 'command'"),
+    ("prompt", "\"prompt\" text NOT NULL DEFAULT ''"),
+    ("skills", "\"skills\" text NOT NULL DEFAULT ''"),
+    ("grants", "\"grants\" text NOT NULL DEFAULT ''"),
+    ("status", "\"status\" text NOT NULL DEFAULT 'active'"),
+    ("catch_up", "\"catch_up\" text NOT NULL DEFAULT 'late'"),
+    ("last_output", "\"last_output\" text NOT NULL DEFAULT ''"),
+    (
+        "last_run_session",
+        "\"last_run_session\" text NOT NULL DEFAULT ''",
+    ),
+];
+
+/// Bring an existing file's `cron_job_records` up to the current column set,
+/// before toasty opens it.
+pub(crate) async fn ensure_schema(path: &Path) -> anyhow::Result<()> {
+    crate::persistence::ensure_columns(path, "cron_job_records", EXPECTED).await?;
+    migrate_enabled_to_status(path).await
 }
 
-impl CronDb {
-    pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        let (path, is_new) = prepare_turso_path(url)?;
-        // Durable data must never need a destructive reset: bring an existing
-        // file up to the current column set in place (additive ALTER TABLE ADD
-        // COLUMN), before toasty opens it. This is what lets a cron.db written
-        // by the command-only version gain the agent-mode columns
-        // (kind/prompt/skills) on upgrade. Extend `EXPECTED` for every new
-        // `CronJobRecord` column. See `infra/persistence::ensure_columns`.
-        if !is_new && let Some(p) = &path {
-            const EXPECTED: &[(&str, &str)] = &[
-                ("kind", "\"kind\" text NOT NULL DEFAULT 'command'"),
-                ("prompt", "\"prompt\" text NOT NULL DEFAULT ''"),
-                ("skills", "\"skills\" text NOT NULL DEFAULT ''"),
-                ("grants", "\"grants\" text NOT NULL DEFAULT ''"),
-                ("status", "\"status\" text NOT NULL DEFAULT 'active'"),
-                ("catch_up", "\"catch_up\" text NOT NULL DEFAULT 'late'"),
-                ("last_output", "\"last_output\" text NOT NULL DEFAULT ''"),
-                (
-                    "last_run_session",
-                    "\"last_run_session\" text NOT NULL DEFAULT ''",
-                ),
-            ];
-            crate::persistence::ensure_columns(p, "cron_job_records", EXPECTED).await?;
-            migrate_enabled_to_status(p).await?;
-        }
-        let driver = match &path {
-            Some(p) => Turso::file(p).concurrent_writes(),
-            None => Turso::in_memory().concurrent_writes(),
-        };
-        let db = toasty::Db::builder()
-            .models(toasty::models!(CronJobRecord))
-            .max_pool_size(DEFAULT_POOL_SIZE)
-            .build(driver)
-            .await?;
-        if is_new {
-            db.push_schema().await?;
-        }
-        if let Some(p) = &path {
-            // Born Turso-native: stamp the marker so the shared prologue never
-            // mistakes this file for a legacy SQLite db later.
-            let marker = crate::persistence::turso_marker_path(p);
-            if !marker.exists() {
-                std::fs::write(&marker, b"turso-native\n").ok();
-            }
-        }
-        Ok(Self {
-            inner: Arc::new(db),
-        })
-    }
+/// Every job in a legacy `cron.db`, for the one-time merge into `komo.db`.
+///
+/// The old file gets its own schema upkeep first: a `cron.db` written before
+/// `status` existed still has `enabled`, and opening it with the current model
+/// would fail on the columns it lacks.
+pub(crate) async fn import_from(path: &Path) -> anyhow::Result<Vec<CronJob>> {
+    ensure_schema(path).await?;
+    let db = toasty::Db::builder()
+        .models(toasty::models!(CronJobRecord))
+        .connect(&format!("turso:{}", path.display()))
+        .await
+        .with_context(|| format!("opening {} to merge it in", path.display()))?;
+    let mut conn = db.connection().await?;
+    let rows = toasty::query!(CronJobRecord).exec(&mut conn).await?;
+    rows.into_iter().map(job_from_record).collect()
 }
 
 /// One-time migration from the pre-status schema: `enabled` (0/1) becomes the
@@ -157,7 +146,7 @@ async fn migrate_enabled_to_status(path: &std::path::Path) -> anyhow::Result<()>
 }
 
 #[async_trait]
-impl CronJobRepository for CronDb {
+impl CronJobRepository for Db {
     async fn save(&self, job: &CronJob) -> anyhow::Result<()> {
         let cols = ActionColumns::from_action(&job.action)?;
         with_write_retry(|| async {
@@ -366,15 +355,18 @@ mod tests {
     use super::*;
     use komo_core::domain::cron::{CronJobStatus, CronRunStatus};
 
+    /// A `komo.db` in a home of this test's own — `Db::connect` scans its
+    /// directory for legacy files to merge.
     fn turso_url(name: &str) -> String {
-        let path = std::env::temp_dir().join(name);
-        crate::persistence::reset_test_db(&path);
-        format!("turso:{}", path.display())
+        let home = std::env::temp_dir().join(format!("komo-cron-{name}"));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        format!("turso:{}", home.join("komo.db").display())
     }
 
     #[tokio::test]
     async fn job_roundtrip_update_and_delete() {
-        let db = CronDb::connect(&turso_url("komo_cron_repo_test.db"))
+        let db = Db::connect(&turso_url("komo_cron_repo_test.db"))
             .await
             .unwrap();
         let job = CronJob::new(
@@ -441,8 +433,10 @@ mod tests {
 
     #[tokio::test]
     async fn upgrades_command_only_schema_in_place() {
-        let path = std::env::temp_dir().join("komo_cron_addcol.db");
-        crate::persistence::reset_test_db(&path);
+        let home = std::env::temp_dir().join("komo-cron-addcol");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        let path = home.join("cron.db");
 
         // 1. Seed a turso file with the OLD command-only schema (no
         //    kind/prompt/skills) + one command row, then drop the handle.
@@ -489,10 +483,11 @@ mod tests {
         )
         .unwrap();
 
-        // 2. Connect: ensure_columns adds kind/prompt/skills in place, the
-        //    legacy row reads back as a command job (kind defaults to
-        //    'command'), and `enabled` migrates into the stored status.
-        let db = CronDb::connect(&format!("turso:{}", path.display()))
+        // 2. Merge it into a fresh `komo.db`: the old file gains
+        //    kind/prompt/skills in place and `enabled` becomes the stored
+        //    status *before* it is read, which is the only way a pre-status
+        //    file is readable through today's model at all.
+        let db = Db::connect(&format!("turso:{}", home.join("komo.db").display()))
             .await
             .unwrap();
         let found = db.find_by_name("legacy").await.unwrap().unwrap();
@@ -528,7 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_job_roundtrips() {
-        let db = CronDb::connect(&turso_url("komo_cron_agent_test.db"))
+        let db = Db::connect(&turso_url("komo_cron_agent_test.db"))
             .await
             .unwrap();
         let job = CronJob::new(
@@ -557,7 +552,7 @@ mod tests {
     /// job's directory rather than as a compile error.
     #[tokio::test]
     async fn an_agent_workspace_and_a_command_workdir_share_a_column_without_crossing() {
-        let db = CronDb::connect(&turso_url("komo_cron_workspace_test.db"))
+        let db = Db::connect(&turso_url("komo_cron_workspace_test.db"))
             .await
             .unwrap();
         db.save(&CronJob::new(
@@ -604,7 +599,7 @@ mod tests {
     /// the job's `last_run_at` was stamped.
     #[tokio::test]
     async fn job_grants_roundtrip_through_save_and_update() {
-        let db = CronDb::connect(&turso_url("komo_cron_grants_test.db"))
+        let db = Db::connect(&turso_url("komo_cron_grants_test.db"))
             .await
             .unwrap();
         let grant = RuleSpec {
@@ -660,7 +655,7 @@ mod tests {
     /// than being left as a property of `delete` nobody checks.
     #[tokio::test]
     async fn removing_a_job_revokes_its_grants() {
-        let db = CronDb::connect(&turso_url("komo_cron_revoke_test.db"))
+        let db = Db::connect(&turso_url("komo_cron_revoke_test.db"))
             .await
             .unwrap();
         let job = CronJob::new(
@@ -699,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_by_name_returns_none_for_unknown() {
-        let db = CronDb::connect(&turso_url("komo_cron_find_test.db"))
+        let db = Db::connect(&turso_url("komo_cron_find_test.db"))
             .await
             .unwrap();
         assert!(db.find_by_name("nope").await.unwrap().is_none());
@@ -707,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_orders_by_name() {
-        let db = CronDb::connect(&turso_url("komo_cron_order_test.db"))
+        let db = Db::connect(&turso_url("komo_cron_order_test.db"))
             .await
             .unwrap();
         for name in ["zeta", "alpha", "mid"] {

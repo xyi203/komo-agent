@@ -75,6 +75,28 @@ state.db 也导——它虽被文档标为 disposable，但 pairing 与 reminder
 放在 bot-runtime 第一批（持久化等待）之前。那一批要加唤醒登记表、重建 cron job 的 trigger 列、
 并让 Task 与登记互相引用——三件事都碰库结构，先合库能让它们只碰一次，并且从第一天就在一个事务里。
 
+## 落地情况
+
+**已实现。** `RuntimeConfig` 只剩一个 `db_url`（`~/.komo/komo.db`）；`KanbanDb` /
+`CronDb` / `MemoryDb` 三个连接类型消失，`kanban.rs` / `cron.rs` /
+`memory/memory_db.rs` 保留各自的模型、查询和 schema 维护，但 `TaskRepository` /
+`CronJobRepository` / `MemoryRepository` 都实现在同一个 `Db` 上——一个域一个文件，
+一个库。`wiring::build` 从五个参数收到三个，`DirectOperatorAdapter` 从四个
+`OnceCell` 收到一个（懒开一次仍然保留：`komo doctor` 只打印配置就不该建库）。
+
+迁移在 `Db::connect` 里，只在 `komo.db` 是新建时跑：逐个读 `kanban.db` /
+`cron.db` / `memory.db`，写入后把旧文件（连 `-log`/`-wal`/`.turso` 等旁挂文件）
+改名成 `<name>.merged-backup`。顺序是「先读、再写、最后改名」，中途崩溃就是旧文件
+还在、下次重来；每行自带 id，重来是覆盖而不是翻倍。**读不出来的旧文件是致命错误
+而不是跳过**——带着空看板启动、而 `kanban.db` 就在旁边没人读，是那种直到你去找某个
+任务才发现的故障。旧文件先各自做自己的 schema 修补再读（pre-status 的
+`cron.db` 还带着 `enabled` 列，pre-Turso 的 `memory.db` 得走 SQLite 驱动），
+所以「komo 发布过的每一种文件形状都还能读」这条测试跟着搬到了合库路径上。
+
+耐久性规则改写为表级，写在 AGENTS.md 的存储表里：`memory_records` 只能加性变更，
+`task_records` / `cron_job_records` 同样持久；session 元数据、run 账本、inbox、todo
+按**行**清理（`komo run prune` / `komo sessions clean`），删表这条路对谁都不再存在。
+
 ## 回滚与重开条件
 
 回滚就是不做：这是一个纯基础设施变更，不改任何 trait。重开拆分的条件只有一个——出现**必须**

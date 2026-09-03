@@ -970,9 +970,6 @@ mod tests {
         assert!(block.contains("- [fact/inferred/global] komo uses a DDD layout"));
     }
 
-    /// A fact and how much to trust it are different things, and an injected
-    /// line has to carry both.
-    #[test]
     /// A claim that came out of a fetched page reads exactly like one the user
     /// made — so the line has to say which it is.
     #[test]
@@ -984,6 +981,9 @@ mod tests {
         assert!(block.contains("/from-tool"), "{block}");
     }
 
+    /// A fact and how much to trust it are different things, and an injected
+    /// line has to carry both.
+    #[test]
     fn recall_block_marks_supported_and_stale_memories() {
         let now = now();
         // Corroborated on two independent occasions.

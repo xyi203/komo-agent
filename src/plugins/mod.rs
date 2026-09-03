@@ -45,7 +45,7 @@ use komo_config::ConfigSnapshot;
 use komo_core::domain::catalog::ToolCatalog;
 use komo_core::domain::hooks::{StepHook, ToolHook, TurnHook};
 use komo_core::domain::tool::Tool;
-use komo_infra::persistence::{db::Db, kanban::KanbanDb};
+use komo_infra::persistence::db::Db;
 use komo_infra::skills::FsSkillStore;
 use komo_services::clarify::ClarifyState;
 use komo_services::memory_query::MemoryQueryService;
@@ -54,7 +54,7 @@ use komo_services::tool_execution::ToolExecutor;
 
 use crate::domain::{
     cron::CronJobRepository, gateway::WeChatLogin, llm::LlmClient, memory::MemoryRepository,
-    notify::Notifier, pairing::PairingRepository, workspace::Workspace,
+    notify::Notifier, pairing::PairingRepository, task::TaskRepository, workspace::Workspace,
 };
 use crate::infra::messaging::home_notifier::TextSender;
 use crate::services::operator_control::actions::WikiOps;
@@ -325,7 +325,7 @@ pub struct ToolCx<'a> {
     /// [`ToolRegistry::tool`] instead — wiring fills the catalogs from it.
     pub catalogs: Arc<ScopedCatalogs>,
     pub db: Arc<Db>,
-    pub kanban: Arc<KanbanDb>,
+    pub kanban: Arc<dyn TaskRepository>,
     pub cron_jobs: Arc<dyn CronJobRepository>,
     pub workspace: Arc<Workspace>,
     pub clarify: Arc<ClarifyState>,
@@ -502,7 +502,7 @@ impl ChannelRegistry {
 pub struct SweepCx<'a> {
     pub config: &'a ConfigSnapshot,
     pub db: Arc<Db>,
-    pub kanban: Arc<KanbanDb>,
+    pub kanban: Arc<dyn TaskRepository>,
     pub cron_jobs: Arc<dyn CronJobRepository>,
     pub notifier: Arc<dyn Notifier>,
     pub review: Arc<LearningCoordinator>,
@@ -704,24 +704,13 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let memory_db = komo_infra::memory::memory_db::MemoryDb::connect("turso::memory:")
-            .await
-            .unwrap();
-        let memory_repo: Arc<dyn MemoryRepository> = Arc::new(memory_db);
+        let memory_repo: Arc<dyn MemoryRepository> = db.clone();
         ToolCx {
             config,
             catalogs: Arc::new(ScopedCatalogs::default()),
             db: db.clone(),
-            kanban: Arc::new(
-                komo_infra::persistence::kanban::KanbanDb::connect("turso::memory:")
-                    .await
-                    .unwrap(),
-            ),
-            cron_jobs: Arc::new(
-                komo_infra::persistence::cron::CronDb::connect("turso::memory:")
-                    .await
-                    .unwrap(),
-            ),
+            kanban: db.clone(),
+            cron_jobs: db.clone(),
             workspace: Arc::new(Workspace::current_dir().unwrap()),
             clarify: Arc::new(ClarifyState::new()),
             memory_query: Arc::new(MemoryQueryService::new(memory_repo.clone())),

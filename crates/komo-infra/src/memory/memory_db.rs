@@ -1,29 +1,24 @@
-//! The memory store: durable long-term memories in their **own** SQLite file
-//! (`~/.komo/memory.db`), separate from the disposable session db (`state.db`)
-//! and the task db (`kanban.db`).
+//! Long-term memories: `memory_records` in `komo.db`, and the
+//! [`MemoryRepository`] over them.
 //!
-//! Memories are real personal data that must survive a `state.db` reset, so —
-//! like `KanbanDb` — they live in an independent file. `MemoryDb` is the only
-//! place toasty appears for memories. Markdown (`infra/md_memory.rs`) is kept
-//! as an import/export format, not the canonical backend.
+//! The strictest durability rule in the repository lives here: this table may
+//! **only ever change additively**. It had its own file (`memory.db`) until
+//! docs/adr/0004 moved that guarantee to the table; the file is gone, the rule
+//! is not. Markdown (`md_memory.rs`) stays an import/export format, never the
+//! canonical backend.
 //!
 //! Schema is laid out **schema-first**: governance/scope/usage columns land all
 //! at once even before every consumer exists, because toasty's `push_schema`
-//! is not idempotent (a column change means deleting the file). See
-//! `docs/personal-agent-roadmap.md`.
+//! is not idempotent. See `docs/personal-agent-roadmap.md`.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use toasty_driver_turso::Turso;
-use tracing::info;
 
 use crate::memory::md_memory::MdMemoryStore;
-use crate::persistence::{
-    DEFAULT_POOL_SIZE, prepare_turso_path, sqlite_backup_path, turso_marker_path, with_write_retry,
-};
+use crate::persistence::db::Db;
+use crate::persistence::with_write_retry;
 use komo_core::domain::memory::{
     Evidence, Memory, MemoryRepository, MemoryScope, parse_belief_state, parse_memory_confidence,
     parse_memory_kind, parse_memory_provenance, parse_memory_status,
@@ -31,7 +26,7 @@ use komo_core::domain::memory::{
 
 // Optional i64 fields use 0 as the "unset" sentinel (same convention as `Db`).
 #[derive(Debug, toasty::Model)]
-struct MemoryRecord {
+pub(crate) struct MemoryRecord {
     #[key]
     id: String,
     kind: String,
@@ -135,77 +130,41 @@ fn decode_evidence(encoded: &str) -> Vec<Evidence> {
 /// pooled `Connection`, so independent reads/writes run concurrently. Writes use
 /// Turso's MVCC concurrent-write mode and retry on commit conflict (see
 /// `infra::persistence::with_write_retry`).
-pub struct MemoryDb {
-    inner: Arc<toasty::Db>,
+/// Every memory in a legacy `memory.db`, for the one-time merge into
+/// `komo.db`.
+///
+/// The old file is brought up to the current column set first — a `memory.db`
+/// written before `belief_state` (or with the retired `recall_query_hashes`
+/// still on it) cannot be read through today's model — and a pre-Turso SQLite
+/// file is opened with the SQLite driver, because that per-store migration ran
+/// here before the merge and dropping the path would strand anyone who had not
+/// upgraded through it.
+pub(crate) async fn import_from(path: &Path) -> anyhow::Result<Vec<Memory>> {
+    let native = crate::persistence::turso_marker_path(path).exists();
+    if native {
+        ensure_columns(path).await?;
+    }
+    let url = match native {
+        true => format!("turso:{}", path.display()),
+        false => format!("sqlite:{}", path.display()),
+    };
+    let db = toasty::Db::builder()
+        .models(toasty::models!(MemoryRecord))
+        .connect(&url)
+        .await
+        .with_context(|| format!("opening {} to merge it in", path.display()))?;
+    let mut conn = db.connection().await?;
+    let rows = toasty::query!(MemoryRecord).exec(&mut conn).await?;
+    Ok(rows.into_iter().map(memory_from_record).collect())
 }
 
-impl MemoryDb {
-    pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        // `url` is `turso:<path>`. Durable data: memories must survive the engine
-        // switch. `prepare_turso_path` stages a file written by the old
-        // rusqlite/SQLite backend aside to `.sqlite-backup`; its rows are
-        // extracted and reloaded into a fresh Turso db after the schema is pushed
-        // (below), guarded by a `.turso` marker so we never re-migrate. In-memory
-        // (no path) skips migration entirely.
-        let (path, is_new) = prepare_turso_path(url)?;
+/// Bring an existing file's `memory_records` up to the current column set,
+/// before toasty opens it.
+pub(crate) async fn ensure_schema(path: &Path) -> anyhow::Result<()> {
+    ensure_columns(path).await
+}
 
-        // Additive in-place migration for an EXISTING db: toasty's `push_schema`
-        // is not idempotent and only runs for new files, so a column added to
-        // `MemoryRecord` after the file was created would otherwise be missing
-        // (every query referencing it would fail). Rather than force a destructive
-        // "delete memory.db" reset — these are durable personal memories — we run
-        // the one DDL toasty's typed API can't: `ALTER TABLE ADD COLUMN` with a
-        // default, directly against the Turso file, before toasty opens it. The
-        // turso handle is dropped here so it never contends with toasty's pool.
-        if !is_new && let Some(p) = &path {
-            ensure_columns(p).await?;
-        }
-
-        // MVCC concurrent-writes on: writers run in parallel and conflicting
-        // commits are retried (see `with_write_retry`). komo's keys are all
-        // UUIDs (no AUTOINCREMENT, which MVCC rejects), so this is uniform across
-        // every db.
-        let driver = match &path {
-            Some(p) => Turso::file(p).concurrent_writes(),
-            None => Turso::in_memory().concurrent_writes(),
-        };
-        let db = toasty::Db::builder()
-            .models(toasty::models!(MemoryRecord))
-            .max_pool_size(DEFAULT_POOL_SIZE)
-            .build(driver)
-            .await?;
-
-        if is_new {
-            db.push_schema().await?;
-        }
-
-        let me = Self {
-            inner: Arc::new(db),
-        };
-
-        // Load the rows extracted from a legacy SQLite file (if any) into the
-        // fresh Turso db, then drop the marker so this only ever happens once.
-        if let Some(p) = &path {
-            let pending = sqlite_backup_path(p);
-            let marker = turso_marker_path(p);
-            if pending.exists() && !marker.exists() {
-                let rows = extract_sqlite_rows(&pending).await?;
-                let count = rows.len();
-                for memory in &rows {
-                    me.save(memory).await?;
-                }
-                std::fs::write(&marker, b"migrated from sqlite\n").ok();
-                info!(count, backup = %pending.display(), "migrated memory.db sqlite → turso");
-            } else if is_new {
-                // Brand-new Turso db with no legacy file: still mark it
-                // Turso-native so a future run never mistakes it for SQLite.
-                std::fs::write(&marker, b"turso-native\n").ok();
-            }
-        }
-
-        Ok(me)
-    }
-
+impl Db {
     /// One-time migration: import every memory from a legacy markdown directory
     /// into a freshly-created db. No-op when the directory is absent or the db
     /// already holds memories (so it is safe to call on every startup). Returns
@@ -286,7 +245,7 @@ fn memory_from_record(record: MemoryRecord) -> Memory {
 }
 
 #[async_trait]
-impl MemoryRepository for MemoryDb {
+impl MemoryRepository for Db {
     async fn save(&self, memory: &Memory) -> anyhow::Result<()> {
         // MVCC: retry the whole transaction on a commit conflict. Each attempt
         // re-checks out its own pooled connection.
@@ -440,40 +399,31 @@ async fn ensure_columns(path: &Path) -> anyhow::Result<()> {
     crate::persistence::drop_retired_columns(path, "memory_records", RETIRED).await
 }
 
-/// Read every memory row from a legacy SQLite db file (opened with toasty's
-/// SQLite driver), faithfully — including expired/any-status rows — so the
-/// migration preserves the full store, not just what `list` would surface.
-async fn extract_sqlite_rows(backup: &Path) -> anyhow::Result<Vec<Memory>> {
-    let url = format!("sqlite:{}", backup.display());
-    let db = toasty::Db::builder()
-        .models(toasty::models!(MemoryRecord))
-        .connect(&url)
-        .await
-        .with_context(|| format!("opening legacy sqlite db at {}", backup.display()))?;
-    let mut conn = db.connection().await?;
-    let rows = toasty::query!(MemoryRecord).exec(&mut conn).await?;
-    Ok(rows.into_iter().map(memory_from_record).collect())
-    // `db` drops here, releasing the backup file.
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use komo_core::domain::memory::{MemoryConfidence, MemoryContext, MemoryKind, MemoryStatus};
 
+    /// A `komo.db` in a home directory of this test's own, wiped first. Its own
+    /// directory because `Db::connect` scans the one it opens for legacy files
+    /// to merge — two tests sharing a directory would merge each other's.
     fn turso_url(name: &str) -> String {
-        let path = std::env::temp_dir().join(name);
-        crate::persistence::reset_test_db(&path);
-        format!("turso:{}", path.display())
+        let home = std::env::temp_dir().join(format!("komo-mdb-{name}"));
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        format!("turso:{}", home.join("komo.db").display())
     }
 
-    /// A legacy SQLite `memory.db` written by the old rusqlite backend (same
-    /// `MemoryRecord` schema) must be migrated into Turso on first connect,
-    /// preserving its rows, leaving a `.sqlite-backup`, and never re-migrating.
+    /// A legacy SQLite `memory.db` — written by the rusqlite backend, two
+    /// engines and one file merge ago — must still reach `komo.db`. That
+    /// migration used to run per store; the merge is now the only path there
+    /// is, so it has to cover the oldest file shape as well as the newest.
     #[tokio::test]
-    async fn migrates_legacy_sqlite_file_into_turso() {
-        let path = std::env::temp_dir().join("komo_memory_db_migrate.db");
-        crate::persistence::reset_test_db(&path);
+    async fn merges_a_legacy_sqlite_memory_db_into_komo_db() {
+        let home = std::env::temp_dir().join("komo-mdb-legacy-sqlite");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        let path = home.join("memory.db");
 
         // 1. Seed a legacy SQLite file with two memories via the SQLite driver.
         {
@@ -521,12 +471,11 @@ mod tests {
             }
         }
 
-        // 2. Connect over Turso: the rows migrate, backup + marker appear.
-        let db = MemoryDb::connect(&format!("turso:{}", path.display()))
-            .await
-            .unwrap();
-        let mut contents: Vec<String> = db
-            .list()
+        // 2. Open `komo.db` beside it: the merge imports the rows and retires
+        //    the old file.
+        let komo = format!("turso:{}", home.join("komo.db").display());
+        let db = Db::connect(&komo).await.unwrap();
+        let mut contents: Vec<String> = MemoryRepository::list(&db)
             .await
             .unwrap()
             .into_iter()
@@ -534,18 +483,26 @@ mod tests {
             .collect();
         contents.sort();
         assert_eq!(contents, vec!["likes coffee", "written in Rust"]);
-        assert!(sqlite_backup_path(&path).exists(), "sqlite backup kept");
-        assert!(turso_marker_path(&path).exists(), "turso marker written");
+        assert!(
+            !path.exists(),
+            "the merged file is renamed, not left in place"
+        );
+        assert!(
+            home.join("memory.db.merged-backup").exists(),
+            "and kept: it was the only copy of durable data"
+        );
 
-        // 3. Add a row, reconnect: no re-migration (still 3, not 5).
-        db.save(&Memory::new(MemoryKind::Fact, "third"))
+        // 3. Add a row, reconnect: nothing re-imports (still 3, not 5).
+        MemoryRepository::save(&db, &Memory::new(MemoryKind::Fact, "third"))
             .await
             .unwrap();
         drop(db);
-        let db2 = MemoryDb::connect(&format!("turso:{}", path.display()))
-            .await
-            .unwrap();
-        assert_eq!(db2.list().await.unwrap().len(), 3, "must not re-migrate");
+        let db2 = Db::connect(&komo).await.unwrap();
+        assert_eq!(
+            MemoryRepository::list(&db2).await.unwrap().len(),
+            3,
+            "must not re-import"
+        );
     }
 
     /// An existing memory.db created before `recall_count` and the truth-signal
@@ -610,9 +567,16 @@ mod tests {
                 .await
                 .unwrap();
             }
-            std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
+            std::fs::write(
+                crate::persistence::turso_marker_path(&path),
+                b"turso-native\n",
+            )
+            .unwrap();
 
-            let db = MemoryDb::connect(&format!("turso:{}", path.display()))
+            // Merged into a fresh `komo.db` beside it: the old file's columns
+            // are brought up to date before it is read, which is what makes an
+            // ancient store readable at all.
+            let db = Db::connect(&format!("turso:{}", home.join("komo.db").display()))
                 .await
                 .unwrap_or_else(|e| panic!("`{name}` must still open: {e}"));
             let mut memory = Memory::new(MemoryKind::Fact, "written after the upgrade");
@@ -631,8 +595,10 @@ mod tests {
 
     #[tokio::test]
     async fn adds_missing_columns_in_place() {
-        let path = std::env::temp_dir().join("komo_memory_db_addcol.db");
-        crate::persistence::reset_test_db(&path);
+        let home = std::env::temp_dir().join("komo-mdb-addcol");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        let path = home.join("memory.db");
 
         // 1. Seed a turso file with the OLD 15-column schema (no recall_count)
         //    and one row, then drop the handle.
@@ -664,14 +630,19 @@ mod tests {
             .await
             .unwrap();
         }
-        // Mark it turso-native so connect() does not stage it as a sqlite backup.
-        std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
+        // Mark it turso-native so it is read as one, not staged as sqlite.
+        std::fs::write(
+            crate::persistence::turso_marker_path(&path),
+            b"turso-native\n",
+        )
+        .unwrap();
 
-        // 2. Connect via MemoryDb: ensure_columns adds both columns in place.
-        let db = MemoryDb::connect(&format!("turso:{}", path.display()))
+        // 2. Merge it into a fresh `komo.db`: the old file's missing columns are
+        //    added in place first, which is what makes it readable at all.
+        let db = Db::connect(&format!("turso:{}", home.join("komo.db").display()))
             .await
             .unwrap();
-        let rows = db.list().await.unwrap();
+        let rows = MemoryRepository::list(&db).await.unwrap();
         assert_eq!(rows.len(), 1, "the pre-migration row survives");
         assert_eq!(rows[0].content, "a pre-migration memory");
         assert_eq!(rows[0].recall_count, 0, "new column defaults to 0");
@@ -716,7 +687,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_list_roundtrip_and_overwrite() {
-        let db = MemoryDb::connect(&turso_url("komo_memory_db_roundtrip.db"))
+        let db = Db::connect(&turso_url("komo_memory_db_roundtrip.db"))
             .await
             .unwrap();
         let mut m = Memory::new(MemoryKind::Preference, "prefers concise answers");
@@ -745,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_hidden_from_list() {
-        let db = MemoryDb::connect(&turso_url("komo_memory_db_expired.db"))
+        let db = Db::connect(&turso_url("komo_memory_db_expired.db"))
             .await
             .unwrap();
         db.save(&Memory::new(MemoryKind::Fact, "live"))
@@ -762,7 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_filters_by_eligibility_and_scope() {
-        let db = MemoryDb::connect(&turso_url("komo_memory_db_pinned.db"))
+        let db = Db::connect(&turso_url("komo_memory_db_pinned.db"))
             .await
             .unwrap();
 
@@ -792,7 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_returns_in_scope_active_and_candidate_matches() {
-        let db = MemoryDb::connect(&turso_url("komo_memory_db_recall.db"))
+        let db = Db::connect(&turso_url("komo_memory_db_recall.db"))
             .await
             .unwrap();
 
@@ -848,7 +819,7 @@ mod tests {
 
     #[tokio::test]
     async fn mark_used_sets_last_used_without_touching_updated_at() {
-        let db = MemoryDb::connect(&turso_url("komo_memory_db_mark_used.db"))
+        let db = Db::connect(&turso_url("komo_memory_db_mark_used.db"))
             .await
             .unwrap();
         let mut m = Memory::new(MemoryKind::Fact, "recalled at least once");
@@ -875,7 +846,7 @@ mod tests {
             .await
             .unwrap();
 
-        let db = MemoryDb::connect(&turso_url("komo_memory_db_import.db"))
+        let db = Db::connect(&turso_url("komo_memory_db_import.db"))
             .await
             .unwrap();
         assert_eq!(db.import_legacy_markdown(&dir).await.unwrap(), 1);

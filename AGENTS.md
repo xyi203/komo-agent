@@ -53,13 +53,19 @@ process's own log mid-conversation.
 
 ## Data & storage rules
 
-| File | Contents | Durability |
+**One database, table-level durability** (docs/adr/0004). `~/.komo/komo.db`
+holds everything Turso stores; "disposable" and "durable" are properties of each
+*table*, not of which file it sits in. The four files it replaced
+(`state.db`, `kanban.db`, `memory.db`, `cron.db`) are imported once on first
+connect and renamed `<name>.merged-backup`.
+
+| Where | Contents | Durability |
 |---|---|---|
-| `~/.komo/state.db` | session *metadata*, todos, reminders, pairings, settings, run ledger, turn journal, inbox | disposable — delete freely |
+| `komo.db` · `session_records`, `session_todo_records`, `reminder_records`, `pairing_records`, `setting_records`, `inbox_records`, run ledger (`run_records`, `run_step_records`, `run_memory_records`) | one turn's execution record and the session metadata around it | disposable **by row** — `komo run prune`, `komo sessions clean`; never by dropping the table |
+| `komo.db` · `task_records` | cross-session tasks | durable |
+| `komo.db` · `memory_records` | long-term memories | durable — **additive changes only** |
+| `komo.db` · `cron_job_records` | scheduled cron jobs | durable |
 | `~/.komo/sessions/` | transcripts — one append-only `.jsonl` per session | disposable |
-| `~/.komo/kanban.db` | cross-session tasks | durable |
-| `~/.komo/memory.db` | long-term memories | durable |
-| `~/.komo/cron.db` | scheduled cron jobs | durable |
 | `~/.komo/permissions.json` | saved approval grants | durable |
 | `~/.komo/checkpoints/` | pre-images of files a run changed (7-day retention) | disposable |
 | `~/.komo/session-index/` | episodic search index over transcripts | disposable — rebuilt on search |
@@ -99,21 +105,27 @@ at *any* split point, which is why `SurfaceContent` carries the turn that put
 each node on the surface.
 
 Schema-change rules (toasty's `push_schema` runs only for **new** db files, and
-is not idempotent):
+is not idempotent — and there is one file now, so "delete it to reset" is no
+longer available for anything):
 
-- New table / non-additive change on disposable state → delete the affected
-  file (`TaskRecord`→kanban.db, `CronJobRecord`→cron.db, anything else incl.
-  `RunRecord`/`RunStepRecord`→state.db).
 - **Column additions never need a reset**: `komo-infra/src/persistence/mod.rs::ensure_columns`
-  ALTERs in place on connect. Extend `EXPECTED` in `memory_db.rs` for
-  `MemoryRecord` columns, and the matching list in `db.rs::connect` for
-  state.db (`SESSION_COLUMNS` / `RUN_COLUMNS` / `STEP_COLUMNS`). Columns must be
-  NOT NULL + DEFAULT, or nullable.
-  Durable data (memory.db) must **only** ever change additively.
+  ALTERs in place on connect. Extend the list next to the model — `EXPECTED` in
+  `memory_db.rs` and `cron.rs`, `SESSION_COLUMNS` / `RUN_COLUMNS` /
+  `STEP_COLUMNS` in `db.rs::connect` — and add an `ensure_schema` for a table
+  that has none yet (`task_records`). Columns must be NOT NULL + DEFAULT, or
+  nullable.
+- **A new table** is added with `ensure_table` (its DDL kept beside the model,
+  byte-parity locked by a test — see `INBOX_TABLE_DDL`), because an existing
+  `komo.db` will not re-run `push_schema`.
+- **A non-additive change** to a durable table (`memory_records`,
+  `task_records`, `cron_job_records`) is not available: those may only ever
+  change additively. On a disposable table it is a **row-level** migration or a
+  documented one-time repair (`drop_retired_columns`), never a dropped file.
 - **A `Message` field change needs neither**: it is a JSONL line, not a column.
 
 Turso/toasty invariants (`komo-infra`'s `persistence/`, `memory/memory_db.rs` —
-the only places the ORM appears; model structs private to their file):
+the only places the ORM appears; one model struct per file, one `Db` holding
+them all, each domain's repository impl in its own module):
 
 - Backend is Turso in MVCC `concurrent_writes` mode; no `rusqlite`. DB URL is
   `turso:<path>` / `turso::memory:`.
@@ -342,7 +354,7 @@ call the same functions, which is what keeps validation from forking.
   canonicalized prefix, `Risk::Safe` deny-only; reads the markdown, not the
   index, so a note edited since the last index run is served current).
 - `session` + `komo-services`' `session_indexing` — **episodic memory**:
-  hybrid search over komo's own transcripts, the third memory beside `memory.db`
+  hybrid search over komo's own transcripts, the third memory beside `memory_records`
   (semantic) and skills (procedural). `search` spans **every** stored
   conversation by default, because "why did we decide against rig?" is a
   question about *some* past session and requiring its id up front is requiring
@@ -685,7 +697,7 @@ call the same functions, which is what keeps validation from forking.
   a load gate; `skill` view/list and every `komo skills` command ignore it.
   Usage is **derived**, never counted: `komo skills audit` rolls `skill view`
   ledger steps up per skill (`domain/run.rs`'s `skill_viewed`), so it reaches
-  only as far back as the disposable `state.db` does. Each load is attributed
+  only as far back as the pruned run ledger does. Each load is attributed
   to **how its turn ended** (`Run.outcome`), bucketed per *run* rather than per
   view — a skill loaded twice in one turn is one piece of evidence about that
   turn. `Unknown` is the honest majority and never counts as success: it is
@@ -705,7 +717,7 @@ call the same functions, which is what keeps validation from forking.
   out of running late at all), `TaskSweep`, `BriefingSweep` (opt-in; aux-model
   runtime with read-only tools + deny-all unattended approver; degrades to
   tool-less `complete` on error; stamps a per-day watermark
-  (`BriefingMarkRepository`, state.db settings) so a gateway restarted across
+  (`BriefingMarkRepository`, a settings row) so a gateway restarted across
   today's slot catches up once at startup — `briefing_catchup_due`, same
   "asleep over a slot → run late, once" rule as cron jobs), `DreamSweep` (one
   governance cycle over both candidate pools — memories promote/archive by
@@ -766,7 +778,7 @@ call the same functions, which is what keeps validation from forking.
   rendering off the folded content) and `coalesce_rapid_keys` rebuilds a paste
   that a terminal without bracketed paste delivered as keystrokes. Input events
   go through a channel so a batch can be collected before it is interpreted.
-- `cron` (`~/.komo/cron.db`, `CronJobSweep`) — two job modes: **command**
+- `cron` (`cron_job_records`, `CronJobSweep`) — two job modes: **command**
   (operator-authored, runs directly, no approver) and **agent** (unattended
   turn on `cron_runtime`, side effects need `unattended = true` policy rules).
   Chat-created jobs (`tools/cron.rs`) are approval-gated at creation; a
@@ -786,7 +798,7 @@ call the same functions, which is what keeps validation from forking.
   person who typed it is still there: resolved late it would fail at 03:00 as a
   permission refusal on every file the turn touches, which reads like a policy
   problem rather than a typo. It shares the `workdir` column with a command
-  job's cwd (same question of a process and of a turn, and cron.db is durable)
+  job's cwd (same question of a process and of a turn, and the table is durable)
   but is a different guarantee — a confinement boundary, not a convenience.
   Recurring *work* = cron job, recurring *message* = reminder, one-shot
   scheduled work = `@at` job.

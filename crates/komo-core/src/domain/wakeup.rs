@@ -163,9 +163,7 @@ mod tests {
             },
             Wakeup::UserReply,
             Wakeup::Event {
-                filter: super::super::session_event::EventFilter::Webhook {
-                    name: "ci".into(),
-                },
+                filter: super::super::session_event::EventFilter::Webhook { name: "ci".into() },
             },
         ] {
             let r = WakeupRegistration::new("s1", wakeup.clone(), now);

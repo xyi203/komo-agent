@@ -38,7 +38,7 @@ mod ui;
 use komo_agent::interaction::CancelState;
 use komo_agent::runtime::AgentRuntime;
 use komo_core::domain::cancel::{CANCELLED_REPLY, is_cancelled};
-use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
+use komo_infra::persistence::db::Db;
 use komo_services::clarify::ClarifyState;
 use komo_services::tool_execution::{SessionContext, SessionOrigin, with_session};
 use std::{io, path::PathBuf, sync::Arc};
@@ -316,14 +316,12 @@ async fn connect(
             clarify: None,
         });
     }
-    let db = Arc::new(Db::connect(&config.runtime.db_url).await?);
-    let kanban = Arc::new(KanbanDb::connect(&config.runtime.kanban_db_url).await?);
     // No gateway is running (we'd have taken the remote path above), so opening
-    // cron.db here can't collide with its exclusive lock. Jobs the user
+    // the database here can't collide with its exclusive lock. Jobs the user
     // schedules from this session fire once a gateway comes up.
-    let cron_jobs = Arc::new(CronDb::connect(&config.runtime.cron_db_url).await?);
+    let db = Arc::new(Db::connect(&config.runtime.db_url).await?);
     let approver: Arc<dyn Approver> = Arc::new(TuiApprover::new(approval_tx));
-    let wired = wiring::build(config, db.clone(), kanban, cron_jobs, approver).await?;
+    let wired = wiring::build(config, db.clone(), approver).await?;
     Ok(Connected {
         backend: Backend::Local {
             runtime: Arc::new(wired.runtime),

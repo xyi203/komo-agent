@@ -1,7 +1,7 @@
 use komo_agent::daemon::Schedule;
 use komo_agent::gateway::Gateway;
 use komo_agent::interaction::{ApprovalState, ChatApprover, GatewayDispatcher};
-use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
+use komo_infra::persistence::db::Db;
 use std::sync::Arc;
 
 use crate::{
@@ -9,7 +9,7 @@ use crate::{
     domain::{
         approval::Approver, cron::CronJobRepository, gateway::MessageHandler, home::HomeRepository,
         notify::Notifier, pairing::PairingRepository, repository::SessionRepository,
-        run::RunRepository, todo::SessionTodoRepository,
+        run::RunRepository, task::TaskRepository, todo::SessionTodoRepository,
     },
     infra::messaging::{
         api::ApiChannel, home_notifier::HomeNotifier, macos_notifier::MacosNotifier,
@@ -60,24 +60,17 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         Ok(n) => tracing::info!(count = n, "reconciled interrupted runs on startup"),
         Err(error) => tracing::warn!(%error, "failed to reconcile interrupted runs"),
     }
-    // Durable tasks in their own file, separate from disposable session state.
-    let kanban = Arc::new(KanbanDb::connect(&rt.kanban_db_url).await?);
-    // Durable scheduled cron jobs, ditto (`komo cron`).
-    let cron_jobs: Arc<dyn CronJobRepository> = Arc::new(CronDb::connect(&rt.cron_db_url).await?);
+    // Tasks and cron jobs are tables in the same database now (docs/adr/0004);
+    // the sweeps still take them as their own repositories.
+    let kanban: Arc<dyn TaskRepository> = db.clone();
+    let cron_jobs: Arc<dyn CronJobRepository> = db.clone();
 
     // Tool actions that need approval are gated over the chat channel: the
     // agent sends an approval prompt and waits for the user's `/approve` (or
     // `/deny`) reply. Shared with the dispatcher so the reply resolves the wait.
     let approvals = Arc::new(ApprovalState::new());
     let approver: Arc<dyn Approver> = Arc::new(ChatApprover::new(approvals.clone()));
-    let mut wired = wiring::build(
-        config,
-        db.clone(),
-        kanban.clone(),
-        cron_jobs.clone(),
-        approver,
-    )
-    .await?;
+    let mut wired = wiring::build(config, db.clone(), approver).await?;
 
     // Expire stored tool outputs once, here. Not a `Maintenance` sweep on
     // purpose: the list of scheduled sweeps is long already, and a scratch file

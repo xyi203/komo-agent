@@ -1,12 +1,13 @@
-//! Direct persistence adapter: operator actions against directly-opened
-//! stores, used when no gateway is running (nothing holds the Turso lock).
+//! Direct persistence adapter: operator actions against a directly-opened
+//! store, used when no gateway is running (nothing holds the Turso lock).
 //!
-//! Stores open **lazily, per request family, once per command**: `run list`
-//! never touches memory.db or kanban.db, and a batch of memory transitions
-//! reuses one connection instead of reconnecting per id.
+//! The database opens **lazily, once per command**: a `komo doctor` that only
+//! prints config never opens it at all, and a batch of memory transitions
+//! reuses the one connection instead of reconnecting per id. It used to be four
+//! files and four cells — one merge later (docs/adr/0004) the laziness is all
+//! that is left of that.
 
-use komo_infra::memory::memory_db::MemoryDb;
-use komo_infra::persistence::{cron::CronDb, db::Db, kanban::KanbanDb};
+use komo_infra::persistence::db::Db;
 use komo_services::cron_actions;
 use std::sync::Arc;
 
@@ -33,10 +34,7 @@ use super::{StoreUrls, now};
 pub(super) struct DirectOperatorAdapter {
     urls: StoreUrls,
     db: OnceCell<Arc<Db>>,
-    kanban: OnceCell<Arc<KanbanDb>>,
-    memory: OnceCell<Arc<MemoryDb>>,
-    cron: OnceCell<Arc<CronDb>>,
-    /// Opened on first use, like the dbs: a CLI command that never touches the
+    /// Opened on first use, like the db: a CLI command that never touches the
     /// vault should not pay for loading its index.
     wiki: OnceCell<Arc<super::actions::WikiOps>>,
 }
@@ -46,9 +44,6 @@ impl DirectOperatorAdapter {
         Self {
             urls,
             db: OnceCell::new(),
-            kanban: OnceCell::new(),
-            memory: OnceCell::new(),
-            cron: OnceCell::new(),
             wiki: OnceCell::new(),
         }
     }
@@ -59,31 +54,11 @@ impl DirectOperatorAdapter {
         komo_infra::skills::FsSkillStore::new(self.urls.skills_root.clone())
     }
 
-    /// The session/run/pairing store (`state.db`), opened on first use.
+    /// The database — sessions, runs, tasks, memories, cron jobs — opened on
+    /// first use.
     pub(super) async fn db(&self) -> anyhow::Result<&Arc<Db>> {
         self.db
             .get_or_try_init(|| async { Ok(Arc::new(Db::connect(&self.urls.db).await?)) })
-            .await
-    }
-
-    /// The durable task store (`kanban.db`), opened on first use.
-    pub(super) async fn kanban(&self) -> anyhow::Result<&Arc<KanbanDb>> {
-        self.kanban
-            .get_or_try_init(|| async { Ok(Arc::new(KanbanDb::connect(&self.urls.kanban).await?)) })
-            .await
-    }
-
-    /// The durable memory store (`memory.db`), opened on first use.
-    pub(super) async fn memory(&self) -> anyhow::Result<&Arc<MemoryDb>> {
-        self.memory
-            .get_or_try_init(|| async { Ok(Arc::new(MemoryDb::connect(&self.urls.memory).await?)) })
-            .await
-    }
-
-    /// The durable cron-job store (`cron.db`), opened on first use.
-    pub(super) async fn cron(&self) -> anyhow::Result<&Arc<CronDb>> {
-        self.cron
-            .get_or_try_init(|| async { Ok(Arc::new(CronDb::connect(&self.urls.cron).await?)) })
             .await
     }
 
@@ -142,7 +117,7 @@ impl DirectOperatorAdapter {
                 OperatorQueryResult::Reminders(pending)
             }
             OperatorQuery::Tasks => OperatorQueryResult::Tasks(
-                TaskRepository::list_open(self.kanban().await?.as_ref()).await?,
+                TaskRepository::list_open(self.db().await?.as_ref()).await?,
             ),
             OperatorQuery::Runs { limit } => OperatorQueryResult::Runs(
                 RunRepository::list(self.db().await?.as_ref(), limit).await?,
@@ -166,7 +141,7 @@ impl DirectOperatorAdapter {
                 // alone. Still bigram/word matching with recall's ranking —
                 // strictly better than the substring scan it replaced — but
                 // cross-language hits need the gateway's semantic arm.
-                let db = self.memory().await?;
+                let db = self.db().await?;
                 let service = komo_services::memory_query::MemoryQueryService::new(db.clone() as _);
                 OperatorQueryResult::MemorySearch(
                     actions::search_memories(&service, db.as_ref(), &query, limit).await?,
@@ -175,16 +150,17 @@ impl DirectOperatorAdapter {
             OperatorQuery::MemoryUsed { id, limit } => OperatorQueryResult::MemoryUsed(
                 RunRepository::runs_using_memory(self.db().await?.as_ref(), &id, limit).await?,
             ),
-            OperatorQuery::Memories => {
-                OperatorQueryResult::Memories(self.memory().await?.list().await?)
-            }
+            OperatorQuery::Memories => OperatorQueryResult::Memories(
+                MemoryRepository::list(self.db().await?.as_ref()).await?,
+            ),
             OperatorQuery::Pairings => OperatorQueryResult::Pairings(actions::pairing_views(
                 PairingRepository::list(self.db().await?.as_ref()).await?,
                 now(),
             )),
             OperatorQuery::DreamPreview => {
                 let at = now();
-                let mut report = actions::dream_classify(&self.memory().await?.list().await?, at);
+                let memories = MemoryRepository::list(self.db().await?.as_ref()).await?;
+                let mut report = actions::dream_classify(&memories, at);
                 let (expire_skills, skill_candidate_count) =
                     actions::dream_classify_skills(&self.skills().list_candidates(), at);
                 report.expire_skills = expire_skills;
@@ -241,9 +217,9 @@ impl DirectOperatorAdapter {
             OperatorQuery::WikiStatus => {
                 OperatorQueryResult::WikiStatus(self.wiki_ops().await?.status().await?)
             }
-            OperatorQuery::CronJobs => {
-                OperatorQueryResult::CronJobs(self.cron().await?.list().await?)
-            }
+            OperatorQuery::CronJobs => OperatorQueryResult::CronJobs(
+                CronJobRepository::list(self.db().await?.as_ref()).await?,
+            ),
         })
     }
 
@@ -257,7 +233,7 @@ impl DirectOperatorAdapter {
             }
             OperatorCommand::MemoryTransition { id, action } => {
                 match actions::apply_memory_transition(
-                    self.memory().await?.as_ref(),
+                    self.db().await?.as_ref(),
                     &id,
                     action,
                     now(),
@@ -301,7 +277,7 @@ impl DirectOperatorAdapter {
             },
             OperatorCommand::DreamApply => {
                 let summary = komo_agent::daemon::DreamSweep {
-                    memories: self.memory().await?.clone() as Arc<dyn MemoryRepository>,
+                    memories: self.db().await?.clone() as Arc<dyn MemoryRepository>,
                     skills: Arc::new(self.skills()),
                 }
                 .apply()
@@ -321,20 +297,20 @@ impl DirectOperatorAdapter {
                  start it with `komo gateway start`, then re-run this"
             ),
             OperatorCommand::MemoryRepairScopes => OperatorCommandResult::MemoryScopesRepaired {
-                repaired: actions::repair_memory_scopes(self.memory().await?.as_ref()).await?,
+                repaired: actions::repair_memory_scopes(self.db().await?.as_ref()).await?,
             },
             OperatorCommand::CronAdd { spec } => OperatorCommandResult::CronAdded(Box::new(
-                cron_actions::add_cron_job(self.cron().await?.as_ref(), spec, now()).await?,
+                cron_actions::add_cron_job(self.db().await?.as_ref(), spec, now()).await?,
             )),
             OperatorCommand::CronRemove { name } => {
-                if !CronJobRepository::delete(self.cron().await?.as_ref(), &name).await? {
+                if !CronJobRepository::delete(self.db().await?.as_ref(), &name).await? {
                     anyhow::bail!(actions::no_cron_job_message(&name));
                 }
                 OperatorCommandResult::CronRemoved
             }
             OperatorCommand::CronSetEnabled { name, enabled } => {
                 match cron_actions::set_cron_enabled(
-                    self.cron().await?.as_ref(),
+                    self.db().await?.as_ref(),
                     &name,
                     enabled,
                     now(),
@@ -346,7 +322,7 @@ impl DirectOperatorAdapter {
                 }
             }
             OperatorCommand::CronTrigger { name } => {
-                match cron_actions::trigger_cron_job(self.cron().await?.as_ref(), &name, now())
+                match cron_actions::trigger_cron_job(self.db().await?.as_ref(), &name, now())
                     .await?
                 {
                     Some(job) => OperatorCommandResult::CronUpdated(Box::new(job)),

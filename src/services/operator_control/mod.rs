@@ -25,18 +25,15 @@ pub use request::*;
 use crate::domain::run::Run;
 use crate::infra::gateway_client::GatewayClient;
 use komo_config::RuntimeConfig;
-use komo_infra::persistence::{db::Db, kanban::KanbanDb};
+use komo_infra::persistence::db::Db;
 
 use direct::DirectOperatorAdapter;
 use gateway::GatewayOperatorAdapter;
 
-/// Where the three stores live, for the direct adapter's lazy connections.
+/// Where the store lives, for the direct adapter's lazy connection.
 #[derive(Debug, Clone)]
 pub struct StoreUrls {
     pub db: String,
-    pub kanban: String,
-    pub memory: String,
-    pub cron: String,
     /// Note-vault config, when `[wiki]` declares a vault. Carried here so the
     /// direct adapter can open the index itself when no gateway is running —
     /// the same reason the db urls are here.
@@ -51,9 +48,6 @@ impl StoreUrls {
     pub fn from_config(runtime: &RuntimeConfig) -> Self {
         Self {
             db: runtime.db_url.clone(),
-            kanban: runtime.kanban_db_url.clone(),
-            memory: runtime.memory_db_url.clone(),
-            cron: runtime.cron_db_url.clone(),
             wiki: runtime.wiki.clone(),
             skills_root: runtime.home.join("skills"),
         }
@@ -123,7 +117,7 @@ impl OperatorControl {
         local_turn: F,
     ) -> anyhow::Result<ResumeOutcome>
     where
-        F: FnOnce(Arc<Db>, Arc<KanbanDb>, Run, String) -> Fut,
+        F: FnOnce(Arc<Db>, Run, String) -> Fut,
         Fut: Future<Output = anyhow::Result<(String, bool)>>,
     {
         let target_id = match id {
@@ -155,9 +149,8 @@ impl OperatorControl {
                         anyhow::bail!(actions::not_recoverable_message(&target_id, &status))
                     }
                     actions::ResumeTarget::Ready { run, steps, input } => {
-                        let kanban = direct.kanban().await?.clone();
                         let session_id = run.session_id.clone();
-                        let (reply, continued) = local_turn(db.clone(), kanban, run, input).await?;
+                        let (reply, continued) = local_turn(db.clone(), run, input).await?;
                         // Nothing to clear: the continuation's own
                         // `turn/started{resumed_from}` claimed the turn it
                         // picked up, and a claimed turn is no longer offered.
@@ -197,10 +190,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         StoreUrls {
-            db: format!("turso:{}", dir.join("state.db").display()),
-            kanban: format!("turso:{}", dir.join("kanban.db").display()),
-            memory: format!("turso:{}", dir.join("memory.db").display()),
-            cron: format!("turso:{}", dir.join("cron.db").display()),
+            db: format!("turso:{}", dir.join("komo.db").display()),
             // These tests exercise the db-backed operations only.
             wiki: None,
             skills_root: dir.join("skills"),
@@ -238,24 +228,26 @@ mod tests {
         assert!(report.is_empty());
     }
 
+    /// The laziness that is left after the merge: one file, opened on the
+    /// first request that needs it and not before. A `komo doctor` that only
+    /// prints config must not create a database.
     #[tokio::test]
-    async fn stores_open_lazily_per_request() {
+    async fn the_store_opens_on_the_first_request_that_needs_it() {
         let urls = temp_urls("lazy");
-        let memory_path = urls.memory.strip_prefix("turso:").unwrap().to_string();
-        let kanban_path = urls.kanban.strip_prefix("turso:").unwrap().to_string();
+        let path = urls.db.strip_prefix("turso:").unwrap().to_string();
         let control = direct(urls);
-        // A run-ledger read must not open the memory or kanban stores.
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "resolving the backend must not open the store"
+        );
+
         control
             .query(OperatorQuery::Runs { limit: 5 })
             .await
             .unwrap();
         assert!(
-            !std::path::Path::new(&memory_path).exists(),
-            "run list must not touch memory.db"
-        );
-        assert!(
-            !std::path::Path::new(&kanban_path).exists(),
-            "run list must not touch kanban.db"
+            std::path::Path::new(&path).exists(),
+            "and the first query that reads it does"
         );
     }
 
@@ -273,7 +265,7 @@ mod tests {
             OperatorBackend::Direct(d) => d,
             _ => unreachable!(),
         };
-        let store = backend.memory().await.unwrap().clone();
+        let store = backend.db().await.unwrap().clone();
         for content in ["likes tea", "works late"] {
             let mut m = Memory::new(MemoryKind::Preference, content);
             m.status = MemoryStatus::Candidate;
@@ -334,13 +326,13 @@ mod tests {
         let control = direct(temp_urls("resume"));
         // Nothing recoverable at all.
         let err = control
-            .resume_run(None, |_, _, _, _| async { Ok((String::new(), false)) })
+            .resume_run(None, |_, _, _| async { Ok((String::new(), false)) })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no recoverable runs"));
         // An explicit unknown id.
         let err = control
-            .resume_run(Some("run-x".into()), |_, _, _, _| async {
+            .resume_run(Some("run-x".into()), |_, _, _| async {
                 Ok((String::new(), false))
             })
             .await
@@ -370,7 +362,7 @@ mod tests {
         .await
         .unwrap();
         let err = control
-            .resume_run(Some(run_id.clone()), |_, _, _, _| async {
+            .resume_run(Some(run_id.clone()), |_, _, _| async {
                 Ok((String::new(), false))
             })
             .await
@@ -382,7 +374,7 @@ mod tests {
             .await
             .unwrap();
         let outcome = control
-            .resume_run(Some(run_id.clone()), |_, _, run, input| async move {
+            .resume_run(Some(run_id.clone()), |_, run, input| async move {
                 assert_eq!(run.session_id, "cli:test");
                 assert!(input.contains("hello"), "priming digest carries the input");
                 Ok(("done".to_string(), false))
