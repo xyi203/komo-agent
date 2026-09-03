@@ -151,10 +151,26 @@ same principal + private conversation
   这是"像一个人"的代价。长任务并行由 background task 与 suspend + wakeup 承担（D5），不通过拆
   Task context 解决。
 
-**一个必须跟着改的东西**：`Session.workspace` 今天是建 session 时锁定的身份字段。一条 home session
-会从不同目录的 TUI 进入，workspace 只能是 **turn 的属性**（`SessionContext::workspace_root`
-已经是），不再是 session 身份的一部分。这与 CONTEXT 里"Profile = 谁，Workspace = 哪里"两条正交轴
-一致：哪里干活是每个 turn 自己说的。
+**三个必须跟着改的东西**：
+
+1. `Session.workspace` 今天是建 session 时锁定的身份字段。一条 home session 会从不同目录的 TUI
+   进入，workspace 只能是 **turn 的属性**（`SessionContext::workspace_root` 已经是），不再是 session
+   身份的一部分。这与 CONTEXT 里"Profile = 谁，Workspace = 哪里"两条正交轴一致：哪里干活是每个
+   turn 自己说的。
+2. **system prompt 的 context 层保持 per process，不随 turn 的 workspace 变。** 缓存前缀的顺序是
+   tools → system → messages，system 一变，后面整段 history 的缓存全部失效。今天 context 层（项目
+   `AGENTS.md`）读的是进程 cwd，`system_prompt.rs` 文档里"stable within a session"这句已经不准，
+   要改成 per process。若某个 turn 需要带上它所在目录的项目指令，照 recall 记忆的做法作为
+   `MessageSource::Injected` 块放到该 turn 用户消息的**尾部**——新字节本来就在那里，对缓存零成本。
+3. **D6 排在 compaction（turn-durability 第三批）之后上线。** 今天 TUI 一开是空会话，history 近零；
+   合到 home session 后每个 turn 都背历史窗口，上限 `max_history_bytes = 256 KB`（约 64k token）。
+   命中率不变——锚定窗口让 history 前缀每 6 轮左右才移一次，和今天的 Telegram 长会话一样——
+   变的是每轮输入量。compaction 把老历史换成 summary 之后窗口不再靠字节上限硬切，这个成本才回到
+   合理范围。若要提前上线，必须同时把 `max_history_bytes` 默认值调小。
+
+另一个不变的事实要写明：Anthropic 的 ephemeral 缓存 TTL 是 5 分钟，komo 未设 1h。"上午 Telegram、
+下午 TUI"这类跨时段接续从来不可能命中缓存，D6 没有让它变差；它带来的命中收益只在同一时段内的
+跨入口接续，以及 Responses 系少掉一堆一次性的 `prompt_cache_key`。
 
 **范围严格限制在 identity / routing**：不引入 Task Router，不新增 Task 状态副本，不动 event-log
 权威模型，不顺手重构 storage。上下文的连续性由已有的三层叠加提供——最近窗口（`find_windowed`）、
@@ -416,7 +432,9 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 - **5.6 Home conversation（D6）**：principal → conversation 两步解析进 `GatewayDispatcher`；home
   session id 记 settings；TUI 默认进入 home session；`/new` 改为写 `conversation/boundary`，不再
   `rotate`；`Session.workspace` 的 creation-locked 语义放弃，workspace 只从 `SessionContext` 读；
-  `todo` 随 boundary 失效。**只改 identity / routing**，不碰事件日志、恢复、审批、storage。
+  `todo` 随 boundary 失效。**只改 identity / routing**，不碰事件日志、恢复、审批、storage；system
+  的 context 层保持 per process。**前置：turn-durability 第三批 compaction 已落地**，否则同时调小
+  `max_history_bytes`。
   验证：Telegram DM 与 TUI 各发一条，两条落在同一 session 且 seq 连续；飞书群消息落在另一条 session；
   TUI 关掉重开看到同一段对话；`/new` 之后模型历史从边界开始，但挂起中的审批仍可被 `/approve` 唤醒、
   kanban Task 与 memory 原样；在 TUI 挂起、从 Telegram `/approve` 的 turn，回复回到 Telegram。
