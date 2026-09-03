@@ -247,6 +247,24 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
                 step.structured = call.structured.clone();
                 step.output_paths = call.output_paths.clone();
             }
+            // Waiting, not working and not dead. `recoverable` is what
+            // `komo run resume` offers and what the startup reconciler rules
+            // on; neither applies to a turn whose return is already scheduled —
+            // resuming it by hand would run it twice, and reconciling it would
+            // report a crash that did not happen.
+            SessionEventKind::TurnSuspended(_) => {
+                projected.run.status = RunStatus::Suspended;
+                projected.run.recoverable = false;
+            }
+            // The wait is over: whatever comes next, this turn is no longer
+            // parked. A continuation picks it up under its own `turn/started`,
+            // so the status only has to stop claiming it is still waiting.
+            SessionEventKind::WakeupFired(_) => {
+                if projected.run.status == RunStatus::Suspended {
+                    projected.run.status = RunStatus::Running;
+                    projected.run.recoverable = true;
+                }
+            }
             SessionEventKind::TurnCompleted { .. } => {
                 projected.run.final_output = std::mem::take(&mut replies[at_index]);
                 projected.run.status = RunStatus::Done;
@@ -638,6 +656,91 @@ mod tests {
             call_started(1, 100, "ghost", "c1", "read"),
         ];
         assert!(project_runs("s1", &events).is_empty());
+    }
+
+    /// A turn that stopped to wait is not crash residue. Recovery must not
+    /// offer it — its return is already scheduled, and resuming it by hand
+    /// would run the same work twice — and the startup reconciler must not
+    /// rule it dead.
+    #[test]
+    fn a_suspended_turn_is_waiting_rather_than_interrupted() {
+        use crate::domain::session_event::{TurnSuspendedEvent, Wakeup};
+
+        let suspended = |seq: u64, turn: &str| {
+            ev(
+                seq,
+                200,
+                SessionEventKind::TurnSuspended(TurnSuspendedEvent {
+                    turn_id: turn.into(),
+                    wakeup: Wakeup::Approval {
+                        call_id: "c1".into(),
+                    },
+                    summary: "waiting for approval to run: rm -rf build".into(),
+                    expires_at: Some(200 + 86_400),
+                }),
+            )
+        };
+
+        // Crashed *before* suspending: nothing scheduled its return, so it is
+        // the interrupted turn recovery exists for.
+        let working = vec![started(0, 100, "t1"), asked(1, 100, "t1", "go")];
+        let run = &project_runs("s1", &working)[0].run;
+        assert_eq!(run.status, RunStatus::Running);
+        assert!(run.recoverable);
+
+        // Crashed *after* suspending: it is parked, and something else will
+        // wake it.
+        let mut waiting = working.clone();
+        waiting.push(suspended(2, "t1"));
+        let run = &project_runs("s1", &waiting)[0].run;
+        assert_eq!(run.status, RunStatus::Suspended);
+        assert!(!run.recoverable, "its return is scheduled, not lost");
+        assert!(
+            !run.status.is_terminal(),
+            "and it is still not an episode: nothing has been decided"
+        );
+    }
+
+    /// The wake is what ends the wait. Between it and the continuation's own
+    /// `turn/started` the turn is running again — and if the process dies in
+    /// that window, it is interrupted like any other.
+    #[test]
+    fn a_fired_wakeup_takes_the_turn_out_of_waiting() {
+        use crate::domain::session_event::{
+            TurnSuspendedEvent, Wakeup, WakeupCause, WakeupFiredEvent,
+        };
+
+        let events = vec![
+            started(0, 100, "t1"),
+            asked(1, 100, "t1", "go"),
+            ev(
+                2,
+                200,
+                SessionEventKind::TurnSuspended(TurnSuspendedEvent {
+                    turn_id: "t1".into(),
+                    wakeup: Wakeup::UserReply,
+                    summary: "asked the user which environment".into(),
+                    expires_at: None,
+                }),
+            ),
+            ev(
+                3,
+                300,
+                SessionEventKind::WakeupFired(WakeupFiredEvent {
+                    turn_id: "t1".into(),
+                    wakeup_id: "wk-1".into(),
+                    cause: WakeupCause::Reply,
+                    payload: "staging".into(),
+                }),
+            ),
+        ];
+
+        let run = &project_runs("s1", &events)[0].run;
+        assert_eq!(run.status, RunStatus::Running);
+        assert!(
+            run.recoverable,
+            "woken and then lost is an interrupted turn again"
+        );
     }
 
     #[test]

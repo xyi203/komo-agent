@@ -418,9 +418,16 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 
 ### 第一批 · 挂起原语 + 审批改造
 
-- **5.1 事件词汇**：`turn/suspended` / `wakeup/fired` / `approval/expired` 进 `SessionEventKind`；
-  fold 规则：suspended 后无 resumed 的 turn 不算 interrupted、不进 `reconcile_interrupted`。
-  验证：fold 单测；注入崩溃在 suspended 前后，恢复判定分别为 interrupted / suspended。
+- **5.1 事件词汇** —— **已完成**：三个事件加上 `Wakeup` / `EventFilter` / `WakeupCause`
+  进 `SessionEventKind`（都是 required，老版本读不了新日志，按第一批的 fail-closed 规则）。
+  「等待」不是新的一列，是 `RunStatus::Suspended`：turn 停下等东西时既不在跑（重启不该当成崩溃残留
+  去 reconcile），也没有结束（没有结论，不是 episode）。`is_terminal()` 一个判据同时管住
+  `unlearned`、`episode::assemble` 和 reconcile 三处，`recoverable` 在挂起时折成 false——
+  它的回来是被安排好的，手动 resume 会把同一段活干两遍。`wakeup/fired` 把它带回 Running：
+  醒了之后再崩，就又是普通的 interrupted。
+  验证：`a_suspended_turn_is_waiting_rather_than_interrupted`（suspended 前后各切一刀，
+  判定分别是 interrupted / waiting）、`a_fired_wakeup_takes_the_turn_out_of_waiting`、
+  `reconciliation_leaves_a_suspended_turn_alone`。
 - **5.2 唤醒登记**：`WakeupRegistration` 表进 cron.db；`CronJobSweep` 增加登记的 claim-before-fire；
   fire 时核对日志。验证：登记指向已恢复的 turn 被丢弃并 warn；重复 fire 不重复恢复。
 - **5.3 审批改造**：`ChatApprover` / TUI approver / `PolicyApprover` 的等待从 oneshot 改为挂起；

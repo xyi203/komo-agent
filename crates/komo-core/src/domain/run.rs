@@ -50,6 +50,13 @@ pub fn truncate(s: &str, cap: usize) -> String {
 pub enum RunStatus {
     /// The turn is in flight (set at start; an in-flight crash leaves it here).
     Running,
+    /// The turn stopped to wait for something outside itself — an approval, an
+    /// answer, a timer, a job it started — and gave up its session slot.
+    ///
+    /// Not `Running`, because nothing is executing and a restart must not
+    /// reconcile it as crash residue; not terminal, because it is coming back.
+    /// What it is waiting for is the `turn/suspended` event's `wakeup`.
+    Suspended,
     Done,
     Failed,
 }
@@ -58,15 +65,23 @@ impl RunStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Suspended => "suspended",
             Self::Done => "done",
             Self::Failed => "failed",
         }
+    }
+
+    /// Whether the turn has stopped for good. A running or suspended turn has
+    /// no decided outcome — it is not an episode, and it is not residue.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done | Self::Failed)
     }
 }
 
 pub fn parse_run_status(s: &str) -> anyhow::Result<RunStatus> {
     match s {
         "running" => Ok(RunStatus::Running),
+        "suspended" => Ok(RunStatus::Suspended),
         "done" => Ok(RunStatus::Done),
         "failed" => Ok(RunStatus::Failed),
         other => Err(anyhow::anyhow!(

@@ -1371,11 +1371,12 @@ impl RunRepository for Db {
         };
         rows.into_iter()
             .map(run_from_record)
-            // A turn still in flight is not an episode. Filtered here rather
-            // than in the query because the crash residue it guards against is
-            // rare and short-lived (`reconcile_interrupted` clears it at every
-            // startup), so it never eats a meaningful share of the limit.
-            .filter(|run| !matches!(run, Ok(r) if matches!(r.status, RunStatus::Running)))
+            // A turn still in flight — running, or parked waiting for
+            // something — is not an episode. Filtered here rather than in the
+            // query because the crash residue it guards against is rare and
+            // short-lived (`reconcile_interrupted` clears it at every startup),
+            // so it never eats a meaningful share of the limit.
+            .filter(|run| !matches!(run, Ok(r) if !r.status.is_terminal()))
             .collect()
     }
 
@@ -2390,6 +2391,40 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// Startup reconciliation rules on turns that were *working* when the
+    /// process died. A turn that had stopped to wait is not residue: something
+    /// is scheduled to wake it, and flipping it to failed would both lie about
+    /// what happened and take it out of the set that can still come back.
+    #[tokio::test]
+    async fn reconciliation_leaves_a_suspended_turn_alone() {
+        use komo_core::domain::run::{Run, RunStatus};
+        let db = Db::connect(&sqlite_url("komo_run_reconcile_suspended.db"))
+            .await
+            .unwrap();
+
+        let working = Run::start("cli:s", "long task");
+        commit_run(&db, &working, &[], 0).await;
+
+        let mut waiting = Run::start("cli:s", "needs approval");
+        waiting.status = RunStatus::Suspended;
+        commit_run(&db, &waiting, &[], 1).await;
+
+        assert_eq!(
+            RunRepository::reconcile_interrupted(&db, 1234)
+                .await
+                .unwrap(),
+            1,
+            "only the turn that was still working"
+        );
+
+        let waiting = RunRepository::get(&db, &waiting.id).await.unwrap().unwrap();
+        assert_eq!(waiting.status, RunStatus::Suspended);
+        assert!(!waiting.recoverable, "it is waiting, not lost");
+        let working = RunRepository::get(&db, &working.id).await.unwrap().unwrap();
+        assert_eq!(working.status, RunStatus::Failed);
+        assert!(working.recoverable);
     }
 
     #[tokio::test]

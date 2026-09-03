@@ -15,10 +15,7 @@
 
 use std::sync::Arc;
 
-use komo_core::domain::{
-    episode::EpisodeView,
-    run::{RunRepository, RunStatus},
-};
+use komo_core::domain::{episode::EpisodeView, run::RunRepository};
 
 /// Load one finished run and its steps.
 ///
@@ -32,7 +29,9 @@ pub async fn assemble(
     let Some(run) = runs.get(run_id).await? else {
         return Ok(None);
     };
-    if matches!(run.status, RunStatus::Running) {
+    // Neither a turn still working nor one parked waiting for an answer has a
+    // decided outcome or a complete step list, so neither is an episode yet.
+    if !run.status.is_terminal() {
         return Ok(None);
     }
     // Steps come back ordered by `seq` (the repository's contract) and scoped to
@@ -46,6 +45,7 @@ pub async fn assemble(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use komo_core::domain::run::RunStatus;
     use komo_core::domain::run::{MemoryUse, Run, RunStep};
 
     /// A ledger holding hand-built runs and steps, keyed by run id.

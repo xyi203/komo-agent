@@ -122,6 +122,9 @@ impl SessionEvent {
             SessionEventKind::ToolCallSettled(c) => Some(c.turn_id.as_str()),
             SessionEventKind::ApprovalRequested(a) => Some(a.turn_id.as_str()),
             SessionEventKind::ApprovalResolved(a) => Some(a.turn_id.as_str()),
+            SessionEventKind::ApprovalExpired { turn_id, .. } => Some(turn_id.as_str()),
+            SessionEventKind::TurnSuspended(s) => Some(s.turn_id.as_str()),
+            SessionEventKind::WakeupFired(w) => Some(w.turn_id.as_str()),
             SessionEventKind::TurnStarted { turn_id, .. }
             | SessionEventKind::TurnCompleted { turn_id }
             | SessionEventKind::TurnFailed { turn_id, .. }
@@ -219,6 +222,140 @@ pub enum SessionEventKind {
     ApprovalRequested(ApprovalRequestedEvent),
     #[serde(rename = "approval/resolved")]
     ApprovalResolved(ApprovalResolvedEvent),
+    /// The third outcome an approval can have, beside allowed and denied:
+    /// nobody answered in time. Recorded as its own event because "denied" and
+    /// "expired" are different things to tell the model, and because a turn
+    /// that expired was *waiting* — an operator reading the log a week later
+    /// needs to see that nobody was there, not a refusal that never happened.
+    #[serde(rename = "approval/expired")]
+    ApprovalExpired {
+        turn_id: String,
+        call_id: String,
+        call_index: u32,
+    },
+
+    /// The turn stopped to wait for something, and gave up its session slot.
+    ///
+    /// A **durable barrier**, like `approval/requested`: written and flushed
+    /// before the wait begins, or a crash cannot tell a turn that died waiting
+    /// from one that died working — and only the first is worth waking up.
+    #[serde(rename = "turn/suspended")]
+    TurnSuspended(TurnSuspendedEvent),
+    /// What ended the wait. The causal link between a suspension and the
+    /// continuation that follows it: without it "why did this turn come back to
+    /// life at 08:00" is not a question the log can answer.
+    #[serde(rename = "wakeup/fired")]
+    WakeupFired(WakeupFiredEvent),
+}
+
+/// What a suspended turn is waiting for.
+///
+/// One vocabulary for four things that look different to a user and identical
+/// to the runtime: an approval, a question, a timer, and a job it started. Each
+/// is "stop here, and come back when X" — differing only in what X is and what
+/// the turn is handed on the way back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum Wakeup {
+    /// A wall-clock instant. `komo wait 2h`, and a routine that checks back.
+    At { at: i64 },
+    /// One gated call's approval — `/approve`, `/deny`, or nobody in time.
+    Approval { call_id: String },
+    /// The user's next message in this conversation.
+    UserReply,
+    /// A background job this turn started (`task/spawned`).
+    TaskDone { task_id: String },
+    /// Something outside komo: a webhook, a message from a particular peer.
+    Event { filter: EventFilter },
+}
+
+impl Wakeup {
+    /// A stable short name for the projection and for operator surfaces.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::At { .. } => "at",
+            Self::Approval { .. } => "approval",
+            Self::UserReply => "user-reply",
+            Self::TaskDone { .. } => "task-done",
+            Self::Event { .. } => "event",
+        }
+    }
+}
+
+/// What an [`Wakeup::Event`] listens for.
+///
+/// Matched against the thing that arrived, never against a name someone typed:
+/// `waiting_on: "张三"` is for a human to read, and a `ChannelPeer` is what an
+/// inbound message can actually be compared with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "on", rename_all = "kebab-case")]
+pub enum EventFilter {
+    /// Any inbound message from this correspondent, on any of komo's channels.
+    FromPeer { platform: String, peer_id: String },
+    /// A named inbound webhook (`POST /api/hooks/{name}`).
+    Webhook { name: String },
+}
+
+/// The turn stopped to wait. `expires_at` is not optional in spirit — every
+/// variant has a default — because a question nobody ever answers must not
+/// leave a turn suspended forever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnSuspendedEvent {
+    pub turn_id: String,
+    pub wakeup: Wakeup,
+    /// One line for the operator: what this turn is waiting for, in words.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+/// Why a suspended turn is being woken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WakeupCause {
+    Approve,
+    Deny,
+    Reply,
+    Time,
+    Event,
+    Task,
+    /// The wait ran out. Not a silent drop: the turn comes back and is told
+    /// nobody answered.
+    Expired,
+    /// The user said something else instead of answering — which is an answer
+    /// about what they want, and takes the pending wait's place.
+    MovedOn,
+}
+
+impl WakeupCause {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Deny => "deny",
+            Self::Reply => "reply",
+            Self::Time => "time",
+            Self::Event => "event",
+            Self::Task => "task",
+            Self::Expired => "expired",
+            Self::MovedOn => "moved-on",
+        }
+    }
+}
+
+/// The wait ended. What the turn is handed on its way back rides in `payload` —
+/// the user's answer, the event that fired, the note that nobody replied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeupFiredEvent {
+    pub turn_id: String,
+    /// The registration this fired, so a wake can be traced back to what
+    /// scheduled it. Empty when nothing was registered (a wait resolved inside
+    /// the process that opened it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wakeup_id: String,
+    pub cause: WakeupCause,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub payload: String,
 }
 
 /// Where a `user/message` came from. A compaction summary enters the surface as
@@ -747,6 +884,9 @@ pub const KNOWN_EVENT_TYPES: &[&str] = &[
     "learning/skipped",
     "approval/requested",
     "approval/resolved",
+    "approval/expired",
+    "turn/suspended",
+    "wakeup/fired",
 ];
 
 /// The ordered conversation surface, folded from a log.

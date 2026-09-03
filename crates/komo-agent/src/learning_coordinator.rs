@@ -528,7 +528,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|r| !r.learned && !matches!(r.status, RunStatus::Running))
+                .filter(|r| !r.learned && r.status.is_terminal())
                 .filter(|r| session_id.is_none_or(|s| r.session_id == s))
                 .take(limit)
                 .cloned()
