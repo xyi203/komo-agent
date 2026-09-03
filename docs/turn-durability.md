@@ -590,7 +590,13 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
    `Delegate` 和两种 sweep 一样退出 backlog，水位事件里的理由是 `delegated turn`。
    post-run 触发本来就不会打到它（子 agent runtime `learns: false`），漏的是
    scheduled sweep——它扫的是全库 `unlearned`，父子两条都在里面。
-2. 等待 `claim_session` 的 ingress 也必须先登记 cancel ownership，Stop 同时覆盖运行中和排队中。
+2. ~~等待 `claim_session` 的 ingress 也必须先登记 cancel ownership~~ —— **已修**：
+   `CancelState` 从「一个 session 一个信号」改成「一个 session 一组登记」，
+   `register` 返回 RAII 的 `CancelTicket`（只退自己那一条），`cancel` 一次翻全部。
+   api 的同步和流式两条路都改成**先登记、再抢 slot**，并把等待和信号 select 在一起：
+   排队时被 Stop 就地返回，不再等前一轮跑完再去跑用户刚叫停的那件事。
+   原来的注释把这件事说得很清楚——「registering while waiting would replace the
+   running turn's and leave it unstoppable」——那是单槽结构逼出来的取舍，不是想要的语义。
 3. ~~consolidator 的关联检索能看到 `Rejected` memory~~ —— **已修**：新增
    `select_related`（= `select_recall` + Rejected），只有 consolidator 用它；注入路径
    仍走 `select_recall`，`dream_verdict` 也只晋升 candidate，所以被拒绝的 claim 能积累

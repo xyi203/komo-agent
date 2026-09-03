@@ -1022,7 +1022,7 @@ mod tests {
     use komo_infra::persistence::db::Db;
     use komo_tools::time::TimeTool;
 
-    use crate::interaction::CancelState;
+    use crate::interaction::{CancelState, CancelTicket};
     use async_trait::async_trait;
     use komo_core::domain::{
         cancel::CANCELLED_ERROR,
@@ -1340,10 +1340,15 @@ mod tests {
     }
 
     /// A `SessionContext` carrying a cancellation signal, plus its trigger.
-    fn cancellable_ctx(session: &str) -> (SessionContext, Arc<CancelState>) {
+    ///
+    /// The ticket is leaked into the returned pair's lifetime by holding it in
+    /// the closure-free way a test can: dropping it would retire the slot, and
+    /// then `cancel` would have nothing to flip.
+    fn cancellable_ctx(session: &str) -> (SessionContext, Arc<CancelState>, CancelTicket) {
         let cancels = Arc::new(CancelState::new());
-        let ctx = SessionContext::detached(session).with_cancel(cancels.register(session));
-        (ctx, cancels)
+        let ticket = cancels.register(session);
+        let ctx = SessionContext::detached(session).with_cancel(ticket.signal());
+        (ctx, cancels, ticket)
     }
 
     #[tokio::test]
@@ -1368,7 +1373,7 @@ mod tests {
             30,
         );
 
-        let (ctx, cancels) = cancellable_ctx("cancel-mid");
+        let (ctx, cancels, _ticket) = cancellable_ctx("cancel-mid");
         let wait_started = started.notified();
         let turn = tokio::spawn(with_session(ctx, async move {
             rt.handle_input("cancel-mid", "长任务".to_string()).await
@@ -1412,7 +1417,7 @@ mod tests {
         // exhausted"), so this also proves the check happens before the round.
         let (rt, _) = scripted_runtime(db.clone(), vec![], vec![], 30);
 
-        let (ctx, cancels) = cancellable_ctx("cancel-early");
+        let (ctx, cancels, _ticket) = cancellable_ctx("cancel-early");
         cancels.cancel("cancel-early");
         let error = with_session(ctx, rt.handle_input("cancel-early", "算了".to_string()))
             .await
@@ -1498,7 +1503,7 @@ mod tests {
         );
         let (rt, _) = scripted_runtime(db.clone(), vec![], vec![], 30);
 
-        let (ctx, cancels) = cancellable_ctx("cancel-pristine");
+        let (ctx, cancels, _ticket) = cancellable_ctx("cancel-pristine");
         cancels.cancel("cancel-pristine");
         let error = with_session(ctx, rt.handle_input("cancel-pristine", "算了".to_string()))
             .await
@@ -1541,21 +1546,46 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_state_reports_whether_a_turn_was_listening() {
-        let cancels = CancelState::new();
+        let cancels = Arc::new(CancelState::new());
         assert!(
             !cancels.cancel("nobody"),
             "no turn in flight → nothing to do"
         );
 
-        let signal = cancels.register("s1");
-        assert!(!signal.is_cancelled());
+        let ticket = cancels.register("s1");
+        assert!(!ticket.is_cancelled());
         assert!(cancels.cancel("s1"));
-        assert!(signal.is_cancelled());
+        assert!(ticket.is_cancelled());
         // Awaiting an already-cancelled signal resolves immediately.
-        signal.cancelled().await;
+        ticket.cancelled().await;
 
-        cancels.finish("s1");
+        drop(ticket);
         assert!(!cancels.cancel("s1"), "finished turns are unreachable");
+    }
+
+    /// Stop is pressed on a *conversation*, so it has to reach the turn running
+    /// and the one queued behind it. With a single slot per session the queued
+    /// caller could not register at all, and it then ran the very work the user
+    /// had just stopped.
+    #[tokio::test]
+    async fn a_stop_reaches_the_queued_turn_as_well_as_the_running_one() {
+        let cancels = Arc::new(CancelState::new());
+        let running = cancels.register("s1");
+        let queued = cancels.register("s1");
+
+        assert!(cancels.cancel("s1"));
+        assert!(running.is_cancelled());
+        assert!(queued.is_cancelled(), "the caller waiting for the slot too");
+
+        // Each registration retires only its own: the running turn finishing
+        // must not make the queued one unstoppable.
+        let still_queued = cancels.register("s1");
+        drop(running);
+        assert!(cancels.cancel("s1"));
+        assert!(still_queued.is_cancelled());
+        drop(queued);
+        drop(still_queued);
+        assert!(!cancels.cancel("s1"), "and the last one out clears the map");
     }
 
     #[tokio::test]

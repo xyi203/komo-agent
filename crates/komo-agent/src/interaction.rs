@@ -23,6 +23,7 @@ use komo_services::clarify::ClarifyState;
 use komo_services::tool_execution::{SessionContext, SessionOrigin, current_session, with_session};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -97,9 +98,19 @@ impl PendingApproval {
 /// A `watch` channel rather than a `oneshot`: the signal is cloned into the turn
 /// context and may be observed from several await points, and a cancel arriving
 /// for a session with no turn in flight is simply a no-op.
+///
+/// **A session holds every registration, not one.** Only one turn *runs* per
+/// session, but a second ingress can be parked in
+/// [`claim_session`](GatewayDispatcher::claim_session) waiting for the slot, and
+/// that caller has to be stoppable too: with one slot per session it could not
+/// register without clobbering the running turn's signal, so Stop reached the
+/// turn in flight and the queued one then ran the very work the user had just
+/// stopped. `cancel` flips them all — what the user pressed Stop on is *this
+/// conversation*, not one of the turns in it.
 #[derive(Default)]
 pub struct CancelState {
-    pending: Mutex<HashMap<String, watch::Sender<bool>>>,
+    pending: Mutex<HashMap<String, Vec<(u64, watch::Sender<bool>)>>>,
+    next_token: AtomicU64,
 }
 
 impl CancelState {
@@ -107,28 +118,90 @@ impl CancelState {
         Self::default()
     }
 
-    /// Open a cancellation slot for a turn about to start, returning the signal
-    /// to hang on its context. Replaces any stale slot for the session (one turn
-    /// at a time per session).
-    pub fn register(&self, session: &str) -> Arc<dyn CancelSignal> {
+    /// Open a cancellation slot, returning the ticket that owns it. The ticket
+    /// retires its own slot when dropped — and only its own, so a queued
+    /// caller's registration cannot take the running turn's away.
+    ///
+    /// Registered *before* the session slot is claimed, not after: the wait for
+    /// the slot is unbounded, and a caller that cannot be stopped while waiting
+    /// is a caller Stop does not reach.
+    pub fn register(self: &Arc<Self>, session: &str) -> CancelTicket {
         let (tx, rx) = watch::channel(false);
-        self.pending.lock().unwrap().insert(session.to_string(), tx);
-        Arc::new(WatchCancel { rx })
-    }
-
-    /// Request cancellation. `false` when nothing is registered for the session
-    /// — no turn in flight, or it already finished.
-    pub fn cancel(&self, session: &str) -> bool {
-        match self.pending.lock().unwrap().get(session) {
-            Some(tx) => tx.send(true).is_ok(),
-            None => false,
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        self.pending
+            .lock()
+            .unwrap()
+            .entry(session.to_string())
+            .or_default()
+            .push((token, tx));
+        CancelTicket {
+            state: self.clone(),
+            session: session.to_string(),
+            token,
+            signal: Arc::new(WatchCancel { rx }),
         }
     }
 
-    /// Drop the slot once the turn is over, so a later cancel can't hit a
-    /// finished turn's signal.
-    pub fn finish(&self, session: &str) {
-        self.pending.lock().unwrap().remove(session);
+    /// Request cancellation of everything registered for the session: the turn
+    /// in flight and anything queued behind it. `false` when nothing is
+    /// registered — no turn, or it already finished.
+    pub fn cancel(&self, session: &str) -> bool {
+        let pending = self.pending.lock().unwrap();
+        let Some(slots) = pending.get(session) else {
+            return false;
+        };
+        // `is_ok()` per slot: a receiver already dropped is a turn already gone,
+        // and answering `true` because one of the others took it is right.
+        slots
+            .iter()
+            .fold(false, |any, (_, tx)| tx.send(true).is_ok() || any)
+    }
+
+    fn retire(&self, session: &str, token: u64) {
+        let mut pending = self.pending.lock().unwrap();
+        let Some(slots) = pending.get_mut(session) else {
+            return;
+        };
+        slots.retain(|(held, _)| *held != token);
+        if slots.is_empty() {
+            pending.remove(session);
+        }
+    }
+}
+
+/// One registration in [`CancelState`], retired when dropped.
+///
+/// RAII because the two things it must survive are the two ways a turn ends
+/// early: an error path that returns before any cleanup line, and a cancel that
+/// unwinds out of the middle of the turn.
+pub struct CancelTicket {
+    state: Arc<CancelState>,
+    session: String,
+    token: u64,
+    signal: Arc<dyn CancelSignal>,
+}
+
+impl CancelTicket {
+    /// The signal to hang on the turn's [`SessionContext`].
+    pub fn signal(&self) -> Arc<dyn CancelSignal> {
+        self.signal.clone()
+    }
+
+    /// Whether this registration has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.signal.is_cancelled()
+    }
+
+    /// Resolves when this registration is cancelled — what a caller waiting for
+    /// the session slot races its wait against.
+    pub async fn cancelled(&self) {
+        self.signal.cancelled().await
+    }
+}
+
+impl Drop for CancelTicket {
+    fn drop(&mut self) {
+        self.state.retire(&self.session, self.token);
     }
 }
 
@@ -1630,6 +1703,46 @@ mod tests {
             .expect("the slot must be handed over once the first turn releases")
             .expect("the waiting task must not panic");
         second.release();
+    }
+
+    /// Stop is pressed on a conversation, so it has to reach the caller *queued*
+    /// for the session as well as the one holding it — and that caller should
+    /// give up its wait rather than run, once the turn it was queued behind
+    /// finishes, the very work the user just stopped.
+    #[tokio::test]
+    async fn a_caller_queued_for_the_session_gives_up_when_it_is_cancelled() {
+        let (entered_tx, _entered_rx) = mpsc::unbounded_channel();
+        let dispatcher = dispatcher_with(Arc::new(GateHandler {
+            entered: entered_tx,
+            permits: Arc::new(Semaphore::new(0)),
+        }));
+        let cancels = Arc::new(CancelState::new());
+
+        let running = dispatcher.claim_session("s1").await;
+        // The api ingress's shape: register, then race the wait for the slot
+        // against the signal.
+        let ticket = cancels.register("s1");
+        let queued = {
+            let dispatcher = dispatcher.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _claim = dispatcher.claim_session("s1") => "ran",
+                    () = ticket.cancelled() => "stopped",
+                }
+            })
+        };
+        // Parked, not running.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(cancels.cancel("s1"), "the session has listeners");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), queued)
+                .await
+                .expect("a cancelled waiter must not keep waiting")
+                .unwrap(),
+            "stopped"
+        );
+        running.release();
     }
 
     // The other direction of the same invariant: a chat message that arrives

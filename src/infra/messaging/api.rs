@@ -665,20 +665,30 @@ async fn chat_completions(
         // session — a chat channel's or another HTTP caller's — so this turn
         // reads a history that already holds the previous answer instead of
         // starting the same work over.
-        let claim = state.dispatcher.claim_session(&session_id).await;
         // Every api turn is interruptible: the caller holds the connection, so
         // it is the one surface with somewhere to put a stop button. Registered
-        // only now that the slot is ours — the cancel map holds one signal per
-        // session, so registering while waiting would replace the running
-        // turn's and leave it unstoppable. Dropped when the turn ends so a late
-        // cancel can't hit the next turn's signal.
-        let ctx = ctx.with_cancel(state.cancels.register(&session_id));
-        let reply = with_session(ctx, state.handler.handle(&session_id, input)).await;
-        state.cancels.finish(&session_id);
-        claim.release();
-        let reply = match reply {
-            Err(error) if is_cancelled(&error) => CANCELLED_REPLY.to_string(),
-            other => other?,
+        // **before** the slot is claimed — the wait for it is unbounded, and a
+        // caller Stop cannot reach while it waits is one that then runs the very
+        // work the user stopped. Retired when the ticket drops.
+        let ticket = state.cancels.register(&session_id);
+        let ctx = ctx.with_cancel(ticket.signal());
+        let claim = tokio::select! {
+            claim = state.dispatcher.claim_session(&session_id) => Some(claim),
+            // Stopped while queued: answer now rather than wait out a turn whose
+            // successor the caller no longer wants.
+            () = ticket.cancelled() => None,
+        };
+        let reply = match claim {
+            Some(claim) => {
+                let reply = with_session(ctx, state.handler.handle(&session_id, input)).await;
+                drop(ticket);
+                claim.release();
+                match reply {
+                    Err(error) if is_cancelled(&error) => CANCELLED_REPLY.to_string(),
+                    other => other?,
+                }
+            }
+            None => CANCELLED_REPLY.to_string(),
         };
         Ok(Json(json!({
             "id": id,
@@ -962,10 +972,21 @@ fn stream_turn(
         // starts at once: a caller queued behind a long turn sees keepalives
         // and a live connection instead of a stalled request. See
         // `GatewayDispatcher::claim_session` for why the wait exists at all.
-        let claim = dispatcher.claim_session(&session_id).await;
-        let ctx = ctx.with_cancel(cancels.register(&session_id));
+        // Registered before the claim, for the same reason as the synchronous
+        // path: a caller queued behind a long turn is a caller Stop has to
+        // reach.
+        let ticket = cancels.register(&session_id);
+        let ctx = ctx.with_cancel(ticket.signal());
+        let claim = tokio::select! {
+            claim = dispatcher.claim_session(&session_id) => Some(claim),
+            () = ticket.cancelled() => None,
+        };
+        let Some(claim) = claim else {
+            let _ = tx.send(SseMsg::Final(CANCELLED_REPLY.to_string()));
+            return;
+        };
         let outcome = with_session(ctx, handler.handle(&session_id, input)).await;
-        cancels.finish(&session_id);
+        drop(ticket);
         claim.release();
         let final_msg = match outcome {
             Ok(text) => text,

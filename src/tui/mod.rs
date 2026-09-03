@@ -717,6 +717,10 @@ fn spawn_turn(
     let session_id = session_id.to_string();
     let turn_tx = turn_tx.clone();
     let events = event_tx.clone();
+    // One registration per local turn, retired when the turn's task ends —
+    // taken only where the context is, so an Esc still reports "nothing to
+    // stop" on a backend that has no interruptible turn.
+    let ticket = clarify.as_ref().map(|_| cancels.register(&session_id));
     let ctx = clarify.as_ref().map(|cl| {
         cl.begin_turn(&session_id);
         SessionContext {
@@ -730,13 +734,12 @@ fn spawn_turn(
             event_sink: Some(Arc::new(TuiEventSink { tx: events.clone() })),
             // Esc stops the turn: the loop flips this signal and the agent
             // loop gives up at its next await.
-            cancel: Some(cancels.register(&session_id)),
+            cancel: ticket.as_ref().map(|ticket| ticket.signal()),
             interject: None,
             channel: None,
             origin: SessionOrigin::User,
         }
     });
-    let turn_cancels = cancels.clone();
     tokio::spawn(async move {
         let result = match backend.turn(&session_id, text, ctx, events).await {
             Ok(reply) => Ok(reply),
@@ -747,8 +750,8 @@ fn spawn_turn(
             Err(error) if is_cancelled(&error) => Ok(CANCELLED_REPLY.to_string()),
             Err(error) => Err(format!("{error:#}")),
         };
-        // Drop the slot so a later Esc can't hit a finished turn.
-        turn_cancels.finish(&session_id);
+        // Retire the slot so a later Esc can't hit a finished turn.
+        drop(ticket);
         let _ = turn_tx.send(result);
     });
 }

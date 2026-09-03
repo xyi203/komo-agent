@@ -150,8 +150,14 @@ fork — add new operator actions there, not in the CLI or api handlers.
   flight. A chat channel queues; an HTTP caller waits, because it is owed its
   own reply. The wait is unbounded on purpose: refusing the message at a
   deadline throws away what the user typed.
-- Cancel: `POST /api/interactions/{session}/cancel` flips the session's
-  `CancelSignal`; `run_agent_loop` races every await against it. A running tool
+- Cancel: `POST /api/interactions/{session}/cancel` flips **every** signal
+  registered for the session; `run_agent_loop` races every await against it. A
+  session holds a *set* of registrations (`CancelState::register` hands back an
+  RAII `CancelTicket` that retires only its own), because Stop is pressed on a
+  conversation, not on one of the turns in it: an ingress parked in
+  `claim_session` registers before it waits and races the wait against its own
+  signal, so a stopped caller gives up instead of running, once the turn ahead
+  of it finishes, the work the user just stopped. A running tool
   stops only if it claims `ToolContext::cancelled()` (shell kills its process
   group; web_fetch/web_search drop the request; fs tools deliberately run to
   completion so `apply_patch` never half-applies). Cancelled runs are Failed,
