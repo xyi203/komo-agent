@@ -12,6 +12,7 @@
 //! `AgentRuntime`.
 
 pub mod auto_reviewer;
+pub mod compaction;
 pub mod daemon;
 pub mod delegate;
 pub mod feedback;

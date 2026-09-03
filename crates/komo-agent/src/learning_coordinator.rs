@@ -763,6 +763,13 @@ mod tests {
 
     #[async_trait]
     impl SessionEventRepository for FakeEvents {
+        async fn surface(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<komo_core::domain::session_event::SurfaceProjection>> {
+            Ok(None)
+        }
+
         async fn append(
             &self,
             _session_id: &str,

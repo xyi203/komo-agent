@@ -11,6 +11,7 @@
 //! see it, and this module materializes the four executors from that one
 //! registry — so a runtime's tool set can never drift from the roster.
 
+use komo_agent::compaction::Compactor;
 use komo_agent::delegate::DelegateTool;
 use komo_agent::learning_coordinator::LearningCoordinator;
 use komo_agent::llm::{PreambleFn, build_llm};
@@ -108,6 +109,10 @@ struct CapabilityProfile {
     /// continued. True only for conversations: an aux turn is re-dispatched
     /// whole, so a journal for one would only ever be written and deleted.
     resumable: bool,
+    /// Summarises its oldest messages once the window starts dropping them.
+    /// True only for conversations, which are the only sessions that outlive
+    /// their window: a sweep or a delegation opens, answers and is done.
+    compacts: bool,
     /// Keeps the pre-image of every file its turns change, so
     /// `komo run rollback` can undo one. On wherever the runtime can write:
     /// a delegation and a cron job produce final file state exactly like a
@@ -120,6 +125,9 @@ struct CapabilityProfile {
 struct RuntimeParts<'a> {
     db: Arc<Db>,
     registry: &'a plugins::ToolRegistry,
+    /// Shared by every runtime that compacts — the aux model summarising, over
+    /// the same window the history read uses.
+    compactor: Arc<Compactor>,
     /// Mirrors the LLM's own history window, so a turn loads exactly what the
     /// model will replay and no long transcript is read in full.
     history_window: usize,
@@ -143,6 +151,7 @@ impl RuntimeParts<'_> {
             max_turns: profile.max_turns,
             history_window: self.history_window,
             learning: profile.learns.then(|| self.learning.clone()),
+            compaction: profile.compacts.then(|| self.compactor.clone()),
             checkpoint: profile
                 .checkpoints
                 .then(|| self.checkpoint.clone())
@@ -590,6 +599,13 @@ pub async fn build(
         registry: &registry,
         history_window: model_config.max_history_messages,
         learning: review.clone(),
+        // The window is the trigger: what a conversation loses to it is exactly
+        // what a summary is for.
+        compactor: Arc::new(Compactor::new(
+            aux_llm.clone(),
+            db.clone(),
+            model_config.max_history_messages,
+        )),
         checkpoint,
     };
 
@@ -600,6 +616,7 @@ pub async fn build(
         max_turns: model_config.max_turns,
         learns: false,
         resumable: false,
+        compacts: false,
         checkpoints: true,
     }));
     let delegate = Arc::new(DelegateTool::new(
@@ -661,6 +678,7 @@ pub async fn build(
         max_turns: model_config.max_turns,
         learns: true,
         resumable: true,
+        compacts: true,
         checkpoints: true,
     });
 
@@ -712,6 +730,7 @@ pub async fn build(
         max_turns: model_config.max_turns,
         learns: false,
         resumable: false,
+        compacts: false,
         checkpoints: true,
     }));
 
@@ -754,6 +773,7 @@ pub async fn build(
         max_turns: BRIEFING_MAX_TURNS,
         learns: false,
         resumable: false,
+        compacts: false,
         checkpoints: false,
     }));
 

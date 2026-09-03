@@ -553,12 +553,33 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
 
 #### 3.2 `surfaceOp` + compaction
 
-- 给 user/final-assistant event 加 surface 声明并实现严格 replacement 验证；tool settle 只进入
-  turn continuation 和 run ledger，不直接进入长期 conversation surface。
-- 摘要生成后追加 replacement event，不改写旧事件。
-- 后续消息和第二次 compaction 必须能继续在当前 surface 上工作。
-- **验证**：完整 fold 与 checkpoint + tail fold 一致；未被 retention truncate 的 human transcript
-  保留被遮住内容；模型只见摘要。
+**已完成**。`surfaceOp` + 严格 replacement 验证是第一批就有的（tool settle 从来
+不进 surface）；这次补上的是产生方：`komo-agent::compaction::Compactor`。
+
+- **触发就是那个窗口**：surface 节点数超过 `max_history_messages`，说明最老的那些
+  消息模型已经看不见了——原来是静默丢失，现在换成一条摘要。窗口为 0（不截断）
+  时永远不压缩，因为没有东西在丢。
+- 摘要是一条 `user/message` + `surfaceOp: replace`，追加，不改写；被遮住的事件
+  还在日志里，human transcript 照样看得到。
+- 三条约束，各有一个测试：
+  1. **切点必须让 surface 继续交替**——摘要是 user 消息，后面必须跟 assistant
+     消息，否则就是 provider 明确拒绝的连续两条 user。
+  2. **摘要 + 保留的尾巴必须装得进窗口**，否则同一个窗口会把摘要本身也丢掉，
+     模型什么都没多得到，白花一次调用。
+  3. **replacement 在写之前先在 surface 的副本上验一遍**。fold 是 fail-closed 的：
+     引用了已经不在 surface 上的节点，不是丢一条摘要，是这个 session 之后每一次读
+     都报错。模型调用前后各 plan 一次，用后一次的结果写。
+- 跑在 turn settle 里、在 turn boundary 之前，所以 checkpoint 一写就已经带上摘要；
+  也因此天然在这一轮的 session slot 内，两个 compaction 不会对着同一份 surface 规划。
+- 任何一步失败都等于「这轮不压缩」：模型报错、超时、surface 变了——窗口照旧截断，
+  也就是压缩之前的行为。
+- 接线走 `CapabilityProfile::compacts`，只有对话有；sweep 和 delegate 的会话活不过
+  自己的窗口。
+- **验证**：`a_conversation_past_its_window_is_compacted_into_a_summary` 端到端跑五轮
+  真实 turn，断言窗口读到的第一条就是摘要、`question 0` 不再重放、历史仍然交替、
+  日志里仍然留着被遮住的原文、只发生一次 compaction；
+  `a_checkpoint_plus_its_tail_is_the_whole_log`（3.1）本来就在每个切点上覆盖了
+  replace，完整 fold 与 checkpoint + tail fold 一致这条由它保证。
 
 ### 第四批 · 相邻正确性问题
 

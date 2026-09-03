@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use super::{
     message::Message,
     session::{ChannelPeer, Session},
-    session_event::{SessionEvent, SessionEventKind},
+    session_event::{SessionEvent, SessionEventKind, SurfaceProjection},
     skill::Skill,
 };
 
@@ -131,6 +131,16 @@ pub trait SessionEventRepository: Send + Sync {
     /// grows for as long as the session lives. A caller that needs the *whole*
     /// log — a rebuild, a retention floor — asks for it.
     async fn events_from(&self, session_id: &str, seq: u64) -> anyhow::Result<Vec<SessionEvent>>;
+
+    /// The session's folded conversation surface — the nodes a later turn
+    /// replays, each with the seq a replacement has to cite. `None` for a
+    /// session with no log.
+    ///
+    /// The messages alone cannot carry a compaction: a summary shadows a range
+    /// of the surface by seq, and a `Message` has no seq. This is the read a
+    /// compactor works from, and the same projection the windowed read is
+    /// served out of.
+    async fn surface(&self, session_id: &str) -> anyhow::Result<Option<SurfaceProjection>>;
 
     /// A completed turn just became durable — a safe point for the log to do its
     /// own upkeep.

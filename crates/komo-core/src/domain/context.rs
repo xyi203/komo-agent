@@ -578,6 +578,13 @@ mod approval_gate_tests {
 
     #[async_trait::async_trait]
     impl SessionEventRepository for Recording {
+        async fn surface(
+            &self,
+            _s: &str,
+        ) -> anyhow::Result<Option<crate::domain::session_event::SurfaceProjection>> {
+            Ok(None)
+        }
+
         async fn append(
             &self,
             _s: &str,

@@ -25,7 +25,9 @@ use komo_core::domain::{
     run::{INTERRUPTED_ERROR, MemoryUse, Run, RunRepository, RunStatus, RunStep, parse_run_status},
     run_projection::{ProjectedRun, RunProjectionStore, project_runs},
     session::{ChannelPeer, Session},
-    session_event::{SESSION_EVENT_VERSION, SessionEvent, SessionEventKind, SessionHeader},
+    session_event::{
+        SESSION_EVENT_VERSION, SessionEvent, SessionEventKind, SessionHeader, SurfaceProjection,
+    },
     skill::Skill,
     todo::{SessionTodoRepository, TodoItem},
 };
@@ -750,6 +752,10 @@ impl SessionEventRepository for Db {
 
     async fn events_from(&self, session_id: &str, seq: u64) -> anyhow::Result<Vec<SessionEvent>> {
         Ok(self.events.events_from(session_id, seq).await?)
+    }
+
+    async fn surface(&self, session_id: &str) -> anyhow::Result<Option<SurfaceProjection>> {
+        Ok(self.events.surface(session_id).await?)
     }
 
     async fn turn_boundary(&self, session_id: &str) -> anyhow::Result<bool> {

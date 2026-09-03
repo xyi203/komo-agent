@@ -1,3 +1,4 @@
+use crate::compaction::Compactor;
 use crate::learning_coordinator::{LearningCoordinator, LearningTrigger};
 use komo_core::domain::{
     cancel::{CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
@@ -89,6 +90,10 @@ pub struct AgentRuntime {
     /// Post-run learning goes through the shared coordinator (also driven by the
     /// gateway's scheduled sweep); `None` = this runtime never learns.
     pub learning: Option<Arc<LearningCoordinator>>,
+    /// Summarises a conversation's oldest messages once the window has started
+    /// dropping them. `None` = this runtime's long sessions keep the plain
+    /// window, and what falls out of it is simply gone.
+    pub compaction: Option<Arc<Compactor>>,
     /// Where a mutating tool leaves the bytes a file held before this turn
     /// touched it, so `komo run rollback` can put them back. `None` = this
     /// runtime's file changes are final.
@@ -612,6 +617,14 @@ impl AgentRuntime {
         let through = events.last().map(|event| event.seq).unwrap_or(0);
         if let Err(error) = self.projection.commit(session_id, &runs, through).await {
             warn!(%error, "failed to project the run ledger (non-fatal)");
+        }
+        // Before the boundary, so the checkpoint written there already holds the
+        // summary — and inside this turn's session slot, which is what keeps two
+        // compactions from planning against the same surface.
+        if let Some(compaction) = &self.compaction
+            && let Some(turn) = runs.last().map(|projected| projected.run.id.clone())
+        {
+            compaction.compact_if_long(session_id, &turn).await;
         }
         match self.events.turn_boundary(session_id).await {
             // Only a roll can put the log over its budget, so the cut is
@@ -1293,6 +1306,7 @@ mod tests {
             max_turns,
             history_window: 0,
             learning: None,
+            compaction: None,
             checkpoint: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
@@ -1730,6 +1744,13 @@ mod tests {
 
     #[async_trait]
     impl SessionEventRepository for ReadSpy {
+        async fn surface(
+            &self,
+            session_id: &str,
+        ) -> anyhow::Result<Option<komo_core::domain::session_event::SurfaceProjection>> {
+            self.inner.surface(session_id).await
+        }
+
         async fn append(
             &self,
             session_id: &str,
@@ -1806,6 +1827,13 @@ mod tests {
 
     #[async_trait]
     impl SessionEventRepository for RetentionSpy {
+        async fn surface(
+            &self,
+            session_id: &str,
+        ) -> anyhow::Result<Option<komo_core::domain::session_event::SurfaceProjection>> {
+            self.inner.surface(session_id).await
+        }
+
         async fn append(
             &self,
             session_id: &str,
@@ -1833,6 +1861,103 @@ mod tests {
             self.floors.lock().unwrap().push(keep_from);
             Ok(None)
         }
+    }
+
+    /// A conversation longer than its window keeps what fell out of it, as a
+    /// summary standing where those messages did — and the log still holds
+    /// them, which is what a human transcript reads.
+    #[tokio::test]
+    async fn a_conversation_past_its_window_is_compacted_into_a_summary() {
+        struct FixedAux(&'static str);
+        #[async_trait]
+        impl LlmClient for FixedAux {
+            async fn complete(&self, _session: &Session) -> anyhow::Result<String> {
+                Ok(self.0.to_string())
+            }
+        }
+
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_compaction.db"))
+                .await
+                .unwrap(),
+        );
+        const SUMMARY: &str = "earlier: five questions about the log";
+        // Six: small enough that five exchanges outgrow it, big enough to hold
+        // the summary plus what stays verbatim.
+        const WINDOW: usize = 6;
+        let compactor = Arc::new(crate::compaction::Compactor::new(
+            Arc::new(FixedAux(SUMMARY)),
+            db.clone(),
+            WINDOW,
+        ));
+        // The scripted driver takes its whole script on the first turn, so each
+        // turn gets its own runtime over the same store.
+        for i in 0..5 {
+            let (mut rt, _) = scripted_runtime(
+                db.clone(),
+                vec![Step::Final(format!("answer {i}"))],
+                vec![],
+                30,
+            );
+            rt.compaction = Some(compactor.clone());
+            rt.handle_input("cli:long", format!("question {i}"))
+                .await
+                .unwrap();
+        }
+
+        // What the *model* replays: the window, not the whole surface. The
+        // summary has to be inside it, or compaction bought nothing.
+        let session = SessionRepository::find_windowed(&*db, "cli:long", WINDOW)
+            .await
+            .unwrap()
+            .unwrap();
+        let history: Vec<(Role, String)> = session
+            .messages
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect();
+        assert_eq!(
+            history[0],
+            (Role::User, SUMMARY.to_string()),
+            "the summary stands where the messages it covers did"
+        );
+        assert!(
+            !history.iter().any(|(_, text)| text == "question 0"),
+            "and the model no longer replays them"
+        );
+        assert!(
+            history.iter().any(|(_, text)| text == "answer 4"),
+            "while the newest exchanges stay verbatim"
+        );
+        // The invariant a replacement is easiest to break: a summary is a user
+        // message, so what follows it has to be the assistant's side.
+        for pair in history.windows(2) {
+            assert_ne!(
+                (&pair[0].0, &pair[1].0),
+                (&Role::User, &Role::User),
+                "two user messages in a row: {history:?}"
+            );
+        }
+
+        // Nothing was rewritten: what the summary covers is still in the log.
+        let events = SessionEventRepository::events(&*db, "cli:long")
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::UserMessage(m) if m.content == "question 0"
+            )),
+            "a human transcript still shows what the summary replaced"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::CompactionCompleted { .. }))
+                .count(),
+            1,
+            "one compaction, on the turn that pushed the surface past the window"
+        );
     }
 
     #[tokio::test]
@@ -2062,6 +2187,7 @@ mod tests {
             max_turns: 30,
             history_window: 0,
             learning: None,
+            compaction: None,
             checkpoint: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
@@ -2680,6 +2806,7 @@ mod tests {
             max_turns: 30,
             history_window: 0,
             learning: None,
+            compaction: None,
             checkpoint: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),

@@ -400,6 +400,26 @@ call the same functions, which is what keeps validation from forking.
   work, so learning from both counts one occasion twice. The guard lives in
   `LearningCoordinator` (`learning_exemption`, which also names the reason the
   watermark event records), covering both triggers.
+- `komo-agent`'s `compaction` — the oldest messages of a long conversation,
+  replaced by a summary of them. The trigger *is* the history window: a surface
+  longer than `max_history_messages` is one whose oldest nodes the model has
+  already stopped seeing, and compaction turns that silent loss into a note to
+  its future self. The summary is one `user/message` carrying a
+  `surfaceOp: replace` over the range it shadows — an append like any other, so
+  **nothing is rewritten** and a human transcript still shows what it covered.
+  Three rules keep it safe: the cut lands where the surface still **alternates**
+  (a summary is a user message, so an assistant message has to follow it); the
+  summary plus what stays verbatim has to **fit the window**, or the same window
+  would drop the summary too; and the replacement is **validated against the
+  surface it will land on**, immediately before the append — the fold fails
+  closed, so a replacement citing a node that has left the surface would not
+  lose a summary, it would make every later read of that session an error. It
+  runs at turn settle, inside that turn's session slot (two compactions planning
+  against one surface is the race that check exists for), and every failure
+  means no compaction: the window keeps trimming, which is the behaviour this
+  improves on rather than depends on. Wired per `CapabilityProfile`
+  (`compacts`) — conversations only; a sweep or a delegation never outlives its
+  window.
 - `komo-agent`'s `delegate` — sub-agent as a real agent turn on its own session
   (`Session.origin = delegate`, which is what keeps it out of the session list); inherits the parent's ambient session context (approvals prompt the
   real conversation, cancel propagates); recursion blocked structurally

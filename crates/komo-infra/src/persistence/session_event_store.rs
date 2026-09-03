@@ -102,7 +102,7 @@ impl SessionEventStore {
     /// shape version, from before a retention cut, or one the tail will not
     /// fold onto is dropped and re-folded — the cost of a stale cache is time,
     /// never a history that never happened.
-    async fn surface(&self, session_id: &str) -> Result<Option<SurfaceProjection>> {
+    pub async fn surface(&self, session_id: &str) -> Result<Option<SurfaceProjection>> {
         let Some(log) = self.existing(session_id).await? else {
             return Ok(None);
         };
