@@ -672,6 +672,36 @@ impl SurfacePlacement {
     }
 }
 
+/// Every attempt at one logical turn: `turn_id` plus the ids it was resumed
+/// from, transitively.
+///
+/// A continuation is a new turn in the log, linked back by `resumed_from`, so
+/// A→B→C is three ids for one question. Rebuilding C from C alone loses A's and
+/// B's rounds — safe (it just re-does the work) but not the semantics anyone
+/// wants: one crash would be recoverable and two would not.
+///
+/// Bounded by the number of `turn/started` events, so a `resumed_from` cycle
+/// (which the log's own ordering makes impossible, but nothing here proves)
+/// cannot loop.
+pub fn attempt_chain(events: &[SessionEvent], turn_id: &str) -> std::collections::HashSet<String> {
+    let mut chain = std::collections::HashSet::new();
+    chain.insert(turn_id.to_string());
+    let mut current = turn_id.to_string();
+    loop {
+        let parent = events.iter().find_map(|event| match &event.kind {
+            SessionEventKind::TurnStarted {
+                turn_id,
+                resumed_from: Some(from),
+            } if *turn_id == current => Some(from.clone()),
+            _ => None,
+        });
+        match parent {
+            Some(from) if chain.insert(from.clone()) => current = from,
+            _ => return chain,
+        }
+    }
+}
+
 /// Project the conversation surface into the messages a later turn replays.
 ///
 /// Only the surface is read, so a compaction's `replace` takes effect here with

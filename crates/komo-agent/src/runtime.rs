@@ -1940,6 +1940,89 @@ mod tests {
         assert!(steps[0].ok, "and the call ran: {:?}", steps[0].error);
     }
 
+    /// The headline of the approval rework: the answer arrives after the
+    /// process that asked is gone, and the turn still comes back and acts.
+    ///
+    /// Everything here is a fresh runtime over the same store — which is what a
+    /// gateway restart is.
+    #[tokio::test]
+    async fn an_approval_answered_after_a_restart_resumes_the_turn_and_runs_the_call() {
+        use komo_core::domain::session_event::ApprovalResolvedEvent;
+
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_answered_later.db"))
+                .await
+                .unwrap(),
+        );
+
+        // 1. A turn stops for an approval nobody has answered.
+        let rt = gated_runtime(db.clone(), Arc::new(Suspending));
+        assert!(
+            rt.handle_input("cli:later", "delete it".into())
+                .await
+                .is_err()
+        );
+        drop(rt);
+        let suspended = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+        assert_eq!(suspended.status, RunStatus::Suspended);
+
+        // 2. The answer lands — what `/approve` writes.
+        SessionEventRepository::append(
+            &*db,
+            "cli:later",
+            vec![SessionEventKind::ApprovalResolved(ApprovalResolvedEvent {
+                turn_id: suspended.id.clone(),
+                call_id: "id-gated".into(),
+                call_index: 0,
+                allowed: true,
+                decided_by: "human".into(),
+                reason: String::new(),
+                waited_ms: 90_000,
+            })],
+        )
+        .await
+        .unwrap();
+        SessionEventRepository::durable_flush(&*db, "cli:later")
+            .await
+            .unwrap();
+
+        // 3. A new process picks the turn up. The approver here would deny
+        //    anything it was asked — it must not be asked.
+        let asked = Arc::new(Mutex::new(0usize));
+        let rt = gated_runtime(db.clone(), Arc::new(NeverAsked(asked.clone())));
+        let reply = rt
+            .resume_interrupted(&suspended)
+            .await
+            .unwrap()
+            .expect("a suspended turn ends on the user message, so it is continuable");
+
+        assert_eq!(reply, "done");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            0,
+            "the answer was already on record"
+        );
+
+        // The continuation is its own run, linked back, and it is the one that
+        // ran the call.
+        let runs = RunRepository::list(&*db, 10).await.unwrap();
+        let continuation = runs
+            .iter()
+            .find(|r| r.resumed_from.as_deref() == Some(suspended.id.as_str()))
+            .expect("the continuation links back to the turn it picked up");
+        assert_eq!(continuation.status, RunStatus::Done);
+        let steps = RunRepository::steps(&*db, &continuation.id).await.unwrap();
+        assert_eq!(steps.len(), 1, "the gated call ran exactly once");
+        assert!(steps[0].ok, "{}", steps[0].error);
+        assert!(
+            RunRepository::steps(&*db, &suspended.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "and the suspended attempt still has no step: it never ran the call"
+        );
+    }
+
     /// The turn has to be in the ledger *before* it ends, or a crash leaves
     /// nothing for `run list` to show and nothing for `run resume` to pick up.
     /// The rows are a projection now, and this is the one commit that happens

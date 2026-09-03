@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use komo_agent::daemon::{
     BriefingSweep, CronJobSweep, DreamSweep, Maintenance, MemoryMonitorSweep, ReminderSweep,
-    ReviewSweep, Schedule, TaskSweep, WorkdayGated,
+    ReviewSweep, Schedule, TaskSweep, WakeupWiring, WorkdayGated,
 };
 use komo_agent::gateway::MaintenanceService;
 use komo_infra::workday::HolidayCalendar;
@@ -196,10 +196,14 @@ impl Plugin for CronJobsPlugin {
                 notifier: cx.notifier.clone(),
                 // Agent-mode jobs run on the unattended full-tool cron runtime.
                 runtime: Some(cx.cron_runtime.clone()),
-                // Standing waits ride the same tick (docs/bot-runtime.md §3.3).
-                // `None` until something suspends a turn — nothing writes a
-                // registration yet, so there is nothing here to wake.
-                wakeups: None,
+                // Standing waits ride the same tick (docs/bot-runtime.md §3.3):
+                // one scheduler for routines and for the turns waiting on an
+                // answer.
+                wakeups: Some(WakeupWiring {
+                    registrations: cx.wakeups.registrations.clone(),
+                    events: cx.wakeups.events.clone(),
+                    dispatch: cx.wakeups.dispatch.clone(),
+                }),
             }),
             alert: Some(cx.notifier.clone()),
         });

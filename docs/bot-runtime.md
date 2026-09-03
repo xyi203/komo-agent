@@ -452,9 +452,31 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   无 turn 的登记、认领两次成功一次、按 turn 一起退休）。
   **dispatch 还没有实现者**：`wakeups: None` 挂在 sweep 上，等 5.3 把挂起路径接上来——
   现在还没有任何东西会写登记，所以生产行为一字未变。
-- **5.3 审批改造**：`ChatApprover` / TUI approver / `PolicyApprover` 的等待从 oneshot 改为挂起；
-  `/approve <id>` 跨 session；过期路径。验证：gateway 重启后 `/approve` 仍能恢复并执行；
-  24h 过期后模型收到拒绝；`Risk::Dangerous` 仍 `Once`。
+- **5.3 审批改造** —— **机制半已完成，答案半还没接**。
+  已完成：`Decision::Suspend`（不是拒绝，是「答案还没到」，只存在于审批器↔gate 之间，
+  tool 永远看不到它——顺手把三个 gated tool 的 `match Decision` 改成读 `is_allowed()` +
+  `feedback()`）；gate 记下等待，executor **不结算**那次调用（无 step、无
+  `tool/call-settled`——停下来等的调用没有发生），loop 以 `Suspended` 结束 turn，
+  runtime 写 `turn/suspended` + 登记（带上 job grants）。
+  留在日志里的是 `approval/requested` 没有 `resolved`，正是恢复已有的「问过、没跑」判据，
+  所以答案到达后重新派发是这次调用的第一次也是唯一一次执行；`rebuild_from_events`
+  因此对**卡在 gate 上的调用无条件重放**，不看幂等性——否则一个为审批停下的 `shell`
+  回来会告诉模型「可能执行了也可能没有」，而这正是那道 barrier 要排除的。
+  挂起的 turn **不写 assistant 消息**：它没有回答，而 surface 必须仍以用户消息结尾，
+  续跑才是续跑。retention 的 floor 从 `recoverable` 放宽到 `!is_terminal()`。
+  gate 问之前先读日志，按 `attempt_chain` 整条链找（答案记在**问的那个 turn** 上，
+  现在问的是它的续跑），所以没人会被要求批准同一件事两次。
+  `TurnWaker` 是另一侧：写 `wakeup/fired`、退休这个 turn 手上其他所有等待、抢 session slot、
+  续跑；spawn 出去所以不占 sweep 的 tick。`attempt_chain` 从 llm.rs 搬进
+  `domain::session_event`，rebuild 和 gate 共用一份。
+  验证：`a_turn_waiting_on_an_approval_suspends_rather_than_failing`、
+  `a_gated_call_honours_the_answer_already_in_the_log`、
+  `an_approval_answered_after_a_restart_resumes_the_turn_and_runs_the_call`（**新进程**
+  接手挂起的 turn，审批器一次都没被问，续跑跑了那个调用，挂起的那次尝试始终没有 step）、
+  `waking_a_turn_records_the_cause_and_retires_its_other_waits`。
+  还没接：`ChatApprover` / TUI approver 仍在等 oneshot（还没有人会答 `Suspend`）、
+  `/approve <id>` 跨 session、挂起期间普通消息算放弃（moved-on）、24h 过期把「没等到」
+  告诉模型。`Risk::Dangerous` 仍 `Once`（策略梯子没动）。
 - **5.4 无人值守审批**：cron turn 的 deny-all 改为挂起 + HomeNotifier。验证：一个没有 grants 的
   routine 在 home chat 收到提示，`/approve` 后动作执行，`/deny` 后 routine 以 error 结算。
 - **5.5 `awaiting` 投影**：session 列表与 TUI 显示。验证：挂起/恢复/过期三态各一测。

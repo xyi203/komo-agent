@@ -1,16 +1,24 @@
-use komo_agent::daemon::Schedule;
+use komo_agent::daemon::{Schedule, WakeupWiring};
 use komo_agent::gateway::Gateway;
-use komo_agent::interaction::{ApprovalState, ChatApprover, GatewayDispatcher};
+use komo_agent::interaction::{ApprovalState, ChatApprover, GatewayDispatcher, TurnWaker};
 use komo_infra::persistence::db::Db;
 use std::sync::Arc;
 
 use crate::{
     cli::wiring,
     domain::{
-        approval::Approver, cron::CronJobRepository, gateway::MessageHandler, home::HomeRepository,
-        notify::Notifier, pairing::PairingRepository, repository::SessionEventRepository,
-        repository::SessionRepository, run::RunRepository, task::TaskRepository,
-        todo::SessionTodoRepository, wakeup::WakeupRepository,
+        approval::Approver,
+        cron::CronJobRepository,
+        gateway::MessageHandler,
+        home::HomeRepository,
+        notify::Notifier,
+        pairing::PairingRepository,
+        repository::SessionEventRepository,
+        repository::SessionRepository,
+        run::RunRepository,
+        task::TaskRepository,
+        todo::SessionTodoRepository,
+        wakeup::{WakeupDispatch, WakeupRepository},
     },
     infra::messaging::{
         api::ApiChannel, home_notifier::HomeNotifier, macos_notifier::MacosNotifier,
@@ -144,6 +152,17 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         db.clone(),
     ));
 
+    // Waking a suspended turn: the scheduler fires, this continues the turn.
+    // Built here because it needs the dispatcher (for the session slot) and the
+    // handler (for the continuation) — the two things only the gateway holds.
+    let waker: Arc<dyn WakeupDispatch> = Arc::new(TurnWaker::new(
+        dispatcher.clone(),
+        handler.clone(),
+        db.clone(),
+        db.clone(),
+        db.clone(),
+    ));
+
     // ── Plugin phase 3: scheduled sweeps ─────────────────────────────────────
     let mut sweep_reg = SweepRegistry::default();
     let sweep_cx = SweepCx {
@@ -162,6 +181,11 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         briefing_schedule,
         briefing_expr: briefing_expr.clone(),
         dream_schedule,
+        wakeups: WakeupWiring {
+            registrations: db.clone(),
+            events: db.clone(),
+            dispatch: waker,
+        },
     };
     plugins::run_sweep_phase(&roster, &gate, &mut sweep_reg, &sweep_cx).await?;
 

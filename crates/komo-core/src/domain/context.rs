@@ -501,9 +501,15 @@ impl ApprovalGate {
     /// answer yet": the gate then asks, which is the safe direction.
     async fn resolved_earlier(&self) -> Option<ApprovalResolvedEvent> {
         let events = self.events.events(&self.session_id).await.ok()?;
+        // Across the whole chain of attempts, not just this turn: the answer was
+        // recorded against the turn that *asked*, and the turn asking now is its
+        // continuation. Bounded to the chain rather than matched on `call_id`
+        // alone, so an answer can never leak into an unrelated turn that
+        // happened to reuse a call id.
+        let attempts = crate::domain::session_event::attempt_chain(&events, &self.turn_id);
         events.iter().rev().find_map(|event| match &event.kind {
             SessionEventKind::ApprovalResolved(resolved)
-                if resolved.turn_id == self.turn_id && resolved.call_id == self.call_id =>
+                if attempts.contains(&resolved.turn_id) && resolved.call_id == self.call_id =>
             {
                 Some(resolved.clone())
             }

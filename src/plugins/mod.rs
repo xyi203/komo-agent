@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use komo_agent::daemon::Schedule;
+use komo_agent::daemon::{Schedule, WakeupWiring};
 use komo_agent::gateway::{Channel, MaintenanceService};
 use komo_agent::learning_coordinator::LearningCoordinator;
 use komo_agent::runtime::AgentRuntime;
@@ -519,6 +519,9 @@ pub struct SweepCx<'a> {
     pub briefing_schedule: Option<Schedule>,
     pub briefing_expr: Option<String>,
     pub dream_schedule: Option<Schedule>,
+    /// What the cron sweep needs to fire a standing wait — the registrations,
+    /// the log to check them against, and the waker that continues the turn.
+    pub wakeups: WakeupWiring,
 }
 
 #[derive(Default)]

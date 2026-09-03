@@ -625,36 +625,6 @@ struct RebuiltTurn {
     start: TurnStart,
 }
 
-/// Every attempt at one logical turn: `turn_id` plus the ids it was resumed
-/// from, transitively.
-///
-/// A continuation is a new turn in the log, linked back by `resumed_from`, so
-/// A→B→C is three ids for one question. Rebuilding C from C alone loses A's and
-/// B's rounds — safe (it just re-does the work) but not the semantics anyone
-/// wants: one crash would be recoverable and two would not.
-///
-/// Bounded by the number of `turn/started` events, so a `resumed_from` cycle
-/// (which the log's own ordering makes impossible, but nothing here proves)
-/// cannot loop.
-fn attempt_chain(events: &[SessionEvent], turn_id: &str) -> std::collections::HashSet<String> {
-    let mut chain = std::collections::HashSet::new();
-    chain.insert(turn_id.to_string());
-    let mut current = turn_id.to_string();
-    loop {
-        let parent = events.iter().find_map(|event| match &event.kind {
-            SessionEventKind::TurnStarted {
-                turn_id,
-                resumed_from: Some(from),
-            } if *turn_id == current => Some(from.clone()),
-            _ => None,
-        });
-        match parent {
-            Some(from) if chain.insert(from.clone()) => current = from,
-            _ => return chain,
-        }
-    }
-}
-
 /// Rebuild the state an interrupted turn died with, from its session's events.
 ///
 /// The history is **derived**, not stored: `session.messages` is the
@@ -691,7 +661,7 @@ fn rebuild_from_events(
 
     let mut history: Vec<Turn> = session.messages.iter().flat_map(to_turns).collect();
 
-    let attempts = attempt_chain(events, turn_id);
+    let attempts = komo_core::domain::session_event::attempt_chain(events, turn_id);
 
     // One round's calls: what was dispatched, and what came back.
     struct Round {
@@ -700,11 +670,22 @@ fn rebuild_from_events(
         settled: std::collections::HashMap<String, String>,
     }
     let mut rounds: Vec<Round> = Vec::new();
+    // Calls that reached the approval gate. A durable `approval/requested` with
+    // no settle beside it **proves the tool body never ran** — that is the whole
+    // point of writing it before the wait — so such a call is re-dispatched on
+    // the way back regardless of whether it is idempotent. Without this, a turn
+    // that stopped for approval on a `shell` would come back and tell the model
+    // the command may or may not have landed, which is the one thing the barrier
+    // exists to rule out.
+    let mut gated: std::collections::HashSet<String> = std::collections::HashSet::new();
     for event in events
         .iter()
         .filter(|e| e.turn_id_of_work().is_some_and(|id| attempts.contains(id)))
     {
         match &event.kind {
+            SessionEventKind::ApprovalRequested(approval) => {
+                gated.insert(approval.call_id.clone());
+            }
             SessionEventKind::AssistantRound(round) => rounds.push(Round {
                 id: round.response_id.clone(),
                 blocks: serde_json::from_value(round.blocks.clone())
@@ -762,7 +743,10 @@ fn rebuild_from_events(
                 // after it would not exist — and only an idempotent tool may
                 // simply be run again. Anything else is the model's call to
                 // make, so it gets told.
-                None if n == last && idempotent(&call.name) => {
+                // Never started: either the gate holds it (see `gated`), or it
+                // is the newest round's call and the tool may simply be run
+                // again.
+                None if n == last && (gated.contains(&key) || idempotent(&call.name)) => {
                     rerun.push(call);
                     None
                 }

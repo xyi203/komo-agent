@@ -39,9 +39,12 @@ use komo_core::domain::{
     home::HomeRepository,
     inbox::{InboundOrigin, InboxClaim, InboxRepository},
     pairing::{ApproveOutcome, PairingRepository, PairingStatus},
-    repository::SessionRepository,
+    repository::{SessionEventRepository, SessionRepository},
+    run::RunRepository,
     session::{ChannelPeer, Session},
+    session_event::{SessionEventKind, WakeupCause, WakeupFiredEvent},
     todo::SessionTodoRepository,
+    wakeup::{WakeupDispatch, WakeupRegistration, WakeupRepository},
 };
 
 /// How long an approval prompt waits for a reply before auto-denying.
@@ -623,6 +626,112 @@ pub struct GatewayDispatcher {
     /// One `Notify` for every session rather than one each: a release is rare,
     /// waiters are few, and a spurious wake costs one re-check of a `HashMap`.
     idle: Notify,
+}
+
+/// Waking a suspended turn: the scheduler's side of `turn/suspended`
+/// (docs/bot-runtime.md §4.1).
+///
+/// Everything about the continuation itself is already built — a wake is
+/// `resume_interrupted` on the suspended run, which replays the turn's rounds
+/// and re-dispatches the call that stopped at the gate. What this adds is the
+/// three things that have to happen around it: record *why* the turn came back,
+/// retire the other waits it was holding, and take the session's turn slot so
+/// the continuation does not run beside a live turn.
+pub struct TurnWaker {
+    dispatcher: Arc<GatewayDispatcher>,
+    handler: Arc<dyn MessageHandler>,
+    runs: Arc<dyn RunRepository>,
+    events: Arc<dyn SessionEventRepository>,
+    wakeups: Arc<dyn WakeupRepository>,
+}
+
+impl TurnWaker {
+    pub fn new(
+        dispatcher: Arc<GatewayDispatcher>,
+        handler: Arc<dyn MessageHandler>,
+        runs: Arc<dyn RunRepository>,
+        events: Arc<dyn SessionEventRepository>,
+        wakeups: Arc<dyn WakeupRepository>,
+    ) -> Self {
+        Self {
+            dispatcher,
+            handler,
+            runs,
+            events,
+            wakeups,
+        }
+    }
+}
+
+#[async_trait]
+impl WakeupDispatch for TurnWaker {
+    async fn fire(
+        &self,
+        registration: &WakeupRegistration,
+        cause: WakeupCause,
+    ) -> anyhow::Result<()> {
+        let Some(turn_id) = registration.turn_id.clone() else {
+            // A wake that *starts* a turn is a trigger, not a continuation —
+            // nothing writes one yet (docs/bot-runtime.md §3.3).
+            warn!(id = %registration.id, "a wakeup with no turn to continue is not dispatchable yet");
+            return Ok(());
+        };
+        let Some(run) = self.runs.get(&turn_id).await? else {
+            anyhow::bail!("no run `{turn_id}` to continue");
+        };
+
+        // Why it came back, durably, before it comes back: without this the log
+        // cannot answer "what ended the wait", and a crash mid-continuation
+        // would read as a turn that woke for no reason.
+        self.events
+            .append(
+                &registration.session_id,
+                vec![SessionEventKind::WakeupFired(WakeupFiredEvent {
+                    turn_id: turn_id.clone(),
+                    wakeup_id: registration.id.clone(),
+                    cause,
+                    payload: String::new(),
+                })],
+            )
+            .await?;
+        self.events.durable_flush(&registration.session_id).await?;
+
+        // Everything else this turn was waiting on goes with it: a turn woken
+        // by an approval must not be woken again by the timer that was watching
+        // the same wait.
+        if let Err(error) = self
+            .wakeups
+            .take_for_turn(&registration.session_id, &turn_id)
+            .await
+        {
+            warn!(%error, turn = %turn_id, "failed to retire a woken turn's other waits");
+        }
+
+        // The continuation is a turn like any other: it queues behind whatever
+        // the session is already doing. Spawned so the sweep's tick is not held
+        // for however long the turn takes — the wake itself is already durable.
+        let dispatcher = self.dispatcher.clone();
+        let handler = self.handler.clone();
+        let session_id = registration.session_id.clone();
+        tokio::spawn(async move {
+            let claim = dispatcher.claim_session(&session_id).await;
+            let ctx = SessionContext::detached(&session_id);
+            let outcome = with_session(ctx, handler.resume_interrupted(&run)).await;
+            claim.release();
+            match outcome {
+                Ok(Some(_)) => {
+                    info!(turn = %run.id, cause = cause.as_str(), "continued a woken turn")
+                }
+                // The continuation declined — the transcript already ends in a
+                // reply, or the log has nothing for the turn. Not an error, and
+                // not something to retry: the wait is gone and the turn is
+                // whatever the log says it is.
+                Ok(None) => warn!(turn = %run.id, "a woken turn was not continuable"),
+                Err(error) => warn!(%error, turn = %run.id, "a woken turn failed"),
+            }
+        });
+        Ok(())
+    }
 }
 
 /// How many mid-turn messages a session may queue before further ones are
@@ -1715,6 +1824,130 @@ mod tests {
             .expect("the slot must be handed over once the first turn releases")
             .expect("the waiting task must not panic");
         second.release();
+    }
+
+    /// The waker's own three jobs: record *why* the turn came back, retire the
+    /// other waits it was holding, and hand the run to whoever continues it.
+    #[tokio::test]
+    async fn waking_a_turn_records_the_cause_and_retires_its_other_waits() {
+        use komo_core::domain::run::Run;
+        use komo_core::domain::session_event::Wakeup;
+
+        /// Records the run it was asked to continue.
+        struct RecordingResume(Mutex<Vec<String>>);
+
+        #[async_trait]
+        impl MessageHandler for RecordingResume {
+            async fn handle(&self, _session_id: &str, input: String) -> anyhow::Result<String> {
+                Ok(input)
+            }
+            async fn resume_interrupted(&self, run: &Run) -> anyhow::Result<Option<String>> {
+                self.0.lock().unwrap().push(run.id.clone());
+                Ok(Some("continued".to_string()))
+            }
+        }
+
+        let home = std::env::temp_dir().join("komo-waker-fire");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        let db = Arc::new(
+            komo_infra::persistence::db::Db::connect(&format!(
+                "turso:{}",
+                home.join("komo.db").display()
+            ))
+            .await
+            .unwrap(),
+        );
+
+        // A suspended turn in the ledger, with two waits on it: the approval
+        // and the deadline watching the same wait.
+        let mut run = Run::start("s1", "delete it");
+        run.status = komo_core::domain::run::RunStatus::Suspended;
+        let projected = komo_core::domain::run_projection::ProjectedRun {
+            run: run.clone(),
+            steps: Vec::new(),
+            start_seq: 0,
+        };
+        komo_core::domain::run_projection::RunProjectionStore::commit(
+            db.as_ref(),
+            "s1",
+            &[projected],
+            0,
+        )
+        .await
+        .unwrap();
+        let approval = WakeupRegistration::new(
+            "s1",
+            Wakeup::Approval {
+                call_id: "c1".into(),
+            },
+            1_000,
+        )
+        .continuing(&run.id);
+        let deadline =
+            WakeupRegistration::new("s1", Wakeup::At { at: 2_000 }, 1_000).continuing(&run.id);
+        for registration in [&approval, &deadline] {
+            WakeupRepository::save(db.as_ref(), registration)
+                .await
+                .unwrap();
+        }
+
+        let handler = Arc::new(RecordingResume(Mutex::new(Vec::new())));
+        let (entered_tx, _entered_rx) = mpsc::unbounded_channel();
+        let dispatcher = dispatcher_with(Arc::new(GateHandler {
+            entered: entered_tx,
+            permits: Arc::new(Semaphore::new(0)),
+        }));
+        let waker = TurnWaker::new(
+            dispatcher,
+            handler.clone(),
+            db.clone(),
+            db.clone(),
+            db.clone(),
+        );
+
+        waker
+            .fire(&approval, WakeupCause::Approve)
+            .await
+            .expect("the wake itself must land");
+
+        // Why it came back is on the record, durably.
+        let events = SessionEventRepository::events(db.as_ref(), "s1")
+            .await
+            .unwrap();
+        let fired = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::WakeupFired(fired) => Some(fired),
+                _ => None,
+            })
+            .next()
+            .expect("the log says what ended the wait");
+        assert_eq!(fired.turn_id, run.id);
+        assert_eq!(fired.cause, WakeupCause::Approve);
+        assert_eq!(
+            fired.wakeup_id, approval.id,
+            "traceable to what scheduled it"
+        );
+
+        // Both waits are gone: the deadline must not wake the same turn again.
+        assert!(
+            WakeupRepository::list(db.as_ref())
+                .await
+                .unwrap()
+                .is_empty(),
+            "a woken turn takes every wait it was holding with it"
+        );
+
+        // And the continuation was handed the suspended run. Spawned, so give
+        // it a moment.
+        for _ in 0..200 {
+            if !handler.0.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(*handler.0.lock().unwrap(), vec![run.id.clone()]);
     }
 
     /// Stop is pressed on a conversation, so it has to reach the caller *queued*

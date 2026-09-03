@@ -175,6 +175,24 @@ fork — add new operator actions there, not in the CLI or api handlers.
   group; web_fetch/web_search drop the request; fs tools deliberately run to
   completion so `apply_patch` never half-applies). Cancelled runs are Failed,
   **not** recoverable.
+- **A turn can also stop to wait** (docs/bot-runtime.md §4.1): an approver that
+  answers `Decision::Suspend` — not a denial, the absence of an answer — makes
+  the gate record what the turn is waiting for, the executor leave that call
+  **unsettled** (a call that stopped to wait did not happen), the loop end the
+  turn as `RunStatus::Suspended`, and the runtime append `turn/suspended` plus a
+  `wakeup_records` registration carrying the turn's job grants.
+  `approval/requested` with no `resolved` beside it is already recovery's
+  "asked for, never ran", so the re-dispatch after the answer arrives is the
+  call's first and only run — and `rebuild_from_events` re-dispatches a gated
+  call regardless of idempotency for exactly that reason. A suspended turn
+  appends **no assistant message**: it has not answered, and the surface has to
+  still end on the user message for the continuation to be one (retention's
+  floor widens from `recoverable` to `!is_terminal()` for the same reason). The
+  gate consults the log before asking, across the whole `attempt_chain` — the
+  answer was recorded against the turn that *asked*, and the turn asking now is
+  its continuation — so nobody approves the same action twice. `TurnWaker` is
+  the other side: record `wakeup/fired`, retire every other wait that turn was
+  holding, claim the session slot, continue.
 - api channel is loopback/ephemeral by default; `[channels.api] enabled = true`
   + `API_SERVER_KEY` widens it. `web_dir` serves the built SPA same-origin;
   `remote_interactive = true` lets keyed remote callers run interactive turns
