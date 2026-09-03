@@ -531,6 +531,15 @@ call the same functions, which is what keeps validation from forking.
   only candidates, so a rejected claim can accumulate evidence and still never
   reach a prompt.
   Reviewer extractions are always `candidate`, never pinned/active.
+  **Provenance is a separate axis again** (`MemoryProvenance`: `user` / `tool`,
+  additive column, default `user`). A turn reads pages, files and MCP replies,
+  and a page that says "the user prefers X" is a page saying so — indistinguishable
+  from the user saying it once it is a claim. The extractor labels each one
+  (`said_by`) and anything that is not plainly `user` reads as `tool`; a
+  tool-derived observation may only land as its own candidate (never support,
+  contest or supersede what the user said), never promotes on accumulated
+  support (`dream_verdict` / `is_supported` want an explicit confirmation), and
+  carries `/from-tool` on its injected line.
   **Both read paths share `MemoryQueryService`** — automatic recall and the
   model's own `memory search` build the same hybrid query, so a memory the model
   was handed is a memory it can find again (candidates included). Matching is

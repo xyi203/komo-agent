@@ -204,6 +204,8 @@ fn parse_md(id: &str, text: &str) -> Option<Memory> {
         content: body.trim().to_string(),
         status: status.unwrap_or(default_status),
         confidence: confidence.unwrap_or(default_confidence),
+        // The legacy markdown store predates tool-derived extraction entirely.
+        provenance: komo_core::domain::memory::MemoryProvenance::User,
         importance: importance.unwrap_or(komo_core::domain::memory::DEFAULT_IMPORTANCE),
         pinned,
         scope: MemoryScope::from_parts(&scope_type, &scope_key),

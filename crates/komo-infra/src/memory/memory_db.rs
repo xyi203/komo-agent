@@ -26,7 +26,7 @@ use crate::persistence::{
 };
 use komo_core::domain::memory::{
     Evidence, Memory, MemoryRepository, MemoryScope, parse_belief_state, parse_memory_confidence,
-    parse_memory_kind, parse_memory_status,
+    parse_memory_kind, parse_memory_provenance, parse_memory_status,
 };
 
 // Optional i64 fields use 0 as the "unset" sentinel (same convention as `Db`).
@@ -48,6 +48,10 @@ struct MemoryRecord {
     updated_at: i64,
     expires_at: i64,
     last_used_at: i64,
+    // Who the claim came from: `user` or `tool`. Additive column, defaulting to
+    // `user` — everything written before it existed was extracted from a
+    // conversation.
+    provenance: String,
     // Truth signals — see `Memory`'s own docs for why they are kept apart from
     // `recall_count`.
     belief_state: String,
@@ -238,6 +242,7 @@ fn record_from_memory(memory: &Memory) -> MemoryRecord {
         updated_at: memory.updated_at,
         expires_at: memory.expires_at.unwrap_or(0),
         last_used_at: memory.last_used_at.unwrap_or(0),
+        provenance: memory.provenance.as_str().to_string(),
         belief_state: memory.belief.as_str().to_string(),
         support_count: memory.support_count,
         contradiction_count: memory.contradiction_count,
@@ -268,6 +273,7 @@ fn memory_from_record(record: MemoryRecord) -> Memory {
         expires_at: nonzero(record.expires_at),
         last_used_at: nonzero(record.last_used_at),
         belief: parse_belief_state(&record.belief_state),
+        provenance: parse_memory_provenance(&record.provenance),
         support_count: record.support_count,
         contradiction_count: record.contradiction_count,
         last_confirmed_at: nonzero(record.last_confirmed_at),
@@ -305,6 +311,7 @@ impl MemoryRepository for MemoryDb {
                     .updated_at(r.updated_at)
                     .expires_at(r.expires_at)
                     .last_used_at(r.last_used_at)
+                    .provenance(r.provenance)
                     .belief_state(r.belief_state)
                     .support_count(r.support_count)
                     .contradiction_count(r.contradiction_count)
@@ -334,6 +341,7 @@ impl MemoryRepository for MemoryDb {
                 updated_at: r.updated_at,
                 expires_at: r.expires_at,
                 last_used_at: r.last_used_at,
+                provenance: r.provenance,
                 belief_state: r.belief_state,
                 support_count: r.support_count,
                 contradiction_count: r.contradiction_count,
@@ -386,6 +394,9 @@ async fn ensure_columns(path: &Path) -> anyhow::Result<()> {
             "recall_count",
             "\"recall_count\" integer NOT NULL DEFAULT 0",
         ),
+        // `user` is what every row written before this column meant: they were
+        // all extracted from conversations, never from fetched content.
+        ("provenance", "\"provenance\" text NOT NULL DEFAULT 'user'"),
         // Truth signals. `belief_state` defaults to `current`, which is exactly
         // what every row written before the column existed means.
         (
@@ -493,6 +504,7 @@ mod tests {
                     updated_at: r.updated_at,
                     expires_at: r.expires_at,
                     last_used_at: r.last_used_at,
+                    provenance: r.provenance,
                     belief_state: r.belief_state,
                     support_count: r.support_count,
                     contradiction_count: r.contradiction_count,

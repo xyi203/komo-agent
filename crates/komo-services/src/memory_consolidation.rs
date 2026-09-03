@@ -37,23 +37,29 @@ use std::time::Duration;
 
 use komo_core::domain::llm::LlmClient;
 use komo_core::domain::memory::{
-    EvidenceRelation, Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryRepository,
-    MemoryStatus, ScoredMemory, select_related,
+    EvidenceRelation, Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryProvenance,
+    MemoryRepository, MemoryStatus, ScoredMemory, select_related,
 };
 use komo_core::domain::message::Message;
 use komo_core::domain::session::Session;
 
 use crate::memory_query::MemoryQueryService;
 
-/// One thing the user said, as extracted — a claim plus the words behind it.
+/// One thing the turn established, as extracted — a claim plus the words behind
+/// it, and who those words belong to.
 #[derive(Debug, Clone)]
 pub struct Observation {
     pub kind: MemoryKind,
     /// The claim, written as a durable declarative fact.
     pub content: String,
-    /// What the user actually said, kept as evidence provenance. Falls back to
+    /// What was actually said, kept as evidence provenance. Falls back to
     /// `content` when the extractor gave no quote.
     pub excerpt: String,
+    /// Whether the *user* said it, or a tool returned it. Fail closed: an
+    /// extractor that does not say means [`MemoryProvenance::Tool`], because
+    /// the whole risk here is content nobody in the conversation authored being
+    /// filed as something the user asserted.
+    pub provenance: MemoryProvenance,
 }
 
 /// What consolidating one observation did to the library.
@@ -207,7 +213,16 @@ impl MemoryConsolidator {
             return Ok(Consolidated::Skipped);
         }
 
-        let related = self.related_claims(ctx, observation, library, now).await;
+        // A claim that came out of tool output may be *recorded*, and nothing
+        // more. It must not add support to something the user said, contest it,
+        // or supersede it: a fetched page that disagrees with the user would
+        // otherwise silence the user's own memory, which is the whole attack.
+        // It lands as its own candidate, marked, and only the user confirming it
+        // can promote it (`dream_verdict`).
+        let related = match observation.provenance {
+            MemoryProvenance::Tool => Vec::new(),
+            MemoryProvenance::User => self.related_claims(ctx, observation, library, now).await,
+        };
         let (relation, target) = match related.is_empty() {
             true => (Relation::Unrelated, None),
             false => self.classify(observation, &related).await,
@@ -301,6 +316,7 @@ impl MemoryConsolidator {
         // confirms or discards, never a pinned/active memory.
         memory.status = MemoryStatus::Candidate;
         memory.confidence = MemoryConfidence::Extracted;
+        memory.provenance = observation.provenance;
         memory.scope = ctx.write_scope();
         memory.source = session_id.to_string();
         memory.source_message_id = memory_key(&observation.content);
@@ -577,6 +593,15 @@ mod tests {
             kind: MemoryKind::Preference,
             content: content.to_string(),
             excerpt: format!("user said: {content}"),
+            provenance: MemoryProvenance::User,
+        }
+    }
+
+    /// The same claim, but read out of something a tool returned.
+    fn from_tool(content: &str) -> Observation {
+        Observation {
+            provenance: MemoryProvenance::Tool,
+            ..observation(content)
         }
     }
 
@@ -659,8 +684,52 @@ mod tests {
         );
     }
 
+    /// A page komo read is a page saying something, not the user saying it. It
+    /// may be recorded — and nothing else: it must not add support to what the
+    /// user said, and it must not silence it by contesting it.
+    #[tokio::test]
+    async fn a_claim_a_tool_returned_does_not_touch_what_the_user_said() {
+        let existing = active("mem-1", "user prefers rebase before push");
+        let store = Arc::new(FakeStore::new(vec![existing]));
+        // The classifier would happily call this the same claim; it is never
+        // asked.
+        let c = consolidator(
+            store.clone(),
+            Ok(r#"{"relation":"same","target":"mem-1"}"#.into()),
+        );
+
+        let out = c
+            .consolidate_all(
+                &ctx(),
+                "s-2",
+                vec![from_tool("user rebases rather than merging before a push")],
+            )
+            .await
+            .unwrap();
+
+        let Consolidated::Created { id } = &out[0] else {
+            panic!(
+                "a tool-derived claim lands as its own candidate, got {:?}",
+                out[0]
+            );
+        };
+        let created = store.get(id);
+        assert_eq!(created.provenance, MemoryProvenance::Tool);
+        assert_eq!(
+            store.get("mem-1").support_count,
+            0,
+            "the user's own claim gained nothing from a page agreeing with it"
+        );
+        assert_eq!(
+            store.get("mem-1").belief,
+            komo_core::domain::memory::BeliefState::Current,
+            "and nothing a tool returned may contest it either"
+        );
+    }
+
     /// A restatement in different words adds support instead of a second memory —
-    /// the deduplication the exact-key check could never do.
+    /// the deduplication the exact-key check could never do."""
+
     #[tokio::test]
     async fn a_reworded_restatement_supports_the_existing_claim() {
         let existing = active("mem-1", "user prefers rebase before push");

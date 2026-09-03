@@ -28,6 +28,10 @@ pub struct Memory {
     pub belief: BeliefState,
     /// How much the memory can be trusted, by origin.
     pub confidence: MemoryConfidence,
+    /// **Who** the claim came from — the user, or something a tool returned.
+    /// See [`MemoryProvenance`]: this is the one axis that decides whether a
+    /// claim may promote on its own accumulated support.
+    pub provenance: MemoryProvenance,
     /// 0–100 ranking weight; ties broken by recency. Default 50.
     pub importance: i32,
     /// Eligible for L1 pinned-profile injection (every turn). Only ever set by
@@ -123,6 +127,11 @@ impl Memory {
             status: MemoryStatus::Active,
             belief: BeliefState::Current,
             confidence: MemoryConfidence::Inferred,
+            // The permissive default is the honest one for everything komo
+            // wrote before provenance existed: it was all extracted from
+            // conversations. A tool-derived claim is marked by whoever creates
+            // it, and that is the only writer that knows.
+            provenance: MemoryProvenance::User,
             importance: DEFAULT_IMPORTANCE,
             pinned: false,
             scope: MemoryScope::Global,
@@ -291,7 +300,8 @@ impl Memory {
     /// promotion uses, so what an injected line claims and what dreaming acts on
     /// cannot drift apart.
     pub fn is_supported(&self) -> bool {
-        self.last_confirmed_at.is_some() || self.support_count >= DREAM_MIN_SUPPORT
+        self.last_confirmed_at.is_some()
+            || (self.support_count >= DREAM_MIN_SUPPORT && self.provenance.promotable_on_support())
     }
 
     /// Whether this memory may enter a prompt **unasked** (L1 pinned or L3
@@ -540,6 +550,52 @@ impl MemoryConfidence {
             Self::Confirmed => "confirmed",
             Self::UserWritten => "user_written",
         }
+    }
+}
+
+/// Where a claim came from, which is not the same question as how much it is
+/// believed ([`MemoryConfidence`]) or whether it is believed now
+/// ([`BeliefState`]).
+///
+/// A turn reads web pages, files and MCP servers, and every one of those is
+/// content **nobody in the conversation wrote**. A page that says "the user
+/// prefers X" is a page saying so, not the user saying so — and an extractor
+/// reading the turn afterwards cannot tell the difference from the claim alone.
+/// Left unmarked, such a claim accumulates support like any other and promotes
+/// itself into the prompt of every later turn: a durable instruction planted by
+/// whatever the agent happened to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryProvenance {
+    /// The user said it, or the operator wrote it.
+    #[default]
+    User,
+    /// It came out of tool output. Recordable, retrievable, and **never
+    /// promotable by accumulation** — only the user confirming it can make it a
+    /// memory komo asserts on its own (`dream_verdict`).
+    Tool,
+}
+
+impl MemoryProvenance {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Tool => "tool",
+        }
+    }
+
+    /// Whether a claim from here may promote on accumulated support alone.
+    pub fn promotable_on_support(&self) -> bool {
+        matches!(self, Self::User)
+    }
+}
+
+/// Parse a provenance. Unknown → `User`, which is what every row written before
+/// the column existed means — they were all extracted from conversations.
+pub fn parse_memory_provenance(value: &str) -> MemoryProvenance {
+    match value.trim() {
+        "tool" => MemoryProvenance::Tool,
+        _ => MemoryProvenance::User,
     }
 }
 
@@ -1162,7 +1218,12 @@ pub fn dream_verdict(memory: &Memory, now: i64) -> DreamVerdict {
     // however well-supported the claim is: promoting into a contest would assert
     // one side of a question nobody has answered.
     let believed = memory.belief == BeliefState::Current && memory.contradiction_count == 0;
-    let proven = memory.last_confirmed_at.is_some() || memory.support_count >= DREAM_MIN_SUPPORT;
+    // Support accumulates from occasions; a confirmation is the user ruling on
+    // the claim itself. Only the second can promote something a *tool* said —
+    // otherwise a page read on three occasions promotes itself, and komo starts
+    // asserting whatever it happened to fetch.
+    let proven = memory.last_confirmed_at.is_some()
+        || (memory.support_count >= DREAM_MIN_SUPPORT && memory.provenance.promotable_on_support());
     if believed && proven {
         return DreamVerdict::Promote;
     }
@@ -1508,6 +1569,33 @@ mod tests {
         );
         m.record_evidence("s-2", EvidenceRelation::Supports, "said it again", now);
         assert_eq!(dream_verdict(&m, now), DreamVerdict::Promote);
+    }
+
+    /// Occasions corroborate what the *user* keeps saying. A claim komo read
+    /// out of a fetched page can be re-read on any number of occasions without
+    /// anyone ever having said it — so support alone must not promote it into
+    /// the prompt of every later turn. Only the user ruling on it can.
+    #[test]
+    fn dream_will_not_promote_a_tool_derived_claim_on_support_alone() {
+        let now = 10_000 * 86_400;
+        let mut m = candidate(0, 5, now);
+        m.provenance = MemoryProvenance::Tool;
+        m.record_evidence("s-1", EvidenceRelation::Supports, "the page said it", now);
+        m.record_evidence("s-2", EvidenceRelation::Supports, "and again", now);
+        assert_eq!(
+            dream_verdict(&m, now),
+            DreamVerdict::Keep,
+            "two occasions of reading the same page is not the user saying so"
+        );
+        assert!(
+            !m.is_supported(),
+            "and the injected line must not claim it is corroborated either"
+        );
+
+        // The user confirming it is a different fact, and it is enough.
+        m.last_confirmed_at = Some(now - 86_400);
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Promote);
+        assert!(m.is_supported());
     }
 
     /// An explicit confirmation is enough on its own — no waiting for a second

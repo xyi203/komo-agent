@@ -614,7 +614,16 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
    fold 按 call_id 把 `approval/resolved` 挂到它那次调用上（审批是在调用还开着的时候
    结算的，靠相邻位置匹配不到），`komo run inspect` 打一行
    `allowed by human after 4.2s`。没被 gate 的调用什么都不打——绝大多数调用都是这样。
-5. memory observation 增加 provenance class，防止 untrusted tool content 被当成用户事实晋升。
+5. ~~memory observation 增加 provenance class~~ —— **已完成**：`Observation` 和
+   `Memory` 各加一个 `provenance`（`user` / `tool`，memory.db 增量列，默认 `user`——
+   在这之前写的每一条都是从对话里抽的）。抽取时模型逐条报 `said_by`，**fail closed**：
+   没说、说别的，一律算 `tool`；因为这条字段决定的是「这个说法能不能自己晋升进以后
+   每一轮的 prompt」，没说清就等于没确立。
+   规则两条：`tool` 的观察只能落成自己的 candidate——不给用户说过的话加 support、
+   不 contest、不 supersede（否则抓来的一个页面就能把用户自己的记忆压成 contested，
+   这正是要防的那件事）；`dream_verdict` 和 `is_supported` 只认「用户明确确认」，
+   support 累积对 `tool` 无效。注入侧那行多一个 `/from-tool` 标记——措辞上分不出来的
+   两件事，得写出来。
 6. ~~**二次 resume 会丢掉第一次续跑之前的轮次**~~ —— **已修**，取的是第一种修法：
    `rebuild_from_events` 自己沿 `turn/started{resumed_from}` 走出整条链
    （`attempt_chain`），按 id 集合过滤事件；A→B→C 里 C 现在按 seq 顺序重放 A 和 B

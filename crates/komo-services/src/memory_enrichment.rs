@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use komo_core::domain::llm::LlmClient;
 use komo_core::domain::memory::{
-    Memory, MemoryContext, MemoryRepository, ScoredMemory, select_pinned, select_recall,
+    Memory, MemoryContext, MemoryProvenance, MemoryRepository, ScoredMemory, select_pinned,
+    select_recall,
 };
 use komo_core::domain::message::{Message, Role};
 use komo_core::domain::run::RecalledMemories;
@@ -484,6 +485,12 @@ fn belief_markers(memory: &Memory, now: i64) -> String {
     let mut markers = String::new();
     if memory.is_supported() {
         markers.push_str("/supported");
+    }
+    // Where the claim came from, when it is not the user. A line that reads
+    // like something they said, but came out of a page komo fetched, is the one
+    // case the model cannot tell apart on wording alone.
+    if memory.provenance == MemoryProvenance::Tool {
+        markers.push_str("/from-tool");
     }
     if memory.is_stale(now) {
         let days = (now - memory.vouched_at()).max(0) / 86_400;
@@ -966,6 +973,17 @@ mod tests {
     /// A fact and how much to trust it are different things, and an injected
     /// line has to carry both.
     #[test]
+    /// A claim that came out of a fetched page reads exactly like one the user
+    /// made — so the line has to say which it is.
+    #[test]
+    fn recall_block_marks_a_tool_derived_memory_as_one() {
+        let now = 10_000 * 86_400;
+        let mut hit = scored("the docs say komo prefers tabs", 2.0);
+        hit.memory.provenance = MemoryProvenance::Tool;
+        let block = render_recalled_memory_block(&[hit], now).unwrap();
+        assert!(block.contains("/from-tool"), "{block}");
+    }
+
     fn recall_block_marks_supported_and_stale_memories() {
         let now = now();
         // Corroborated on two independent occasions.
