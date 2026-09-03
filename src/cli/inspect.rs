@@ -450,6 +450,18 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
                 println!("      {label} {line}");
             }
         }
+        // Which rung let a gated call happen, and how long it waited to be
+        // answered. Empty for the great majority of calls, which are never
+        // gated — so this line appears exactly where "why was this allowed?" is
+        // a question someone might ask.
+        if !s.approved_by.is_empty() {
+            let waited = if s.approval_waited_ms > 0 {
+                format!(" after {}", fmt_elapsed(s.approval_waited_ms))
+            } else {
+                String::new()
+            };
+            println!("      allowed by {}{waited}", s.approved_by);
+        }
         // Where the elided middle went, for a result too large to hand the model
         // whole — this is the way back to what the preview cut.
         for path in &s.output_paths {

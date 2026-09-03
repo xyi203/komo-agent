@@ -15,8 +15,11 @@ use async_trait::async_trait;
 use tracing::info;
 
 use komo_core::domain::{
-    approval::{ApprovalRequest, Approver, Decision, Risk},
-    policy::{Policy, Rule, Verdict},
+    approval::{
+        ApprovalRequest, Approver, DECIDED_BY_CONFIG_ALLOW, DECIDED_BY_CONFIG_DENY,
+        DECIDED_BY_DEFAULT, DECIDED_BY_JOB_GRANT, DECIDED_BY_SAVED_GRANT, Decision, Risk,
+    },
+    policy::{Policy, Rule, RuleSource, Verdict},
 };
 use komo_infra::permissions_store::PermissionsStore;
 use komo_services::tool_execution::{current_job_grants, current_session};
@@ -85,6 +88,13 @@ impl PolicyApprover {
 #[async_trait]
 impl Approver for PolicyApprover {
     async fn decide(&self, request: &ApprovalRequest) -> Decision {
+        self.decide_reported(request).await.0
+    }
+
+    /// The ladder, and which rung of it answered. One implementation for both
+    /// entry points: a rung that decides differently depending on who asked is
+    /// a rung the audit record cannot describe.
+    async fn decide_reported(&self, request: &ApprovalRequest) -> (Decision, &'static str) {
         // An unattended turn (cron / briefing) is evaluated channel-lessly even
         // though it *has* a session: `SessionOrigin` is what says nobody is
         // watching, and only that makes the engine's unattended branch run —
@@ -105,9 +115,9 @@ impl Approver for PolicyApprover {
             if decision.verdict == Verdict::Deny {
                 info!(summary = %request.summary, channel = ?channel, rule = ?decision.rule,
                       "policy: denied (safe action)");
-                return policy_denial(decision);
+                return (policy_denial(decision), DECIDED_BY_CONFIG_DENY);
             }
-            return Decision::Allow;
+            return (Decision::Allow, DECIDED_BY_DEFAULT);
         }
 
         let decision = self
@@ -117,28 +127,44 @@ impl Approver for PolicyApprover {
             Verdict::Deny => {
                 info!(summary = %request.summary, channel = ?channel, rule = ?decision.rule,
                       "policy: denied");
-                policy_denial(decision)
+                (policy_denial(decision), DECIDED_BY_CONFIG_DENY)
             }
             // The engine already gates unattended grants: with `channel = None`
             // only an explicitly `unattended` allow rule or one of this job's
             // own grants (never a default) produces `Allow`, so an Allow here is
             // safe to honor as-is. The source is logged because it is the only
-            // way to answer "why did this go through" after the fact.
+            // way to answer "why did this go through" after the fact — and
+            // recorded on the event for the same reason.
             Verdict::Allow => {
                 info!(summary = %request.summary, channel = ?channel, rule = ?decision.rule,
                       source = ?decision.source, "policy: auto-allowed");
-                Decision::Allow
+                (Decision::Allow, granted_by(&decision))
             }
-            Verdict::Ask => match self.inner.decide(request).await {
+            // Escalated: whoever the prompt reaches — the auto-reviewer, then a
+            // person — is the rung that decided, and says so itself.
+            Verdict::Ask => match self.inner.decide_reported(request).await {
                 // "Allow, and remember it": persist here, then hand the caller a
                 // plain Allow — no tool needs to know the difference.
-                Decision::AllowAlways => {
+                (Decision::AllowAlways, by) => {
                     self.remember(request, channel.as_deref());
-                    Decision::Allow
+                    (Decision::Allow, by)
                 }
                 other => other,
             },
         }
+    }
+}
+
+/// Which list an auto-allow came from. A saved grant and a config rule are the
+/// same `Allow` to the caller and completely different answers to "who let this
+/// happen".
+fn granted_by(decision: &komo_core::domain::policy::Decision) -> &'static str {
+    match decision.source {
+        RuleSource::Saved => DECIDED_BY_SAVED_GRANT,
+        RuleSource::JobGrant => DECIDED_BY_JOB_GRANT,
+        RuleSource::Config if decision.rule.is_some() => DECIDED_BY_CONFIG_ALLOW,
+        // No rule matched: `default_normal`, or a safe action's floor.
+        RuleSource::Config => DECIDED_BY_DEFAULT,
     }
 }
 
@@ -221,6 +247,78 @@ mod tests {
         let allowed = with_session(ctx, approver.approve(&shell_req())).await;
         assert!(allowed);
         assert!(!*inner.asked.lock().unwrap(), "inner must not be consulted");
+    }
+
+    /// "Why did this go through?" is asked long after the fact, and `allowed`
+    /// alone cannot answer it — every rung produces the same `true`. Each one
+    /// names itself for the audit record.
+    #[tokio::test]
+    async fn every_rung_of_the_ladder_says_which_one_decided() {
+        let inner = Arc::new(Recording {
+            asked: Mutex::new(false),
+            answer: true,
+        });
+
+        // A config allow rule, matched.
+        let approver = PolicyApprover::wrap(
+            Policy::new(vec![allow_rule("cargo ")], Verdict::Ask),
+            inner.clone(),
+        );
+        let ctx = SessionContext::detached("cli-session");
+        let (decision, by) =
+            with_session(
+                ctx,
+                async move { approver.decide_reported(&shell_req()).await },
+            )
+            .await;
+        assert!(decision.is_allowed());
+        assert_eq!(by, DECIDED_BY_CONFIG_ALLOW);
+
+        // A deny rule.
+        let mut deny = allow_rule("cargo ");
+        deny.effect = Effect::Deny;
+        let approver = PolicyApprover::wrap(Policy::new(vec![deny], Verdict::Ask), inner.clone());
+        let ctx = SessionContext::detached("cli-session");
+        let (decision, by) =
+            with_session(
+                ctx,
+                async move { approver.decide_reported(&shell_req()).await },
+            )
+            .await;
+        assert!(!decision.is_allowed());
+        assert_eq!(by, DECIDED_BY_CONFIG_DENY);
+
+        // The job's own grants, which is the only way a cron turn gets one.
+        let approver = PolicyApprover::wrap(Policy::new(Vec::new(), Verdict::Ask), inner.clone());
+        let grant = {
+            let mut rule = allow_rule("cargo ");
+            rule.unattended = true;
+            rule
+        };
+        let (decision, by) = with_session(
+            cron_ctx(),
+            with_job_grants(vec![grant], async move {
+                approver.decide_reported(&shell_req()).await
+            }),
+        )
+        .await;
+        assert!(decision.is_allowed());
+        assert_eq!(by, DECIDED_BY_JOB_GRANT);
+
+        // Escalated: whatever the inner approver is, the report is its own.
+        // `Recording` does not override the method, so it answers with the
+        // trait's default rather than claiming a rung it does not know.
+        let approver = PolicyApprover::wrap(Policy::new(Vec::new(), Verdict::Ask), inner.clone());
+        let ctx = SessionContext::detached("cli-session");
+        let (decision, by) =
+            with_session(
+                ctx,
+                async move { approver.decide_reported(&shell_req()).await },
+            )
+            .await;
+        assert!(decision.is_allowed());
+        assert_eq!(by, komo_core::domain::approval::DECIDED_BY_APPROVER);
+        assert!(*inner.asked.lock().unwrap());
     }
 
     #[tokio::test]

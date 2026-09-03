@@ -283,6 +283,21 @@ pub struct RunStep {
     /// case; this is the operator's way back to what the preview elided.
     #[serde(default)]
     pub output_paths: Vec<String>,
+    /// Which rung of the permission ladder let this call happen, projected from
+    /// its `approval/resolved` event (`domain::approval`'s `DECIDED_BY_*`).
+    /// Empty for a call that was never gated — most of them.
+    ///
+    /// "Why did this go through?" is asked long after the fact, and `ok` cannot
+    /// answer it: a config rule, a grant saved months ago, the auto-reviewer and
+    /// a person at a prompt all leave the same successful step behind.
+    #[serde(default)]
+    pub approved_by: String,
+    /// How long the approval waited before it was answered, in milliseconds.
+    /// `0` = never gated, or answered instantly. "It was allowed" and "someone
+    /// thought about it for four minutes and then allowed it" are different
+    /// facts about the same call.
+    #[serde(default)]
+    pub approval_waited_ms: i64,
 }
 
 /// Per-field cap on a step's args/result inside the resume digest, and the
@@ -543,6 +558,8 @@ mod tests {
             elapsed_ms: 10 + seq,
             structured: serde_json::Value::Null,
             output_paths: Vec::new(),
+            approved_by: String::new(),
+            approval_waited_ms: 0,
         }
     }
 

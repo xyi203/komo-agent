@@ -862,6 +862,11 @@ impl ToolExecutionCore {
                             .collect()
                     })
                     .unwrap_or_default(),
+                // Projected from this call's `approval/resolved`, not carried
+                // here: the executor never sees which rung answered, and this
+                // copy of the step only feeds the turn's own tool note.
+                approved_by: String::new(),
+                approval_waited_ms: 0,
             };
             // The turn's own copy, for the tool note its closing message
             // carries. The ledger's step rows are a projection of the event

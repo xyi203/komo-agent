@@ -511,7 +511,7 @@ impl ToolContext {
         }
 
         let asked_at = std::time::Instant::now();
-        let decision = self.approver.decide(request).await;
+        let (decision, decided_by) = self.approver.decide_reported(request).await;
         let waited_ms = asked_at.elapsed().as_millis() as i64;
         let allowed = decision.is_allowed();
 
@@ -520,10 +520,7 @@ impl ToolContext {
             call_id: gate.call_id.clone(),
             call_index: gate.call_index,
             allowed,
-            // Which rung of the ladder decided is not yet reported by the
-            // approver; the field is here because recovery reads `allowed`, and
-            // filling it in is the run-ledger projection's job.
-            decided_by: String::new(),
+            decided_by: decided_by.to_string(),
             reason: decision.feedback().unwrap_or_default().to_string(),
             waited_ms,
         });

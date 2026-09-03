@@ -33,7 +33,7 @@ use tokio::sync::{Notify, oneshot, watch};
 use tracing::{info, warn};
 
 use komo_core::domain::{
-    approval::{ApprovalRequest, Approver, Decision, Risk},
+    approval::{ApprovalRequest, Approver, DECIDED_BY_HUMAN, Decision, Risk},
     cancel::CancelSignal,
     gateway::{InterjectSource, MessageHandler, ReplySink, WeChatLogin},
     home::HomeRepository,
@@ -392,6 +392,18 @@ impl ChatApprover {
 #[async_trait]
 impl Approver for ChatApprover {
     async fn decide(&self, request: &ApprovalRequest) -> Decision {
+        self.decide_reported(request).await.0
+    }
+
+    /// Whatever this returns, a person in the conversation decided it — a
+    /// `/approve`, a `/deny`, or the silence that times out.
+    async fn decide_reported(&self, request: &ApprovalRequest) -> (Decision, &'static str) {
+        (self.decide_inner(request).await, DECIDED_BY_HUMAN)
+    }
+}
+
+impl ChatApprover {
+    async fn decide_inner(&self, request: &ApprovalRequest) -> Decision {
         if request.risk == Risk::Safe {
             return Decision::Allow;
         }

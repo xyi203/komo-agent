@@ -312,6 +312,8 @@ mod tests {
             elapsed_ms: 0,
             structured: serde_json::Value::Null,
             output_paths: Vec::new(),
+            approved_by: String::new(),
+            approval_waited_ms: 0,
         }
     }
 

@@ -452,6 +452,13 @@ call the same functions, which is what keeps validation from forking.
   deny-only — never prompted. Wholly-denied tools are dropped from the catalog
   at wiring (`drop_policy_denied`). Policy only tightens; hardline floors
   short-circuit inside the tool.
+  **Every rung names itself**: `Approver::decide_reported` answers
+  `(Decision, rung)` and the gate writes it to `approval/resolved`, which the
+  ledger folds onto the call as `RunStep::approved_by` / `approval_waited_ms`
+  (`komo run inspect` prints `allowed by human after 4.2s`) — "why did this go
+  through?" is asked long after the fact, and every rung produces the same
+  `true`. The trait's default answers `approver`, so an implementation that does
+  not know its rung never claims one.
 - `komo-agent`'s `auto_reviewer` — the `[policy] mode = "auto"` rung, sitting
   between the engine's `Ask` and the human (attended runtimes only; `mode =
   "ask"` is the default and omits the decorator entirely). An aux-model reviewer

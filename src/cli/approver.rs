@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::domain::approval::{ApprovalRequest, Approver, Decision, Risk};
+use crate::domain::approval::{ApprovalRequest, Approver, DECIDED_BY_HUMAN, Decision, Risk};
 
 /// What the user answered at the approval prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +67,18 @@ impl Default for CliApprover {
 #[async_trait]
 impl Approver for CliApprover {
     async fn decide(&self, request: &ApprovalRequest) -> Decision {
+        self.decide_reported(request).await.0
+    }
+
+    /// The operator at the terminal — including the session cache, which is an
+    /// answer they gave earlier in this same session.
+    async fn decide_reported(&self, request: &ApprovalRequest) -> (Decision, &'static str) {
+        (self.decide_inner(request).await, DECIDED_BY_HUMAN)
+    }
+}
+
+impl CliApprover {
+    async fn decide_inner(&self, request: &ApprovalRequest) -> Decision {
         if request.risk == Risk::Safe {
             return Decision::Allow;
         }

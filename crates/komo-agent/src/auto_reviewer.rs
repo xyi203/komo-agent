@@ -52,7 +52,7 @@ use async_trait::async_trait;
 use tracing::{info, warn};
 
 use komo_core::domain::{
-    approval::{ApprovalRequest, Approver, Decision, Risk},
+    approval::{ApprovalRequest, Approver, DECIDED_BY_AUTO_REVIEW, Decision, Risk},
     llm::LlmClient,
     message::{Message, Role},
     repository::SessionRepository,
@@ -163,28 +163,35 @@ impl AutoReviewApprover {
 #[async_trait]
 impl Approver for AutoReviewApprover {
     async fn decide(&self, request: &ApprovalRequest) -> Decision {
+        self.decide_reported(request).await.0
+    }
+
+    /// Every path that hands over says so by passing the inner approver's own
+    /// report through: this rung only ever names itself when it actually
+    /// vouched.
+    async fn decide_reported(&self, request: &ApprovalRequest) -> (Decision, &'static str) {
         // Irreversible actions are the human's, always. Structural, so no
         // prompt wording can talk the reviewer into one.
         if request.risk == Risk::Dangerous {
-            return self.inner.decide(request).await;
+            return self.inner.decide_reported(request).await;
         }
         // No attended session means no operator request to authorize against —
         // and an unattended turn must keep granting only through its own
         // explicit rules, never a live judgement call.
         let Some(ctx) = current_session().filter(|c| !c.is_unattended()) else {
-            return self.inner.decide(request).await;
+            return self.inner.decide_reported(request).await;
         };
         let Some(authority) = self.authorizing_request(&ctx.session_id).await else {
             info!(summary = %request.summary,
                   "auto review skipped: no operator request to authorize against");
-            return self.inner.decide(request).await;
+            return self.inner.decide_reported(request).await;
         };
 
         match self.reviewed_allow(request, &authority).await {
             Some(true) => {
                 info!(summary = %request.summary, session = %ctx.session_id,
                       "policy: auto-allowed by review");
-                Decision::Allow
+                (Decision::Allow, DECIDED_BY_AUTO_REVIEW)
             }
             // `Some(false)` is the reviewer declining to vouch, `None` is a
             // failure it could not judge through. Both mean the same thing here,
@@ -192,7 +199,7 @@ impl Approver for AutoReviewApprover {
             outcome => {
                 info!(summary = %request.summary, vouched = ?outcome,
                       "auto review did not vouch; asking the operator");
-                self.inner.decide(request).await
+                self.inner.decide_reported(request).await
             }
         }
     }

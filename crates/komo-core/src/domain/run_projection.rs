@@ -201,6 +201,8 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
                         elapsed_ms: 0,
                         structured: serde_json::Value::Null,
                         output_paths: Vec::new(),
+                        approved_by: String::new(),
+                        approval_waited_ms: 0,
                     },
                 });
                 open.push((
@@ -209,6 +211,22 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
                     at_index,
                     projected.steps.len() - 1,
                 ));
+            }
+            // The audit half of an approval-gated call: which rung let it
+            // happen and how long the answer took. Matched by `call_id` like a
+            // settle — the approval resolves while the call is still open, so
+            // adjacency says nothing.
+            SessionEventKind::ApprovalResolved(approval) => {
+                let found = open
+                    .iter()
+                    .find(|(run_id, call_id, ..)| run_id == turn_id && *call_id == approval.call_id)
+                    .map(|(.., step_index)| *step_index);
+                if let Some(step_index) = found
+                    && let Some(projected_step) = projected.steps.get_mut(step_index)
+                {
+                    projected_step.step.approved_by = approval.decided_by.clone();
+                    projected_step.step.approval_waited_ms = approval.waited_ms;
+                }
             }
             SessionEventKind::ToolCallSettled(call) => {
                 let found = open.iter().position(|(run_id, call_id, ..)| {
@@ -476,6 +494,45 @@ mod tests {
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(run.error, CANCELLED_ERROR);
         assert!(!run.recoverable);
+    }
+
+    #[test]
+    fn an_approval_lands_on_the_call_it_gated() {
+        use crate::domain::session_event::ApprovalResolvedEvent;
+
+        // Two calls in flight; only one of them was gated. The approval belongs
+        // to its own call, and it resolves while both are still open — so the
+        // match is by id, like a settle.
+        let events = vec![
+            started(0, 100, "t1"),
+            call_started(1, 100, "t1", "c1", "read"),
+            call_started(2, 100, "t1", "c2", "shell"),
+            ev(
+                3,
+                101,
+                SessionEventKind::ApprovalResolved(ApprovalResolvedEvent {
+                    turn_id: "t1".into(),
+                    call_id: "c2".into(),
+                    call_index: 1,
+                    allowed: true,
+                    decided_by: "human".into(),
+                    reason: String::new(),
+                    waited_ms: 4_200,
+                }),
+            ),
+            call_settled(4, 102, "t1", "c2", ToolOutcome::Succeeded),
+            call_settled(5, 102, "t1", "c1", ToolOutcome::Succeeded),
+        ];
+
+        let steps = &project_runs("s1", &events)[0].steps;
+        assert_eq!(steps[0].step.tool_name, "read");
+        assert!(
+            steps[0].step.approved_by.is_empty(),
+            "a call nobody gated says nothing about approval"
+        );
+        assert_eq!(steps[1].step.tool_name, "shell");
+        assert_eq!(steps[1].step.approved_by, "human");
+        assert_eq!(steps[1].step.approval_waited_ms, 4_200);
     }
 
     #[test]

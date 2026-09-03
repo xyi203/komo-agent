@@ -176,6 +176,18 @@ impl From<bool> for Decision {
     }
 }
 
+/// Rungs of the permission ladder, as `approval/resolved` records them. The
+/// vocabulary is closed and the strings are stable: they are read back out of
+/// logs written by older builds.
+pub const DECIDED_BY_APPROVER: &str = "approver";
+pub const DECIDED_BY_CONFIG_DENY: &str = "config-deny";
+pub const DECIDED_BY_CONFIG_ALLOW: &str = "config-allow";
+pub const DECIDED_BY_DEFAULT: &str = "default";
+pub const DECIDED_BY_SAVED_GRANT: &str = "saved-grant";
+pub const DECIDED_BY_JOB_GRANT: &str = "job-grant";
+pub const DECIDED_BY_AUTO_REVIEW: &str = "auto-review";
+pub const DECIDED_BY_HUMAN: &str = "human";
+
 /// Gate for sensitive, side-effecting actions (e.g. running a shell command or
 /// writing a file).
 ///
@@ -191,6 +203,21 @@ pub trait Approver: Send + Sync {
     /// Ask the user to approve `request`. See [`Decision`] — a denial may carry
     /// a reason for the model.
     async fn decide(&self, request: &ApprovalRequest) -> Decision;
+
+    /// [`decide`](Approver::decide), plus **which rung decided** — the audit
+    /// half of an approval, recorded on `approval/resolved`.
+    ///
+    /// "Why did this go through?" is asked long after the fact, and `allowed`
+    /// alone cannot answer it: a config rule, a grant the operator saved months
+    /// ago, the auto-reviewer and a person at a prompt all produce the same
+    /// `true`. Only the layer that decided knows which, so it reports it here.
+    ///
+    /// Defaults to [`DECIDED_BY_APPROVER`] — an approver that does not say is
+    /// one whose answer came from wherever it was wired, which is all the log
+    /// can honestly claim about it. Every rung of the real ladder overrides it.
+    async fn decide_reported(&self, request: &ApprovalRequest) -> (Decision, &'static str) {
+        (self.decide(request).await, DECIDED_BY_APPROVER)
+    }
 
     /// [`decide`](Approver::decide) reduced to a yes/no, for callers that have
     /// nothing to do with a denial's reason.

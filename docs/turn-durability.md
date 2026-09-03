@@ -602,8 +602,18 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
    仍走 `select_recall`，`dream_verdict` 也只晋升 candidate，所以被拒绝的 claim 能积累
    证据但永远回不到 prompt。原来的行为是：用户拒过的说法下次再被观察到，会当成全新
    candidate 重新落库——一次一个 occasion 地把拒绝忘掉。
-4. 第一批已记录 approval 生命周期；后续再给 `approval/resolved` 补最终放行层级、scope key 和
-   等待时间，作为 run ledger projection 的审计字段。
+4. ~~给 `approval/resolved` 补最终放行层级、scope key 和等待时间~~ —— **已完成**：
+   scope key 和 `waited_ms` 第一批就在写，缺的是「哪一级放的行」。`Approver` 加了
+   一个带默认实现的 `decide_reported`，返回 `(Decision, rung)`：policy 报
+   `config-allow` / `config-deny` / `saved-grant` / `job-grant` / `default`，
+   auto reviewer 只在自己真的背书时报 `auto-review`（其余一律透传内层的答案），
+   chat / CLI 报 `human`；没表态的实现落到 `approver`，因为「答案来自被接进来的那个
+   approver」是日志唯一能诚实声称的东西。默认实现意味着十几个测试用的 approver
+   一个都不用改。
+   投影侧：`RunStep` 增加 `approved_by` / `approval_waited_ms` 两个增量列，
+   fold 按 call_id 把 `approval/resolved` 挂到它那次调用上（审批是在调用还开着的时候
+   结算的，靠相邻位置匹配不到），`komo run inspect` 打一行
+   `allowed by human after 4.2s`。没被 gate 的调用什么都不打——绝大多数调用都是这样。
 5. memory observation 增加 provenance class，防止 untrusted tool content 被当成用户事实晋升。
 6. ~~**二次 resume 会丢掉第一次续跑之前的轮次**~~ —— **已修**，取的是第一种修法：
    `rebuild_from_events` 自己沿 `turn/started{resumed_from}` 走出整条链

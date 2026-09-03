@@ -216,6 +216,14 @@ struct RunStepRecord {
     /// column. A list, not JSON: the entries are paths, and `split('\n')` on the
     /// read side beats a nested parse.
     output_paths: String,
+
+    /// Which rung of the permission ladder let this call happen, projected from
+    /// its `approval/resolved` event. Empty = never gated. Additive column.
+    approved_by: String,
+
+    /// How long that approval waited to be answered, in milliseconds. 0 = never
+    /// gated, or answered instantly. Additive column.
+    approval_waited_ms: i64,
 }
 
 /// One inbound message the gateway has seen (`domain/inbox.rs`). The key is
@@ -390,6 +398,11 @@ impl Db {
                 ("uncertain", "\"uncertain\" boolean NOT NULL DEFAULT false"),
                 ("structured", "\"structured\" text NOT NULL DEFAULT ''"),
                 ("output_paths", "\"output_paths\" text NOT NULL DEFAULT ''"),
+                ("approved_by", "\"approved_by\" text NOT NULL DEFAULT ''"),
+                (
+                    "approval_waited_ms",
+                    "\"approval_waited_ms\" integer NOT NULL DEFAULT 0",
+                ),
             ];
             ensure_columns(p, "run_step_records", STEP_COLUMNS).await?;
             ensure_table(p, INBOX_TABLE, INBOX_TABLE_DDL).await?;
@@ -1605,6 +1618,8 @@ impl Db {
                             value => value.to_string(),
                         },
                         output_paths: step.output_paths.join("\n"),
+                        approved_by: step.approved_by.clone(),
+                        approval_waited_ms: step.approval_waited_ms,
                     })
                     .exec(&mut tx)
                     .await?;
@@ -1719,6 +1734,8 @@ impl InboxRepository for Db {
 
 fn step_from_record(record: RunStepRecord) -> RunStep {
     RunStep {
+        approved_by: record.approved_by,
+        approval_waited_ms: record.approval_waited_ms,
         run_id: record.run_id,
         seq: record.seq,
         tool_name: record.tool_name,
@@ -2224,6 +2241,8 @@ mod tests {
             } else {
                 Vec::new()
             },
+            approved_by: if ok { "human".into() } else { String::new() },
+            approval_waited_ms: if ok { 4_200 } else { 0 },
         };
         run.plan = "multistep:2".into();
         run.status = RunStatus::Done;
@@ -2309,6 +2328,8 @@ mod tests {
                 elapsed_ms: 12,
                 structured: serde_json::Value::Null,
                 output_paths: Vec::new(),
+                approved_by: String::new(),
+                approval_waited_ms: 0,
             };
             commit_run(&db, &run, &[step], through as u64).await;
         }
@@ -3058,6 +3079,8 @@ mod tests {
             elapsed_ms: 12,
             structured: serde_json::Value::Null,
             output_paths: Vec::new(),
+            approved_by: String::new(),
+            approval_waited_ms: 0,
         };
         commit_run(&db, &fresh, &[step], 0).await;
         let stored = RunRepository::get(&db, &fresh.id).await.unwrap().unwrap();
