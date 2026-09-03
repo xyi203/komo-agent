@@ -44,6 +44,7 @@ routines，可以被消息、定时器和外部事件唤醒，持续执行跨小
 | 身份 | 单 persona（SOUL.md）、单 config、`CapabilityProfile` 按 runtime 分（main/cron/briefing/delegate） | 无 BotId，也不需要（§2 D1） |
 | 工作区 | `Session.workspace`、`CronJob.workspace`、`SessionContext::workspace_root`、checkpoints | 缺 per-task artifacts 目录；浏览器登录态在没有 browser 工具前不可执行 |
 | 通知 | `HomeNotifier`：sethome > `home_chat`，feishu 优先 | 全局一把，无 per-routine 策略 |
+| 会话身份 | `session_for(peer)`：一个聊天 peer 一条 session；TUI 每次启动一个新 session id，`komo resume <id>` 才接上；`/new` 换 session | 操作者自己的各个入口互相断裂，Telegram 上午聊的下午 TUI 里接不上；连同一台电脑两次开 TUI 都接不上 |
 
 ---
 
@@ -116,6 +117,50 @@ Grok 的 Automation 形状是 `{name, prompt, trigger, isEnabled, runs[]}`，tri
 Handoff 不是新工具：就是 `ask_user` 带一段 instruction，恢复条件相同。表里单列是因为它决定了
 文案和通知方式，不决定模型。
 
+### D6 · Home conversation 按 principal 归并
+
+三个词各管一件事，边界压成一句：**Session 是 durability / event log 的内部执行单元；Conversation
+是用户连续性的路由语义；Task 只描述工作，不拥有对话上下文。**
+
+**不变量**：
+
+```
+same principal + private conversation
+  => same logical home conversation
+  => same ordered session timeline
+```
+
+而不是 `sender/peer => session`，也不是 `message => task => context`。
+
+**约束**：
+
+- 操作者自己的私有入口——TUI / desktop / web / Telegram DM / 飞书 DM / 微信——全部落到**同一个
+  home session**。
+- 有其他参与者的对话（飞书群、任何 correspondent ≠ me 的 chat）按 correspondent 各自一条 session，
+  今天的 `find_by_peer` 只服务这一类。
+- transport peer **不决定 session identity**，只负责消息来源和回复目的地。回复回到消息来的那个 peer，
+  即使 turn 是在另一个入口的上下文里跑的。
+- TUI 启动默认进入 home session；`komo resume <id>` 保留给 correspondent session 和历史排查。
+- `/new` 保留，语义是**显式的 context boundary**：之后默认不携带 boundary 之前的 conversational
+  working context。durable task / memory / grants / 挂起中的 turn 是否失效，由**各自的生命周期规则**
+  决定，`/new` 不碰它们。它不再是"大清理按钮"——把 Conversation、Task、Policy 三种生命周期重新
+  耦合起来是这条规则要防的事。实现上它是同一条日志里的一条边界事件，不是换 session id，否则不变量
+  的第三行就破了。
+- session / event log / checkpoint / recovery 机制**完全不变**。
+- 同一 home session 保持 **single writer + turn serialization**：Telegram 和 CLI 同时说话就排队，
+  这是"像一个人"的代价。长任务并行由 background task 与 suspend + wakeup 承担（D5），不通过拆
+  Task context 解决。
+
+**一个必须跟着改的东西**：`Session.workspace` 今天是建 session 时锁定的身份字段。一条 home session
+会从不同目录的 TUI 进入，workspace 只能是 **turn 的属性**（`SessionContext::workspace_root`
+已经是），不再是 session 身份的一部分。这与 CONTEXT 里"Profile = 谁，Workspace = 哪里"两条正交轴
+一致：哪里干活是每个 turn 自己说的。
+
+**范围严格限制在 identity / routing**：不引入 Task Router，不新增 Task 状态副本，不动 event-log
+权威模型，不顺手重构 storage。上下文的连续性由已有的三层叠加提供——最近窗口（`find_windowed`）、
+compaction summary（turn-durability 第三批）、检索（`session` 工具 + L3 记忆召回）——路由是排他的，
+检索是叠加的，判错时前者静默替换正确上下文，后者只是多塞几段无关内容。
+
 ---
 
 ## 3. 目标数据模型
@@ -128,6 +173,7 @@ wakeup/fired     { turn_id, wakeup_id, cause: "approve"|"deny"|"reply"|"time"|"e
 approval/expired { turn_id, call_id, call_index }
 task/spawned     { turn_id, task_id, kind: "shell"|"delegate", label }
 task/settled     { task_id, outcome, result_ref, elapsed_ms }
+conversation/boundary { }                      ← /new；只影响 surface fold 与窗口起点（§3.8）
 ```
 
 - `turn/suspended` 是 durable barrier（同 `approval/requested`）：挂起前落盘，否则崩溃后不知道
@@ -260,6 +306,40 @@ struct Task {
 匹配的是 **peer**，不是名字字串：`waiting_on` 是给人看的，`ChannelPeer` 才是能对上入站消息的东西。
 `FromPeer` 是 `EventFilter` 的一个变体，与 §3.3 `Feishu` trigger 共用匹配器。
 
+### 3.8 会话解析（D6）
+
+```
+InboundMessage { peer, sender, text }
+      │
+      ▼
+ Principal Resolution        allow_from / pairing 已有的事：sender 是不是 me
+      │
+      ▼
+ Conversation Resolution
+      │
+      ├── me + private peer ─────► Home Session（唯一，settings 里记 id）
+      │
+      └── correspondent ─────────► Conversation Session（find_by_peer，首次接触时开）
+                                        │
+                                        ▼
+                                 serialized turns（claim_session 不变）
+                                        │
+                       ┌────────────────┼────────────────┐
+                     recent          compaction        retrieval
+                     window           summary           memory
+```
+
+- **Home session 的 id** 是 settings 表里一条记录，首次需要时创建；没有第二条。
+- **回复目的地**来自 `InboundMessage.peer`，随 turn 走（`ReplySink` 已经是按 turn 给的），与 session
+  无关。一个在 TUI 里挂起、由 Telegram `/approve` 唤醒的 turn，恢复后的回复回 Telegram，TUI 下次
+  打开在窗口里看到同一段。
+- **新事件** `conversation/boundary { turn_id? }`：`/new` 写它；surface fold 从最近一条 boundary 之后
+  开始取模型历史；`find_windowed` 的窗口不越过它。它对 seq、恢复、审批、投影都不可见——它只影响
+  "模型默认看到多长的历史"。
+- `todo`（session 级工作焦点）是 conversational working context，随 boundary 失效；kanban Task、
+  memory、grants、`WakeupRegistration` 不受 boundary 影响，各按自己的规则活或死。
+- 记忆 `write_scope()` 规则不变：home session 没有 correspondent，写 `Global`；这正是它该有的语义。
+
 ---
 
 ## 4. 关键流程
@@ -333,34 +413,41 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 - **5.4 无人值守审批**：cron turn 的 deny-all 改为挂起 + HomeNotifier。验证：一个没有 grants 的
   routine 在 home chat 收到提示，`/approve` 后动作执行，`/deny` 后 routine 以 error 结算。
 - **5.5 `awaiting` 投影**：session 列表与 TUI 显示。验证：挂起/恢复/过期三态各一测。
+- **5.6 Home conversation（D6）**：principal → conversation 两步解析进 `GatewayDispatcher`；home
+  session id 记 settings；TUI 默认进入 home session；`/new` 改为写 `conversation/boundary`，不再
+  `rotate`；`Session.workspace` 的 creation-locked 语义放弃，workspace 只从 `SessionContext` 读；
+  `todo` 随 boundary 失效。**只改 identity / routing**，不碰事件日志、恢复、审批、storage。
+  验证：Telegram DM 与 TUI 各发一条，两条落在同一 session 且 seq 连续；飞书群消息落在另一条 session；
+  TUI 关掉重开看到同一段对话；`/new` 之后模型历史从边界开始，但挂起中的审批仍可被 `/approve` 唤醒、
+  kanban Task 与 memory 原样；在 TUI 挂起、从 Telegram `/approve` 的 turn，回复回到 Telegram。
 
 ### 第二批 · `wait` 与后台任务
 
-- **5.6 `wait` 工具**：三种参数 → 三种 Wakeup；预算；无人值守可用。验证：routine 里
+- **5.7 `wait` 工具**：三种参数 → 三种 Wakeup；预算；无人值守可用。验证：routine 里
   `wait 2h` 后 gateway 重启，到点仍恢复；预算耗尽返回引导文案。
-- **5.7 `ask_user` 持久化**：换到挂起原语，行为不变。验证：提问后重启，回答仍被接上。
-- **5.8 后台 shell / delegate**：`task/spawned|settled`，结算唤醒或开新 turn；重启后 running 判 uncertain。
+- **5.8 `ask_user` 持久化**：换到挂起原语，行为不变。验证：提问后重启，回答仍被接上。
+- **5.9 后台 shell / delegate**：`task/spawned|settled`，结算唤醒或开新 turn；重启后 running 判 uncertain。
   验证：turn 结束后任务完成，session 收到带结果的新 turn；父 turn 挂起在 TaskDone 时精确恢复。
-- **5.9 kanban Task ↔ Wakeup**：`waiting_on_peer` / `wakeup_id` 列（kanban.db 加列，`ensure_columns`）；
+- **5.10 kanban Task ↔ Wakeup**：`waiting_on_peer` / `wakeup_id` 列（kanban.db 加列，`ensure_columns`）；
   进入/离开 `Waiting` 登记/撤销；`FromPeer` 过滤器；`wait { for_task }`。
   验证：Task 等某 feishu peer，该 peer 来消息后 `task.source` 上出现一个带消息内容的新 turn，
   Task 状态未被自动改动；Task 完成后同一 peer 再来消息不再触发；纯文字 `waiting_on` 在 list 里标「不可唤醒」。
 
 ### 第三批 · Trigger 泛化
 
-- **5.10 `Trigger` 枚举 + `runs` 历史**：替换 `schedule` 与 `last_*`；cron.db 重建；`komo cron`
+- **5.11 `Trigger` 枚举 + `runs` 历史**：替换 `schedule` 与 `last_*`；cron.db 重建；`komo cron`
   CLI/`cron` 工具/api 三个入口走同一 `cron_actions`。验证：现有 cron 测试全绿；`Any` 任一命中只跑一次。
-- **5.11 Webhook**：`/api/hooks/{name}`。验证：无 key 401；命中登记唤醒；命中 routine 开 turn 且 `event` 记录 body 摘要。
-- **5.12 Feishu match**：`TriggerMatcher`（与 5.9 的 `FromPeer` 共用）；命中不进聊天路径。
+- **5.12 Webhook**：`/api/hooks/{name}`。验证：无 key 401；命中登记唤醒；命中 routine 开 turn 且 `event` 记录 body 摘要。
+- **5.13 Feishu match**：`TriggerMatcher`（与 5.10 的 `FromPeer` 共用）；命中不进聊天路径。
   验证：非 `allow_from` 的群成员 reaction 能触发 routine 但 turn 的 grants 是 routine 的，不是发送者的。
-- **5.13 FileChanged**：`notify` + 防抖。验证：批量写 50 个文件只触发一次。
+- **5.14 FileChanged**：`notify` + 防抖。验证：批量写 50 个文件只触发一次。
 
 ### 第四批 · 收口
 
-- **5.14 per-routine 通知策略**：`notify: always | on_error | never`（Grok 每 agent 有
+- **5.15 per-routine 通知策略**：`notify: always | on_error | never`（Grok 每 agent 有
   `notificationsEnabled` / `notifyOnUpdatesEnabled`）。「有异常才告诉我」在这里。
-- **5.15 per-task artifacts**：`~/.komo/artifacts/<session>/`，进 workspace 的可写 roots。
-- **5.16 文档**：AGENTS.md 模块地图更新（cron → routine + wakeup；approval 一节改写；task 一节加唤醒）。
+- **5.16 per-task artifacts**：`~/.komo/artifacts/<session>/`，进 workspace 的可写 roots。
+- **5.17 文档**：AGENTS.md 模块地图更新（cron → routine + wakeup；approval 一节改写；task 一节加唤醒）。
 
 ---
 
@@ -379,6 +466,11 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   {allowInstructions[], blockInstructions[]}`）；komo 的 `[policy] mode = "auto"` 只以 operator
   最新消息为授权依据，ADR 0003 的边界不放宽。
 - 不让挂起的 turn 无限期存在：每个变体都有 `expires_at` 默认值。
+- 不做 Task Router：不让一条消息被"挂到某个 Task"从而决定它的上下文。指代（"刚才那个""昨天那个
+  方案"）由窗口 + compaction + 检索叠加解决，不由路由排他解决。
+- 不让 Task 持有 goal / plan / findings 这类模型维护的状态文档；那是日志之外的第二份权威。
+- 不把 `/new` 做成清理按钮：它不删 todo 之外的任何东西，不结束挂起的 turn，不撤销 grants。
+- 不为 home session 引入多写者或并行 turn；并行是 background task 和 routine 的事。
 
 ---
 
@@ -386,7 +478,7 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 
 已决（2026-09-02）：
 
-- **Q1 kanban Task 与 Wakeup 打通** → 打通。Task 的 `Waiting` 登记一条 `FromPeer` 唤醒，详见 §3.7、5.9。
+- **Q1 kanban Task 与 Wakeup 打通** → 打通。Task 的 `Waiting` 登记一条 `FromPeer` 唤醒，详见 §3.7、5.10。
 - **Q2 审批挂起期间用户在同一 session 说话** → 视为放弃审批：`Deny{feedback: 那条消息}` 结算并恢复
   turn，见 §4.1。Grok widget 的 `dismissOnMoveOn` 与现有 `Answer::Deny(feedback)` 都是这个形状。
 
@@ -401,6 +493,9 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 
 ## 8. 完成判据
 
+0. 操作者从 Telegram DM、飞书 DM、TUI 三个入口各说一句，三句在同一条 session 日志里 seq 连续；
+   一条飞书群消息落在另一条 session。TUI 关掉重开，看到的是同一段对话。`/new` 之后模型看不到
+   边界前的对话，但 `komo run inspect` 仍能读出边界前的全部 turn，挂起中的审批仍能被唤醒。
 1. gateway 在审批等待、提问等待、`wait 2h`、后台任务运行中四种状态下被 kill 并重启，
    对应的 `/approve`、用户回答、到点、任务结算都能恢复原 turn 且不重跑已完成的工具调用。
 2. 一个无 grants 的 agent routine 在 03:00 遇到需审批动作，08:00 操作员在 home chat `/approve <id>`，
