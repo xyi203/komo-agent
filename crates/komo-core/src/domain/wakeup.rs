@@ -42,6 +42,29 @@ pub fn default_expiry_secs(wakeup: &Wakeup) -> Option<i64> {
     }
 }
 
+/// The error a suspended turn stops with, so every layer tells a wait apart
+/// from a failure by downcasting — the same shape as
+/// [`Cancelled`](crate::domain::cancel::Cancelled).
+///
+/// It is not a failure and not a cancel: nothing went wrong, and the turn is
+/// coming back. What it is waiting for rides on the turn's
+/// `PendingSuspension`, not on the error.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Suspended;
+
+impl std::fmt::Display for Suspended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("suspended, waiting")
+    }
+}
+
+impl std::error::Error for Suspended {}
+
+/// Is this error a turn that stopped to wait?
+pub fn is_suspended(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Suspended>().is_some()
+}
+
 /// One standing instruction to wake something up.
 #[derive(Debug, Clone)]
 pub struct WakeupRegistration {

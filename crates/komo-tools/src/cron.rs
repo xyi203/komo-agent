@@ -125,15 +125,17 @@ impl CronTool {
 /// user's reason, if they gave one) when denied.
 async fn approve_manage(ctx: &ToolContext, summary: String, kept: &str) -> Option<String> {
     let request = ApprovalRequest::normal(summary).with_scope_key("cron:manage".to_string());
-    match ctx.decide(&request).await {
-        // `AllowAlways` is the same yes; only `PolicyApprover` treats it
-        // differently (it persists the grant).
-        Decision::Allow | Decision::AllowAlways => None,
-        Decision::Deny { feedback } => Some(match feedback {
-            Some(reason) => format!("Rejected by the user ({reason}); {kept}"),
-            None => format!("Rejected by user; {kept}"),
-        }),
+    // Read as yes/no plus a reason rather than matched variant by variant: a
+    // tool has no business knowing the shapes an answer can take (`AllowAlways`
+    // is the same yes, and only `PolicyApprover` treats it differently).
+    let decision = ctx.decide(&request).await;
+    if decision.is_allowed() {
+        return None;
     }
+    Some(match decision.feedback() {
+        Some(reason) => format!("Rejected by the user ({reason}); {kept}"),
+        None => format!("Rejected by user; {kept}"),
+    })
 }
 
 #[async_trait]

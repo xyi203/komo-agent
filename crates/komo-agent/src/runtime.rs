@@ -14,8 +14,9 @@ use komo_core::domain::{
     session::Session,
     session_event::{
         AssistantMessageEvent, MessageSource, SessionEvent, SessionEventKind, SurfacePlacement,
-        TurnRecorder, UserMessageEvent,
+        TurnRecorder, TurnSuspendedEvent, UserMessageEvent,
     },
+    wakeup::{Suspended, WakeupRegistration, WakeupRepository, is_suspended},
 };
 /// A turn whose opening the log never confirmed: settle folds the whole log
 /// rather than a tail it cannot locate. Always correct, only slower.
@@ -94,6 +95,10 @@ pub struct AgentRuntime {
     /// dropping them. `None` = this runtime's long sessions keep the plain
     /// window, and what falls out of it is simply gone.
     pub compaction: Option<Arc<Compactor>>,
+    /// Where a suspended turn's wait is registered, so a sweep comes back for
+    /// it after this process is gone. `None` = nothing schedules a return, and
+    /// only the startup re-check would find the turn.
+    pub wakeups: Option<Arc<dyn WakeupRepository>>,
     /// Where a mutating tool leaves the bytes a file held before this turn
     /// touched it, so `komo run rollback` can put them back. `None` = this
     /// runtime's file changes are final.
@@ -154,6 +159,10 @@ impl TurnRecorder for RunRecorder {
             warn!(%error, turn_id = %self.turn_id, "turn events are not durable");
         }
     }
+}
+
+fn now() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
 impl AgentRuntime {
@@ -409,6 +418,45 @@ impl AgentRuntime {
             interjections,
         } = match self.run_agent_loop(&session, run, resume_entries).await {
             Ok(outcome) => outcome,
+            // Stopped to wait for something outside itself. **Not** a failure
+            // and not an answer: the turn gives up its session slot and comes
+            // back when the wake arrives.
+            //
+            // Deliberately no assistant message — a suspended turn has not
+            // answered, and the surface has to still end on the user message
+            // for the continuation to be a continuation rather than a second
+            // question. The prompt the user sees was delivered by whoever asked
+            // for the approval, not by this transcript.
+            Err(error) if is_suspended(&error) => {
+                let pending = probe
+                    .suspension()
+                    .expect("a suspended turn carries what it is waiting for");
+                let expires_at = pending.expires_at.or_else(|| {
+                    komo_core::domain::wakeup::default_expiry_secs(&pending.wakeup)
+                        .map(|secs| now() + secs)
+                });
+                // Durable before the wait is registered, and before the caller
+                // is told: a registration for a suspension the log does not
+                // hold would wake a turn that never stopped.
+                self.record_durable(
+                    session_id,
+                    vec![SessionEventKind::TurnSuspended(TurnSuspendedEvent {
+                        turn_id: probe.run_id.clone(),
+                        wakeup: pending.wakeup.clone(),
+                        summary: pending.summary.clone(),
+                        expires_at,
+                    })],
+                )
+                .await;
+                self.register_wait(session_id, &probe.run_id, &pending, expires_at)
+                    .await;
+                info!(
+                    run_id = %probe.run_id,
+                    summary = %pending.summary,
+                    "run suspended, waiting"
+                );
+                return Err(error);
+            }
             Err(error) => {
                 // The turn failed *after* the user message was persisted. Persist
                 // an assistant turn too, so the transcript stays user/assistant-
@@ -544,6 +592,44 @@ impl AgentRuntime {
         Ok((reply, usage, memories))
     }
 
+    /// Register the wait a suspended turn is holding, so something comes back
+    /// for it after this process is gone.
+    ///
+    /// Best-effort with a loud failure: a suspension the scheduler never learns
+    /// about is a turn nobody wakes — but the log already says the turn is
+    /// waiting, and the startup re-check (`reregister_suspended_turns`) reads it
+    /// back from there, which is why this can fail without stranding anything
+    /// permanently.
+    async fn register_wait(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        pending: &komo_core::domain::context::PendingSuspension,
+        expires_at: Option<i64>,
+    ) {
+        let Some(wakeups) = &self.wakeups else {
+            warn!(
+                turn_id,
+                "no wakeup store wired: this turn waits until the next startup check"
+            );
+            return;
+        };
+        let registration = WakeupRegistration::new(session_id, pending.wakeup.clone(), now())
+            .continuing(turn_id)
+            .expiring_at(expires_at)
+            // The job's grants ride across the wait: a routine that stopped to
+            // ask still has to be able to act when it comes back.
+            .with_grants(
+                komo_services::tool_execution::current_job_grants()
+                    .iter()
+                    .map(komo_core::domain::policy::RuleSpec::from_rule)
+                    .collect(),
+            );
+        if let Err(error) = wakeups.save(&registration).await {
+            warn!(%error, turn_id, "failed to register a suspended turn's wait");
+        }
+    }
+
     /// Append this turn's events, best-effort, answering with them as the log
     /// stamped them. A record that fails to land must never fail the turn it
     /// describes — an empty answer is that failure.
@@ -664,7 +750,14 @@ impl AgentRuntime {
             .collect();
         let keep_from = runs
             .iter()
-            .filter(|projected| projected.run.recoverable || unlearned.contains(&projected.run.id))
+            // A turn that has not finished keeps its own log whatever else is
+            // true of it: `recoverable` covers the one that crashed, and a
+            // *suspended* turn is not recoverable — its return is scheduled —
+            // but cutting its rounds away would leave the continuation
+            // replaying nothing.
+            .filter(|projected| {
+                !projected.run.status.is_terminal() || unlearned.contains(&projected.run.id)
+            })
             // Its own start is not enough: a resumable turn replays every
             // earlier attempt at it, and those are turns of their own in the log.
             .map(|projected| replay_floor(runs, projected))
@@ -824,6 +917,18 @@ impl AgentRuntime {
                         })
                         .await?
                     };
+
+                    // A gated call that stopped to wait ends the turn here.
+                    // Checked between rounds rather than inside the round: the
+                    // round's other calls have already run and settled, and
+                    // their results are on record for the continuation to
+                    // replay — what must not happen is another provider request
+                    // carrying a result for a call that never ran.
+                    if let Some(run) = &context.run
+                        && run.suspension().is_some()
+                    {
+                        return Err(Suspended.into());
+                    }
 
                     // Anything the user said while that round ran joins this
                     // step instead of waiting for a whole new turn — a
@@ -1307,6 +1412,7 @@ mod tests {
             history_window: 0,
             learning: None,
             compaction: None,
+            wakeups: None,
             checkpoint: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
@@ -1618,6 +1724,220 @@ mod tests {
         assert!(steps[0].ok);
 
         assert_ledger_matches_log(&db, "cli:s1").await;
+    }
+
+    /// A tool that asks before it acts, and reports which answer it got.
+    struct Gated;
+
+    #[async_trait]
+    impl Tool for Gated {
+        fn name(&self) -> &'static str {
+            "gated"
+        }
+        fn description(&self) -> &'static str {
+            "asks for approval, then claims to have acted"
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            ctx: &komo_core::domain::context::ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            let request = komo_core::domain::approval::ApprovalRequest::normal("delete the tree");
+            let decision = ctx.decide(&request).await;
+            match decision.is_allowed() {
+                true => Ok(ToolOutput::text("acted")),
+                false => Err(ToolError::Denied(
+                    decision.feedback().unwrap_or("refused").to_string(),
+                )),
+            }
+        }
+    }
+
+    /// An approver that answers "later" — the prompt is out, nobody has
+    /// replied.
+    struct Suspending;
+
+    #[async_trait]
+    impl komo_core::domain::approval::Approver for Suspending {
+        async fn decide(
+            &self,
+            _request: &komo_core::domain::approval::ApprovalRequest,
+        ) -> komo_core::domain::approval::Decision {
+            komo_core::domain::approval::Decision::Suspend
+        }
+    }
+
+    /// An approver that must never be consulted.
+    struct NeverAsked(Arc<Mutex<usize>>);
+
+    #[async_trait]
+    impl komo_core::domain::approval::Approver for NeverAsked {
+        async fn decide(
+            &self,
+            _request: &komo_core::domain::approval::ApprovalRequest,
+        ) -> komo_core::domain::approval::Decision {
+            *self.0.lock().unwrap() += 1;
+            komo_core::domain::approval::Decision::deny()
+        }
+    }
+
+    fn gated_runtime(
+        db: Arc<Db>,
+        approver: Arc<dyn komo_core::domain::approval::Approver>,
+    ) -> AgentRuntime {
+        let (mut rt, _) = scripted_runtime(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("gated", "{}")]),
+                Step::Final("done".into()),
+            ],
+            vec![],
+            30,
+        );
+        let mut executor =
+            ToolExecutor::new(komo_services::tool_execution::ToolExecutionConfig::default());
+        executor.register(Arc::new(Gated));
+        rt.tool_executor = executor.with_events(db.clone()).with_approver(approver);
+        rt.wakeups = Some(db.clone());
+        rt
+    }
+
+    /// A gated call whose answer has not arrived stops the turn instead of
+    /// holding the session slot — and leaves behind exactly what a
+    /// continuation needs: the request on record, the call unsettled, and a
+    /// standing wait.
+    #[tokio::test]
+    async fn a_turn_waiting_on_an_approval_suspends_rather_than_failing() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_suspend.db"))
+                .await
+                .unwrap(),
+        );
+        let rt = gated_runtime(db.clone(), Arc::new(Suspending));
+
+        let outcome = rt.handle_input("cli:wait", "delete it".into()).await;
+        assert!(
+            komo_core::domain::wakeup::is_suspended(&outcome.unwrap_err()),
+            "the turn stops as suspended, not as a failure"
+        );
+
+        // The ledger says waiting: not running (a restart must not reconcile
+        // it), not finished (there is no conclusion).
+        let run = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+        assert_eq!(run.status, RunStatus::Suspended);
+        assert!(!run.recoverable, "its return is scheduled, not manual");
+
+        let events = SessionEventRepository::events(&*db, "cli:wait")
+            .await
+            .unwrap();
+        // The wire tag, which is what the assertions below are about.
+        let kinds: Vec<String> = events
+            .iter()
+            .map(|event| {
+                serde_json::to_value(&event.kind).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert!(kinds.iter().any(|k| k == "approval/requested"), "{kinds:?}");
+        assert!(kinds.iter().any(|k| k == "turn/suspended"), "{kinds:?}");
+        assert!(
+            !kinds.iter().any(|k| k == "tool/call-settled"),
+            "a call that stopped to wait did not happen: {kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|k| k == "approval/resolved"),
+            "and nobody has answered it: {kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|k| k == "assistant/message"),
+            "a suspended turn has not answered, and the surface must still end \
+             on the user message for the continuation to be one: {kinds:?}"
+        );
+
+        // And something is scheduled to come back for it.
+        let waits = komo_core::domain::wakeup::WakeupRepository::list(&*db)
+            .await
+            .unwrap();
+        assert_eq!(waits.len(), 1);
+        assert_eq!(waits[0].turn_id.as_deref(), Some(run.id.as_str()));
+        assert_eq!(
+            waits[0].wakeup,
+            komo_core::domain::session_event::Wakeup::Approval {
+                call_id: "id-gated".into()
+            }
+        );
+        assert!(
+            waits[0].expires_at.is_some(),
+            "a wait nobody answers has to come back and say so"
+        );
+    }
+
+    /// The answer that arrived while the turn was suspended **is** the answer.
+    /// Re-dispatching the call must not ask the user to approve the same action
+    /// twice — and for a wait that expired, asking again would park the turn
+    /// forever.
+    #[tokio::test]
+    async fn a_gated_call_honours_the_answer_already_in_the_log() {
+        use komo_core::domain::session_event::ApprovalResolvedEvent;
+
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_answered.db"))
+                .await
+                .unwrap(),
+        );
+        let asked = Arc::new(Mutex::new(0usize));
+        let rt = gated_runtime(db.clone(), Arc::new(NeverAsked(asked.clone())));
+
+        // The turn opens, and the answer is already on record for the call it
+        // is about to make.
+        let turn_id = Run::new_id();
+        SessionEventRepository::append(
+            &*db,
+            "cli:answered",
+            vec![
+                SessionEventKind::TurnStarted {
+                    turn_id: turn_id.clone(),
+                    resumed_from: None,
+                },
+                SessionEventKind::ApprovalResolved(ApprovalResolvedEvent {
+                    turn_id: turn_id.clone(),
+                    call_id: "id-gated".into(),
+                    call_index: 0,
+                    allowed: true,
+                    decided_by: "human".into(),
+                    reason: String::new(),
+                    waited_ms: 1_000,
+                }),
+            ],
+        )
+        .await
+        .unwrap();
+        SessionEventRepository::durable_flush(&*db, "cli:answered")
+            .await
+            .unwrap();
+
+        let reply = rt
+            .run_ledgered(
+                "cli:answered",
+                turn_id.clone(),
+                TurnKind::Fresh {
+                    user_input: "delete it".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(reply, "done");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            0,
+            "the approver must not be asked about an answer that already landed"
+        );
+        let steps = RunRepository::steps(&*db, &turn_id).await.unwrap();
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].ok, "and the call ran: {:?}", steps[0].error);
     }
 
     /// The turn has to be in the ledger *before* it ends, or a crash leaves
@@ -2226,6 +2546,7 @@ mod tests {
             history_window: 0,
             learning: None,
             compaction: None,
+            wakeups: None,
             checkpoint: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
@@ -2845,6 +3166,7 @@ mod tests {
             history_window: 0,
             learning: None,
             compaction: None,
+            wakeups: None,
             checkpoint: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),

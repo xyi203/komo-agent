@@ -104,21 +104,20 @@ pub async fn allow_read(ctx: &ToolContext, path: &Path) -> Option<String> {
             path: path.to_path_buf(),
             write: false,
         });
-    match ctx.decide(&request).await {
-        // `AllowAlways` is the same yes; only `PolicyApprover` treats it
-        // differently (it persists the grant).
-        Decision::Allow | Decision::AllowAlways => None,
-        Decision::Deny { feedback } => Some(match feedback {
-            Some(reason) => format!(
-                "Read of {} blocked: {reason}. Nothing was read.",
-                path.display()
-            ),
-            None => format!(
-                "Read of {} blocked by the permission policy; nothing was read.",
-                path.display()
-            ),
-        }),
+    let decision = ctx.decide(&request).await;
+    if decision.is_allowed() {
+        return None;
     }
+    Some(match decision.feedback() {
+        Some(reason) => format!(
+            "Read of {} blocked: {reason}. Nothing was read.",
+            path.display()
+        ),
+        None => format!(
+            "Read of {} blocked by the permission policy; nothing was read.",
+            path.display()
+        ),
+    })
 }
 
 /// Consult the approver for a **write** (`Risk::Normal` — it prompts).
@@ -131,18 +130,17 @@ pub async fn allow_write(ctx: &ToolContext, path: &Path, summary: String) -> Opt
             path: path.to_path_buf(),
             write: true,
         });
-    match ctx.decide(&request).await {
-        // `AllowAlways` is the same yes; only `PolicyApprover` treats it
-        // differently (it persists the grant).
-        Decision::Allow | Decision::AllowAlways => None,
-        Decision::Deny { feedback } => Some(match feedback {
-            Some(reason) => format!(
-                "Rejected by the user; {} was not changed. They said: {reason}",
-                path.display()
-            ),
-            None => format!("Rejected by user; {} was not changed.", path.display()),
-        }),
+    let decision = ctx.decide(&request).await;
+    if decision.is_allowed() {
+        return None;
     }
+    Some(match decision.feedback() {
+        Some(reason) => format!(
+            "Rejected by the user; {} was not changed. They said: {reason}",
+            path.display()
+        ),
+        None => format!("Rejected by user; {} was not changed.", path.display()),
+    })
 }
 
 /// Approve a mutation that spans **several** files with a single prompt.

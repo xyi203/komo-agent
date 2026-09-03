@@ -830,10 +830,23 @@ impl ToolExecutionCore {
         // run before the step is recorded, which is what carries the path.
         let bounded = result.map(|out| self.bound(out, context, seq_field));
 
+        // A call that stopped to wait for an approval **did not happen**: no
+        // step, no `tool/call-settled`, nothing for a continuation to replay.
+        // Its `tool/call-started` and `approval/requested` stand, which is
+        // exactly the "requested, never resolved ⇒ not started" reading
+        // recovery already has — and what lets the re-dispatch after the answer
+        // be the first and only run of it.
+        let suspended = context
+            .run
+            .as_ref()
+            .is_some_and(|run| run.suspended_call(call_id));
+
         // Record the step — best-effort, never affecting the tool's own result.
         // Retries collapse into this one step: the retry is a robustness
         // detail, not extra audit rows.
-        if let (Some((run, seq)), Some(args)) = (ledger, redacted_args) {
+        if let (Some((run, seq)), Some(args)) = (ledger, redacted_args)
+            && !suspended
+        {
             let ended_at = now();
             if ok {
                 info!(tool = name, seq, elapsed_ms, "tool ok");

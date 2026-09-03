@@ -136,6 +136,15 @@ pub enum Decision {
     Deny {
         feedback: Option<String>,
     },
+    /// **Nobody has answered yet, and the answer is coming later.** The prompt
+    /// has been delivered somewhere a person will see it — a chat, the home
+    /// channel — and the turn stops here rather than holding a session slot for
+    /// five minutes or guessing.
+    ///
+    /// Not a denial: the action is neither refused nor taken. The gate turns
+    /// this into a `turn/suspended` and a standing wakeup, and the same call is
+    /// re-dispatched when the answer arrives (docs/bot-runtime.md §4.1).
+    Suspend,
 }
 
 impl Decision {
@@ -153,6 +162,12 @@ impl Decision {
 
     pub fn is_allowed(&self) -> bool {
         matches!(self, Decision::Allow | Decision::AllowAlways)
+    }
+
+    /// Whether the answer is still coming. Distinct from `!is_allowed()`: a
+    /// denial is an answer, and this is the absence of one.
+    pub fn is_suspended(&self) -> bool {
+        matches!(self, Decision::Suspend)
     }
 
     /// The denial's explanation, if the user (or a policy rule) gave one.

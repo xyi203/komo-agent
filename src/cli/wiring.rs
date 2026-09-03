@@ -151,6 +151,10 @@ impl RuntimeParts<'_> {
             history_window: self.history_window,
             learning: profile.learns.then(|| self.learning.clone()),
             compaction: profile.compacts.then(|| self.compactor.clone()),
+            // Every runtime that can be gated can suspend, and a suspended
+            // turn's wait has to outlive the process — so all of them get the
+            // store, conversations and routines alike.
+            wakeups: Some(self.db.clone()),
             checkpoint: profile
                 .checkpoints
                 .then(|| self.checkpoint.clone())

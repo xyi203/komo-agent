@@ -22,7 +22,7 @@ use crate::domain::repository::SessionEventRepository;
 use crate::domain::run::RunStep;
 use crate::domain::session::ChannelPeer;
 use crate::domain::session_event::{
-    ApprovalRequestedEvent, ApprovalResolvedEvent, SessionEventKind,
+    ApprovalRequestedEvent, ApprovalResolvedEvent, SessionEventKind, Wakeup,
 };
 
 /// What is driving a turn, as far as **approval** is concerned.
@@ -309,6 +309,21 @@ impl ReplySink for NoopSink {
     }
 }
 
+/// The wait a gated call raised instead of running.
+///
+/// Carried on the turn rather than returned from the call, because it is not
+/// the *call's* outcome — the call did not happen. The executor reads it to
+/// leave that call unsettled, and the loop reads it to stop the turn.
+#[derive(Debug, Clone)]
+pub struct PendingSuspension {
+    pub call_id: String,
+    pub call_index: u32,
+    pub wakeup: Wakeup,
+    /// One line for the operator: what this turn is waiting for.
+    pub summary: String,
+    pub expires_at: Option<i64>,
+}
+
 /// The run-ledger handle for one turn (`domain/run.rs`, roadmap §7): created by
 /// `AgentRuntime::run_turn` and passed **explicitly** down to the executor, so
 /// ledgering and the per-turn call budget never depend on a caller having
@@ -325,6 +340,13 @@ pub struct RunContext {
     /// carries) keeps them here instead. Ephemeral: the durable record is the
     /// `tool/call-settled` event these are built from.
     steps: Arc<Mutex<Vec<RunStep>>>,
+    /// The wait that stopped this turn, if one did. Written by the approval
+    /// gate, read by the executor (which then leaves the call unsettled) and by
+    /// the loop (which then ends the turn as suspended rather than failed).
+    ///
+    /// One per turn: the first call to raise one stops the turn, and a round's
+    /// other calls settle normally around it.
+    suspend: Arc<Mutex<Option<PendingSuspension>>>,
     /// Monotonic step counter, shared across clones so steps within a run get a
     /// stable order even when tool calls run concurrently.
     seq: Arc<AtomicI64>,
@@ -341,6 +363,7 @@ impl RunContext {
         Self {
             run_id,
             steps: Arc::new(Mutex::new(Vec::new())),
+            suspend: Arc::new(Mutex::new(None)),
             seq: Arc::new(AtomicI64::new(0)),
             checkpoint: None,
         }
@@ -381,6 +404,31 @@ impl RunContext {
         let mut steps = self.steps.lock().unwrap().clone();
         steps.sort_by_key(|step| step.seq);
         steps
+    }
+
+    /// Record the wait that stopped this turn. First one wins: two calls in a
+    /// round both waiting on a person is one suspension, and the turn comes
+    /// back to re-dispatch both.
+    pub fn suspend(&self, pending: PendingSuspension) {
+        let mut slot = self.suspend.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(pending);
+        }
+    }
+
+    /// The wait that stopped this turn, if one did.
+    pub fn suspension(&self) -> Option<PendingSuspension> {
+        self.suspend.lock().unwrap().clone()
+    }
+
+    /// Whether *this call* is the one that stopped the turn — the executor's
+    /// question, because a suspended call has no outcome to record.
+    pub fn suspended_call(&self, call_id: &str) -> bool {
+        self.suspend
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|pending| pending.call_id == call_id)
     }
 }
 
@@ -440,6 +488,28 @@ impl ApprovalGate {
     async fn durable(&self) -> anyhow::Result<()> {
         self.events.durable_flush(&self.session_id).await
     }
+
+    /// The answer already in the log for **this call**, if there is one.
+    ///
+    /// What makes a resumed turn re-dispatch its gated call without asking
+    /// again: the answer arrived while the turn was suspended, and it is on
+    /// record. Asking a second time would be asking the user to approve the
+    /// same action twice — and for a wait that expired, would park the turn
+    /// again forever.
+    ///
+    /// The newest resolution wins, and a log that cannot be read means "no
+    /// answer yet": the gate then asks, which is the safe direction.
+    async fn resolved_earlier(&self) -> Option<ApprovalResolvedEvent> {
+        let events = self.events.events(&self.session_id).await.ok()?;
+        events.iter().rev().find_map(|event| match &event.kind {
+            SessionEventKind::ApprovalResolved(resolved)
+                if resolved.turn_id == self.turn_id && resolved.call_id == self.call_id =>
+            {
+                Some(resolved.clone())
+            }
+            _ => None,
+        })
+    }
 }
 
 impl ToolContext {
@@ -482,6 +552,18 @@ impl ToolContext {
         let Some(gate) = &self.approval else {
             return self.approver.decide(request).await;
         };
+
+        // An answer that arrived while this turn was suspended is *the* answer:
+        // the call is being re-dispatched precisely because it came in.
+        if let Some(resolved) = gate.resolved_earlier().await {
+            return match resolved.allowed {
+                true => Decision::Allow,
+                false => match resolved.reason.is_empty() {
+                    true => Decision::deny(),
+                    false => Decision::deny_because(resolved.reason),
+                },
+            };
+        }
         let scope_key = request.scope_key.clone().unwrap_or_default();
 
         // Before the wait. A crash past this point but before a durable
@@ -513,6 +595,40 @@ impl ToolContext {
         let asked_at = std::time::Instant::now();
         let (decision, decided_by) = self.approver.decide_reported(request).await;
         let waited_ms = asked_at.elapsed().as_millis() as i64;
+
+        // Nobody has answered, and the answer is coming later: the prompt is
+        // delivered, this turn stops here, and the *same* call is re-dispatched
+        // when the wake arrives. Deliberately **no** `approval/resolved` — the
+        // question is still open, and a resolution written now would be the
+        // gate answering it itself.
+        if decision.is_suspended() {
+            let pending = PendingSuspension {
+                call_id: gate.call_id.clone(),
+                call_index: gate.call_index,
+                wakeup: Wakeup::Approval {
+                    call_id: gate.call_id.clone(),
+                },
+                summary: request.summary.clone(),
+                expires_at: None,
+            };
+            match &self.run {
+                Some(run) => run.suspend(pending),
+                // No ledger handle means nothing can stop the turn on this
+                // call's behalf, and a caller that cannot suspend must not act
+                // as though it were allowed.
+                None => {
+                    return Decision::deny_because(
+                        "this action needs approval and this runtime cannot wait for one",
+                    );
+                }
+            }
+            // The tool stops on a refusal like any other; the executor drops
+            // this outcome, because a call that never ran has none.
+            return Decision::deny_because(
+                "waiting for approval — the turn will continue when it arrives",
+            );
+        }
+
         let allowed = decision.is_allowed();
 
         let resolved = SessionEventKind::ApprovalResolved(ApprovalResolvedEvent {
