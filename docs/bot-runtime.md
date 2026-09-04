@@ -42,7 +42,7 @@ routines，可以被消息、定时器和外部事件唤醒，持续执行跨小
 | Task | `domain/task.rs` kanban：`inbox/todo/waiting/done/cancelled` + `waiting_on` + `due_at`，`TaskSweep` 到期投递 | 是承诺清单，不是执行单元；名字已占用 |
 | Routine | `CronJob {schedule, action: Command|Agent, status, catch_up, grants, workspace, last_output, last_run_session}`（`domain/cron.rs`） | 已是 Routine 的 70%：缺 trigger 泛化、缺逐次 run 历史 |
 | 身份 | 单 persona（SOUL.md）、单 config、`CapabilityProfile` 按 runtime 分（main/cron/briefing/delegate） | 无 BotId，也不需要（§2 D1） |
-| 工作区 | `Session.workspace`、`CronJob.workspace`、`SessionContext::workspace_root`、checkpoints | 缺 per-task artifacts 目录；浏览器登录态在没有 browser 工具前不可执行 |
+| 工作区 | `Session.workspace`、`CronJob.workspace`、`SessionContext::workspace_root`、checkpoints、`ArtifactStore`（§5.16） | 浏览器登录态在没有 browser 工具前不可执行 |
 | 通知 | `HomeNotifier`：sethome > `home_chat`，feishu 优先 | 全局一把，无 per-routine 策略 |
 | 会话身份 | `session_for(peer)`：一个聊天 peer 一条 session；TUI 每次启动一个新 session id，`komo resume <id>` 才接上；`/new` 换 session | 操作者自己的各个入口互相断裂，Telegram 上午聊的下午 TUI 里接不上；连同一台电脑两次开 TUI 都接不上 |
 
@@ -753,7 +753,38 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 
 - **5.15 per-routine 通知策略**：`notify: always | on_error | never`（Grok 每 agent 有
   `notificationsEnabled` / `notifyOnUpdatesEnabled`）。「有异常才告诉我」在这里。
-- **5.16 per-task artifacts**：`~/.komo/artifacts/<session>/`，进 workspace 的可写 roots。
+- **5.16 per-task artifacts** —— **已完成**：`komo-services` 的 `ArtifactStore`，根
+  `<komo home>/artifacts`，每个 session 一个子目录，目录名与 `tool_output_store` 共用同一个
+  `sanitize`（两处拼出两个名字就是两个目录）。**按需创建**：`session_dir()` 只算路径，第一次
+  写进去时由 `write` 建父目录，不写就不留目录。
+
+  它进的是 `Workspace` 的**可写**集合而不是 `readonly_roots`：`with_artifacts(root)` 单独存一个
+  root，`resolve_contained` / `contains` / `resolve_readable` 都算上它，于是 `write`/`edit`/
+  `apply_patch` 能写、`shell` 能拿它当 cwd、`read`/`grep`/`glob` 能读。单独存而不是塞进
+  `roots`，是因为它是 komo 的目录不是工作区的：相对路径仍然锚定工作区第一个 root，
+  `fs_common::effective` 把它连同只读 roots 一起带进 turn 自己选的 workspace（D6 之后 workspace
+  是 turn 的属性），`shell` 也改走同一个 `effective` —— 它原先自己拼一份派生 workspace，那份会把
+  artifacts 弄丢。confinement 一点没放松：词法归一（`normalize_lexically`）+ 前缀检查照走，
+  `artifacts/../x` 依旧被拒。
+
+  **模型怎么知道**：`TurnInjections`（`komo-agent` 的 `llm.rs`）——按 runtime 授予的「往这一轮
+  用户消息尾部加什么」，和 recall 记忆同一个位置、同一个理由。缓存前缀是 tools → system →
+  messages，而 artifacts 路径带 session id，放进 system prompt 会让每条会话都有一份自己的冷前缀；
+  挂在用户消息尾部则是「新字节本来就在那儿」，对缓存零成本（D6 第 2 条）。主 agent 和 cron
+  runtime 拿到它（两者都会写文件），aux / delegate / briefing 不拿。
+
+  **保留策略**：不扫。tool-output 是调用的副产物所以 7 天过期，artifacts 是 turn 刻意留下的东西，
+  按时删掉就是删掉用户要的那份。session 之间不隔离——整个根都可写，昨天的报告今天读得到；
+  per-session 子目录是「放哪」的约定，不是边界。`komo run rollback` 对这里的写照常生效
+  （checkpoint 按绝对路径记 pre-image，对 root 没有假设）。后台任务的 `result_ref`（5.9）不动：
+  那是工具输出，不是产物。
+
+  验证：`the_artifacts_root_is_writable_from_outside_the_workspace`（core）、
+  `writes_into_the_artifacts_root_and_still_refuses_to_leave_it`、
+  `a_workdir_inside_the_artifacts_root_is_allowed`（tools）、
+  `the_artifacts_directory_reaches_the_model_after_the_user_message`、
+  `a_runtime_without_an_artifacts_grant_says_nothing_about_it`（agent）、
+  `nothing_is_created_by_naming_a_directory`（services）。
 - **5.17 文档**：AGENTS.md 模块地图更新（cron → routine + wakeup；approval 一节改写；task 一节加唤醒）。
 
 ---

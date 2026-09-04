@@ -131,6 +131,7 @@ mod tests {
     use crate::test_support::{approving_ctx, detached_ctx};
     use komo_core::domain::approval::{ApprovalRequest, Approver, Decision};
     use komo_core::domain::context::{SessionContext, ToolContext};
+    use komo_services::artifact_store::ArtifactStore;
     use std::path::PathBuf;
 
     fn tool_in(tag: &str) -> (WriteTool, PathBuf) {
@@ -168,6 +169,51 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)), "{err}");
         assert!(!target.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The mirror of the case above: komo's artifacts directory is outside the
+    /// workspace and **is** writable, because it is where a turn's own output
+    /// belongs. The session's subdirectory does not exist until something lands
+    /// in it, and a traversal out of the root is still refused.
+    #[tokio::test]
+    async fn writes_into_the_artifacts_root_and_still_refuses_to_leave_it() {
+        let base = std::env::temp_dir().join("komo_write_artifacts");
+        let _ = std::fs::remove_dir_all(&base);
+        let workspace_dir = base.join("project");
+        let artifacts = base.join("artifacts");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let store = ArtifactStore::new(artifacts.clone());
+        let tool = WriteTool::new(Arc::new(
+            Workspace::new(vec![workspace_dir]).with_artifacts(artifacts.clone()),
+        ));
+        let session_dir = store.session_dir("cli:t");
+        assert!(!session_dir.exists(), "nothing is created up front");
+
+        let report = session_dir.join("report.md");
+        let out = tool
+            .call(
+                json!({ "path": report.display().to_string(), "content": "# done" }),
+                &approving_ctx("cli:t"),
+            )
+            .await
+            .unwrap();
+        assert!(out.text.contains("Created"), "{}", out.text);
+        assert!(session_dir.is_dir(), "the first write creates it");
+        assert_eq!(std::fs::read_to_string(&report).unwrap(), "# done");
+
+        let escape = artifacts.join("../permissions.json");
+        let err = tool
+            .call(
+                json!({ "path": escape.display().to_string(), "content": "x" }),
+                &approving_ctx("cli:t"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err}");
+        assert!(!base.join("permissions.json").exists());
 
         let _ = std::fs::remove_dir_all(&base);
     }

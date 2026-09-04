@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 pub struct Workspace {
     roots: Vec<PathBuf>,
     readonly_roots: Vec<PathBuf>,
+    artifacts_root: Option<PathBuf>,
     unrestricted_reads: bool,
 }
 
@@ -14,6 +15,7 @@ impl Workspace {
         Self {
             roots,
             readonly_roots: Vec::new(),
+            artifacts_root: None,
             unrestricted_reads: false,
         }
     }
@@ -27,9 +29,20 @@ impl Workspace {
     /// managed storage (`~/.komo/tool-output`, where an over-limit tool result is
     /// kept in full). Without this a preview could name a path the model has no
     /// way to open; with it, `read`/`grep` reach that file and nothing else does,
-    /// because every mutating tool resolves against [`roots`](Self::roots) alone.
+    /// because every mutating tool resolves against the writable roots alone —
+    /// the workspace's own plus [`with_artifacts`](Self::with_artifacts).
     pub fn with_readonly(mut self, roots: Vec<PathBuf>) -> Self {
         self.readonly_roots = roots;
+        self
+    }
+
+    /// Add komo's own artifacts directory (`~/.komo/artifacts`), which a turn may
+    /// **write** — it is where what a turn produced belongs, as opposed to the
+    /// user's files in [`roots`](Self::roots). Kept apart from those because it is
+    /// komo's, not the workspace's: a turn that picks its own root still has it,
+    /// and it never anchors a relative path.
+    pub fn with_artifacts(mut self, root: PathBuf) -> Self {
+        self.artifacts_root = Some(root);
         self
     }
 
@@ -51,6 +64,11 @@ impl Workspace {
         &self.readonly_roots
     }
 
+    /// The artifacts root, so a derived workspace carries it over.
+    pub fn artifacts_root(&self) -> Option<&Path> {
+        self.artifacts_root.as_deref()
+    }
+
     /// Whether reads may reach paths outside the workspace and named read-only
     /// roots. This must be carried into a session-selected workspace.
     pub fn has_unrestricted_reads(&self) -> bool {
@@ -64,7 +82,7 @@ impl Workspace {
     /// blocks `../` escapes.
     pub fn contains(&self, path: &Path) -> bool {
         let resolved = self.resolve(path);
-        self.roots.iter().any(|root| resolved.starts_with(root))
+        self.writable().any(|root| resolved.starts_with(root))
     }
 
     /// The normalized absolute form of `path`, but only when it lands inside the
@@ -72,8 +90,7 @@ impl Workspace {
     /// root, so a tool can accept `src/main.rs` as readily as an absolute path.
     pub fn resolve_contained(&self, path: &Path) -> Option<PathBuf> {
         let resolved = self.resolve(path);
-        self.roots
-            .iter()
+        self.writable()
             .any(|root| resolved.starts_with(root))
             .then_some(resolved)
     }
@@ -86,11 +103,19 @@ impl Workspace {
         let resolved = self.resolve(path);
         (self.unrestricted_reads
             || self
-                .roots
-                .iter()
-                .chain(&self.readonly_roots)
+                .writable()
+                .chain(self.readonly_roots.iter().map(PathBuf::as_path))
                 .any(|root| resolved.starts_with(root)))
         .then_some(resolved)
+    }
+
+    /// Every root a mutation may land in: the workspace's own, plus the artifacts
+    /// directory when one is configured.
+    fn writable(&self) -> impl Iterator<Item = &Path> {
+        self.roots
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(self.artifacts_root.as_deref())
     }
 
     fn resolve(&self, path: &Path) -> PathBuf {
@@ -154,6 +179,34 @@ mod tests {
             ws.resolve_readable(Path::new("/home/user/.komo/memory.db"))
                 .is_none(),
             "only the named subdirectory, not the whole komo home"
+        );
+    }
+
+    /// The mirror of the read-only root: komo's artifacts directory is outside
+    /// the workspace and still writable, because it is where a turn's own output
+    /// belongs.
+    #[test]
+    fn the_artifacts_root_is_writable_from_outside_the_workspace() {
+        let ws = Workspace::new(vec![PathBuf::from("/home/user/project")])
+            .with_artifacts(PathBuf::from("/home/user/.komo/artifacts"));
+        let report = Path::new("/home/user/.komo/artifacts/sess-1/report.md");
+
+        assert!(ws.resolve_contained(report).is_some());
+        assert!(ws.resolve_readable(report).is_some());
+        // Confinement is unchanged: the root's parent is not in it, and a
+        // traversal out of it is still lexically resolved and refused.
+        assert!(
+            ws.resolve_contained(Path::new("/home/user/.komo/artifacts/../permissions.json"))
+                .is_none()
+        );
+        assert!(
+            ws.resolve_contained(Path::new("/home/user/.komo/komo.db"))
+                .is_none()
+        );
+        // …and a relative path still anchors to the workspace, not to it.
+        assert_eq!(
+            ws.resolve_contained(Path::new("notes.txt")).unwrap(),
+            PathBuf::from("/home/user/project/notes.txt")
         );
     }
 

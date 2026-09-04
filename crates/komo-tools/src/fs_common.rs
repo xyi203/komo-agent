@@ -66,8 +66,13 @@ pub fn resolve_readable(
 
 /// The workspace this turn actually resolves against: the session's own root when
 /// it picked one, else the wired default. A session-selected root still carries
-/// the managed read-only roots — they are komo's, not the workspace's.
-fn effective<'a>(
+/// komo's own managed roots — the read-only tool-output store and the writable
+/// artifacts directory are komo's, not the workspace's, so moving where a turn
+/// works must not take them away.
+///
+/// `shell` resolves its `workdir` through this too, which is what lets a turn run
+/// a command inside its artifacts directory.
+pub(crate) fn effective<'a>(
     workspace: &'a Arc<Workspace>,
     ctx: &ToolContext,
 ) -> std::borrow::Cow<'a, Workspace> {
@@ -75,6 +80,10 @@ fn effective<'a>(
         Some(root) => {
             let derived = Workspace::new(vec![root.clone()])
                 .with_readonly(workspace.readonly_roots().to_vec());
+            let derived = match workspace.artifacts_root() {
+                Some(artifacts) => derived.with_artifacts(artifacts.to_path_buf()),
+                None => derived,
+            };
             let derived = if workspace.has_unrestricted_reads() {
                 derived.with_unrestricted_reads()
             } else {

@@ -71,6 +71,7 @@ connect and renamed `<name>.merged-backup`.
 | `~/.komo/checkpoints/` | pre-images of files a run changed (7-day retention) | disposable |
 | `~/.komo/session-index/` | episodic search index over transcripts | disposable — rebuilt on search |
 | `~/.komo/tool-output/` | over-limit tool results + per-session `index.jsonl` (7-day retention) | disposable |
+| `~/.komo/artifacts/<session>/` | what a turn *produced* — reports, scripts, downloads | durable — never swept; a writable workspace root |
 | `~/.komo/skills/` | skill files (filesystem is the source of truth) | durable |
 
 Transcripts are **files, not rows** (`persistence/message_log.rs`), because they
@@ -400,7 +401,10 @@ call the same functions, which is what keeps validation from forking.
   unlocks, nested timeouts; `background: true` hands the same approved command
   to `background_tasks` and answers with a task id), `grep`/`glob` (ripgrep libraries in-process;
   policy runs over paths **before** content is read), `read`/`write` +
-  `fs_common` (workspace-confined; `write_if_unchanged` guards the approval
+  `fs_common` (confined to the workspace's roots **plus `~/.komo/artifacts`** —
+  komo's own writable root, where a turn puts what it *made* rather than what it
+  changed, one directory per session, named to the model at the tail of each
+  turn's user message; `write_if_unchanged` guards the approval
   window), `edit` (exact match only, no fuzzy) / `apply_patch` (v2 envelope,
   one approval per batch, no rollback — reports exactly what landed),
   `web_fetch` (content-type gated, 256 KB download cap, deny-only network

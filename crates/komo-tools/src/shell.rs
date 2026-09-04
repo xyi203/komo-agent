@@ -325,14 +325,7 @@ impl Tool for ShellTool {
             }));
         }
 
-        let selected_workspace = ctx
-            .session
-            .workspace_root
-            .as_ref()
-            .map(|root| Workspace::new(vec![root.clone()]));
-        let workspace = selected_workspace
-            .as_ref()
-            .unwrap_or(self.workspace.as_ref());
+        let workspace = crate::fs_common::effective(&self.workspace, ctx);
         let cwd = match &args.workdir {
             Some(dir) => {
                 let path = workspace
@@ -880,6 +873,28 @@ mod tests {
             .await
             .unwrap();
         assert!(out.text.contains("marker.txt"), "{}", out.text);
+    }
+
+    /// The artifacts directory is a writable root outside the workspace, so a
+    /// turn can run a command inside what it just produced there.
+    #[tokio::test]
+    async fn a_workdir_inside_the_artifacts_root_is_allowed() {
+        let artifacts = scratch("artifacts");
+        let session_dir = artifacts.join("cli-t");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("report.md"), "x").unwrap();
+        let tool = ShellTool::new(Arc::new(
+            Workspace::new(vec![std::path::PathBuf::from("/home/user/project")])
+                .with_artifacts(artifacts.clone()),
+        ));
+        let out = tool
+            .call(
+                json!({ "command": "ls", "workdir": session_dir.to_string_lossy() }),
+                &ctx_with(Arc::new(AlwaysApprove)),
+            )
+            .await
+            .unwrap();
+        assert!(out.text.contains("report.md"), "{}", out.text);
     }
 
     #[tokio::test]

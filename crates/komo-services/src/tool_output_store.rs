@@ -227,7 +227,10 @@ fn expired(path: &Path) -> bool {
 /// (`feishu:oc_x`), and a colon is a path separator's cousin on enough systems to
 /// not risk it. Dots go too — that is what keeps `..` and a leading `.` from
 /// ever reaching the filesystem, rather than a special case per shape.
-fn sanitize(id: &str) -> String {
+///
+/// Shared with [`crate::artifact_store`]: both turn the same session id into the
+/// same directory name, and two spellings of that would be two directories.
+pub(crate) fn sanitize(id: &str) -> String {
     let cleaned: String = id
         .chars()
         .map(|c| {

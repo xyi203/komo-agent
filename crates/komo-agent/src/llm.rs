@@ -1,4 +1,5 @@
 use komo_infra::codex::{CODEX_BASE_URL, CodexAuth, codex_static_headers};
+use komo_services::artifact_store::ArtifactStore;
 use komo_services::memory_enrichment::MemoryEnricher;
 use std::future::Future;
 use std::sync::Arc;
@@ -33,6 +34,40 @@ use komo_provider::{
 /// stays byte-identical across turns within a day (upstream prompt cache stays
 /// warm) and self-heals across midnight.
 pub type PreambleFn = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// What a runtime may add to the tail of a turn's user message.
+///
+/// Both vary per turn or per session, which is precisely why they live here
+/// rather than in the system prompt: the provider cache prefix runs tools →
+/// system → messages, so anything that moves that often must land where the new
+/// bytes already are. Both are granted per runtime — an aux or delegate
+/// sub-agent gets neither.
+#[derive(Clone, Default)]
+pub struct TurnInjections {
+    /// Per-turn memory enrichment. `Some` only for the main agent — aux/delegate
+    /// sub-agents must not be fed the user's memory library. The enricher owns
+    /// the whole memory policy (selection, screening, rendering, usage tracking);
+    /// this adapter only appends the finished prefix.
+    pub enricher: Option<Arc<MemoryEnricher>>,
+    /// komo's artifacts directory, for a runtime whose tools can write. The note
+    /// names this session's own subdirectory; the workspace is what makes it
+    /// writable (docs/bot-runtime.md §5.16).
+    pub artifacts: Option<Arc<ArtifactStore>>,
+}
+
+/// The line that tells the model where its own output belongs. Deliberately
+/// short — it rides on every turn — and it states the *distinction* rather than
+/// only the path, because "put files here" without "those files are the user's"
+/// is the half that gets ignored.
+fn artifacts_note(artifacts: &ArtifactStore, session_id: &str) -> String {
+    format!(
+        "[artifacts] This conversation's own output directory is {}. Put anything \
+         meant to last there — reports, scripts you wrote, files you downloaded — \
+         and say where you put it. It is writable and is never cleaned up. Files \
+         in the working directory are the user's: change them only when asked to.",
+        artifacts.session_dir(session_id).display()
+    )
+}
 
 /// Stand-in for a provider whose API key is missing (see [`build_llm`]):
 /// construction always succeeds so a fresh install boots, and every call —
@@ -92,11 +127,9 @@ pub struct ProviderLlm {
     /// past any token limit while sitting well inside the count. Applied after the
     /// count window, trimming from the oldest end.
     max_history_bytes: usize,
-    /// Optional per-turn memory enrichment. `Some` only for the main agent —
-    /// aux/delegate sub-agents must not be fed the user's memory library. The
-    /// enricher owns the whole memory policy (selection, screening, rendering,
-    /// usage tracking); this adapter only appends the finished prefix.
-    enricher: Option<Arc<MemoryEnricher>>,
+    /// What this backend appends to a turn's user message, granted per runtime
+    /// (see [`TurnInjections`]).
+    injections: TurnInjections,
     /// Per-completion timeout, bounding all attempts of one round together.
     /// `None` = no timeout (config `llm_timeout_secs = 0`).
     timeout: Option<Duration>,
@@ -405,7 +438,7 @@ impl ProviderLlm {
         // (memory is background context — it must never fail a reply).
         let mut prompt = prompt;
         let mut memories = RecalledMemories::default();
-        if let Some(enricher) = &self.enricher
+        if let Some(enricher) = &self.injections.enricher
             && let Some(injection) = enricher
                 .enrich(session, &prompt, &session.messages[..last_user_idx])
                 .await
@@ -418,6 +451,14 @@ impl ProviderLlm {
                 prompt = format!("{recall}\n\n{prompt}");
             }
             memories = injection.used;
+        }
+
+        // Where this session's own output belongs. It names a per-session
+        // directory, so it rides at the tail of the user message for the same
+        // reason recall does: in the system prompt it would give every session a
+        // different cached prefix.
+        if let Some(artifacts) = &self.injections.artifacts {
+            prompt = format!("{prompt}\n\n{}", artifacts_note(artifacts, &session.id));
         }
 
         Ok((preamble, prompt, history, memories))
@@ -1386,21 +1427,20 @@ const FABRICATED_CALL_MARKERS: [&str; 5] = [
 ///
 /// `preamble` is a factory (see [`PreambleFn`]) invoked once per turn to
 /// (re)assemble the system prompt — typically wrapping a
-/// [`crate::system_prompt::SystemPromptBuilder`]. `enricher` is the
-/// optional per-turn memory enrichment — `Some` only for the main agent, `None`
-/// for aux/delegate sub-agents (they must not be fed the user's memory library).
+/// [`crate::system_prompt::SystemPromptBuilder`]. `injections` is what this
+/// runtime may add to a turn's user message (see [`TurnInjections`]).
 pub fn build_llm(
     config: &ModelConfig,
     tools: Option<&komo_services::tool_execution::ToolExecutor>,
     preamble: PreambleFn,
-    enricher: Option<Arc<MemoryEnricher>>,
+    injections: TurnInjections,
     cache_family: Option<&str>,
 ) -> anyhow::Result<Arc<dyn LlmClient>> {
     let providers = config.menu_providers();
     // The common case: everything on the menu runs on one provider, so there is
     // nothing to route between.
     if providers.len() < 2 {
-        return build_provider_llm(config, tools, preamble, enricher, cache_family);
+        return build_provider_llm(config, tools, preamble, injections, cache_family);
     }
 
     let mut by_provider = Vec::with_capacity(providers.len());
@@ -1421,7 +1461,7 @@ pub fn build_llm(
                 &scoped,
                 tools,
                 preamble.clone(),
-                enricher.clone(),
+                injections.clone(),
                 cache_family,
             )?,
         ));
@@ -1437,7 +1477,7 @@ fn build_provider_llm(
     config: &ModelConfig,
     tools: Option<&komo_services::tool_execution::ToolExecutor>,
     preamble: PreambleFn,
-    enricher: Option<Arc<MemoryEnricher>>,
+    injections: TurnInjections,
     cache_family: Option<&str>,
 ) -> anyhow::Result<Arc<dyn LlmClient>> {
     // A missing API key degrades instead of failing construction: a fresh
@@ -1517,7 +1557,7 @@ fn build_provider_llm(
         preamble,
         max_history_messages: config.max_history_messages,
         max_history_bytes: config.max_history_bytes,
-        enricher,
+        injections,
         // Cap each completion so a hung provider request fails the turn instead
         // of wedging it in `running`. `0` = off.
         timeout: (config.llm_timeout_secs > 0)
@@ -1892,6 +1932,68 @@ mod tests {
         let mut session = Session::new("s");
         session.messages.push(Message::user(text));
         session
+    }
+
+    /// A backend with nothing but the injections under test — enough to call
+    /// [`ProviderLlm::assemble`], which touches no network.
+    fn llm_with(injections: TurnInjections) -> ProviderLlm {
+        ProviderLlm {
+            client: Arc::new(ProviderClient {
+                endpoint: Endpoint {
+                    url: "http://127.0.0.1:1/v1/responses".to_string(),
+                    auth: Auth::Bearer(String::new()),
+                    headers: Vec::new(),
+                    client: reqwest::Client::new(),
+                },
+                wire: Wire::Responses,
+            }),
+            tools: None,
+            default_model: "m".to_string(),
+            provider: Provider::OpenAi,
+            cache_family: None,
+            preamble: Arc::new(|| "you are komo".to_string()),
+            max_history_messages: 0,
+            max_history_bytes: 0,
+            injections,
+            timeout: None,
+        }
+    }
+
+    /// The artifacts directory is per session, so it rides at the **tail** of the
+    /// user message and never in the system prompt: the cache prefix is
+    /// tools → system → messages, and a per-session system tier would give every
+    /// conversation its own cold prefix.
+    #[tokio::test]
+    async fn the_artifacts_directory_reaches_the_model_after_the_user_message() {
+        let store = Arc::new(ArtifactStore::new(std::path::PathBuf::from(
+            "/komo/artifacts",
+        )));
+        let llm = llm_with(TurnInjections {
+            enricher: None,
+            artifacts: Some(store.clone()),
+        });
+        let session = asked("写个报告");
+        let dir = store.session_dir(&session.id).display().to_string();
+
+        let (preamble, prompt, _, _) = llm.assemble(&session).await.unwrap();
+        assert!(prompt.contains(&dir), "{prompt}");
+        assert!(
+            prompt.starts_with("写个报告"),
+            "the user's own words come first: {prompt}"
+        );
+        assert!(
+            !preamble.contains(&dir),
+            "a per-session path must stay out of the cached prefix"
+        );
+    }
+
+    /// A runtime that was not granted one is told nothing — an aux or delegate
+    /// sub-agent has no files of its own to leave behind.
+    #[tokio::test]
+    async fn a_runtime_without_an_artifacts_grant_says_nothing_about_it() {
+        let llm = llm_with(TurnInjections::default());
+        let (_, prompt, _, _) = llm.assemble(&asked("写个报告")).await.unwrap();
+        assert_eq!(prompt, "写个报告");
     }
 
     /// A turn resumed **twice**: A died after a round, B (resumed from A) died

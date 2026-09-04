@@ -14,7 +14,7 @@
 use komo_agent::compaction::Compactor;
 use komo_agent::delegate::DelegateTool;
 use komo_agent::learning_coordinator::LearningCoordinator;
-use komo_agent::llm::{PreambleFn, build_llm};
+use komo_agent::llm::{PreambleFn, TurnInjections, build_llm};
 use komo_agent::reviewer::ReflectiveReviewer;
 use komo_agent::runtime::AgentRuntime;
 use komo_agent::system_prompt::SystemPromptBuilder;
@@ -26,6 +26,7 @@ use komo_infra::embedding::{GatedEmbedder, OllamaEmbedder};
 use komo_infra::permissions_store::PermissionsStore;
 use komo_infra::persistence::db::Db;
 use komo_infra::skills::FsSkillStore;
+use komo_services::artifact_store::ArtifactStore;
 use komo_services::background_tasks::BackgroundTaskRuntime;
 use komo_services::memory_enrichment::MemoryEnricher;
 use komo_services::skill_registry::SkillRegistry;
@@ -248,10 +249,15 @@ pub async fn build(
         config.runtime.home.join("tool-output"),
     ));
 
+    // Where a turn puts what it *made*, as opposed to what it changed
+    // (docs/bot-runtime.md §5.16). A writable root outside the workspace, one
+    // subdirectory per session, created on first write and never swept.
+    let artifacts = Arc::new(ArtifactStore::new(config.runtime.home.join("artifacts")));
+
     // Mutations and shell workdirs remain confined to the current working
-    // directory. Local files are readable from any directory (subject to the
-    // file-read permission policy); managed tool output is retained as an
-    // explicit root for session-derived workspaces as well.
+    // directory plus the artifacts root. Local files are readable from any
+    // directory (subject to the file-read permission policy); both managed roots
+    // are retained for session-derived workspaces as well.
     // Work a turn hands off and does not wait for (docs/bot-runtime.md §5.9).
     // Only the main runtime gets it, for the same reason only the main runtime
     // records its tool calls: a detached task settles into a session log, and a
@@ -267,6 +273,7 @@ pub async fn build(
     let workspace = Arc::new(
         Workspace::current_dir()?
             .with_readonly(readonly_roots)
+            .with_artifacts(artifacts.root().to_path_buf())
             .with_unrestricted_reads(),
     );
 
@@ -292,7 +299,13 @@ pub async fn build(
     let aux_preamble: PreambleFn = Arc::new(move || aux_builder.build());
     // Aux/delegate sub-agents must not be fed the user's memory library — and
     // the aux agent never gets an aux of its own (no recursion).
-    let aux_llm = build_llm(&aux_config, None, aux_preamble, None, Some("aux"))?;
+    let aux_llm = build_llm(
+        &aux_config,
+        None,
+        aux_preamble,
+        TurnInjections::default(),
+        Some("aux"),
+    )?;
 
     // ── The attended approval chain ──────────────────────────────────────────
     // Built here rather than at the top of `build` because its middle rung needs
@@ -560,7 +573,7 @@ pub async fn build(
         model_config,
         Some(&subagent_tools),
         subagent_preamble,
-        None,
+        TurnInjections::default(),
         Some("delegate"),
     )?;
     let skill_repo: Arc<dyn SkillRepository> = skill_store.clone();
@@ -678,7 +691,16 @@ pub async fn build(
         Some(aux_llm.clone()),
         memory_query.clone(),
     ));
-    let llm = build_llm(model_config, Some(&tools), preamble, Some(enricher), None)?;
+    let llm = build_llm(
+        model_config,
+        Some(&tools),
+        preamble,
+        TurnInjections {
+            enricher: Some(enricher),
+            artifacts: Some(artifacts.clone()),
+        },
+        None,
+    )?;
 
     // The conversation: the only runtime that learns from what it did, and the
     // only one whose turns are worth resuming.
@@ -731,11 +753,17 @@ pub async fn build(
             .workspace_root(Some(root.clone())),
     );
     let cron_preamble: PreambleFn = Arc::new(move || cron_builder.build());
+    // An unattended routine writes files too — a nightly report is the case
+    // §5.16 is for — so it is told where they belong. No enricher: a sweep must
+    // not be fed the user's memory library.
     let cron_llm = build_llm(
         model_config,
         Some(&cron_tools),
         cron_preamble,
-        None,
+        TurnInjections {
+            enricher: None,
+            artifacts: Some(artifacts.clone()),
+        },
         Some("cron"),
     )?;
     let cron_runtime = Arc::new(parts.build(CapabilityProfile {
@@ -780,7 +808,7 @@ pub async fn build(
         &aux_config,
         Some(&briefing_tools),
         briefing_preamble,
-        None,
+        TurnInjections::default(),
         Some("briefing"),
     )?;
     let briefing_runtime = Arc::new(parts.build(CapabilityProfile {
