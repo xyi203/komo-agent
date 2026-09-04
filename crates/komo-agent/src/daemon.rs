@@ -1158,6 +1158,7 @@ impl BriefingSweep {
             effort: String::new(),
             channel: None,
             origin: SessionOrigin::User,
+            awaiting: None,
         };
         self.llm.complete(&session).await
     }

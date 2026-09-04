@@ -522,9 +522,17 @@ pub async fn session_list(control: &OperatorControl) -> anyhow::Result<()> {
         println!("No sessions.");
         return Ok(());
     }
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     for s in sessions {
+        // A conversation stopped on an approval looks idle in every other
+        // column — it has no turn running and no reply to show.
+        let waiting = s
+            .awaiting
+            .as_ref()
+            .map(|awaiting| format!("  ⏸ {}", awaiting.label(now)))
+            .unwrap_or_default();
         println!(
-            "{}  created {}  {} messages ({} user turns)",
+            "{}  created {}  {} messages ({} user turns){waiting}",
             s.id,
             local_time(s.created_at),
             s.messages,

@@ -589,6 +589,7 @@ pub fn session_summaries(sessions: Vec<Session>) -> Vec<SessionSummary> {
             workspace: s.workspace,
             model: s.model,
             effort: s.effort,
+            awaiting: s.awaiting,
         })
         .collect()
 }

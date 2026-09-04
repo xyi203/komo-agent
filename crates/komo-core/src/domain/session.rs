@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use super::awaiting::Awaiting;
 use super::context::SessionOrigin;
 use super::message::Message;
 
@@ -83,6 +84,13 @@ pub struct Session {
     /// session list shows it, and whether the learning pass may extract from it.
     #[serde(default)]
     pub origin: SessionOrigin,
+    /// The wait this conversation is stopped in, when it is stopped in one.
+    ///
+    /// A projection of the session log (`domain::awaiting`), cached on the row
+    /// so a session list does not have to fold every transcript to say which
+    /// conversations are waiting on someone.
+    #[serde(default)]
+    pub awaiting: Option<Awaiting>,
 }
 
 /// Default session status when none is stored (older rows, fresh sessions).
@@ -116,6 +124,7 @@ impl Session {
             effort: String::new(),
             channel: None,
             origin: SessionOrigin::User,
+            awaiting: None,
         }
     }
 

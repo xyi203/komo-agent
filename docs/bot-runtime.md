@@ -512,7 +512,22 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   还没接：TUI approver 仍在进程内等（它本来就守着自己的 turn，不需要跨进程恢复）。
 - **5.4 无人值守审批**：cron turn 的 deny-all 改为挂起 + HomeNotifier。验证：一个没有 grants 的
   routine 在 home chat 收到提示，`/approve` 后动作执行，`/deny` 后 routine 以 error 结算。
-- **5.5 `awaiting` 投影**：session 列表与 TUI 显示。验证：挂起/恢复/过期三态各一测。
+- **5.5 `awaiting` 投影** —— **已完成**：`Awaiting {turn_id, kind, since, summary, expires_at}`
+  从日志 fold（`komo-core` 的 `domain::awaiting`），`turn/suspended` 置位，`wakeup/fired`、
+  接手它的 `turn/started{resumed_from}`、以及那个 turn 的终止事件三者任一清除。fold 带
+  **prior**（`project_awaiting(prior, events)`）：折前缀再折其余等于折全部，所以 turn 自己的
+  那段 tail 就够——否则挂起期间另一个 turn 跑完，它的 tail 里没有挂起事件，会把别人的等待抹掉。
+  落在 `session_records.awaiting`（`ensure_columns` 加的可空列，JSON，空串 = 不在等），
+  写入点就是 run ledger 已经读过日志的那两处（`open_in_ledger` / `settle_turn`），不新开一次
+  全量读；列是**缓存不是权威**，`Db::rebuild_projections`（原 `rebuild_run_projection`，
+  现在一次 fold 同时喂两个投影）以 `prior = None` 重折全日志。
+  显示：`komo session list` 一列、TUI 状态栏（resume 时读一次，发消息即清——说别的就是
+  moved-on）、api 的 `SessionSummary` 带上该字段（apps 未改）。
+  验证：`a_suspended_turn_is_a_session_that_is_waiting`、`an_answered_approval_ends_the_wait`、
+  `a_wait_that_ran_out_ends_the_wait`、`another_turn_running_leaves_the_wait_alone`、
+  `the_continuation_that_picks_the_turn_up_ends_the_wait`、
+  `the_wait_a_session_is_stopped_in_rebuilds_from_the_log`（清空列后重建 = fold）、
+  `a_suspended_turn_shows_up_as_the_session_waiting`（写入点确实接上了）。
 - **5.6 Home conversation（D6）**：principal → conversation 两步解析进 `GatewayDispatcher`；home
   session id 记 settings；TUI 默认进入 home session；`/new` 改为写 `conversation/boundary`，不再
   `rotate`；`Session.workspace` 的 creation-locked 语义放弃，workspace 只从 `SessionContext` 读；

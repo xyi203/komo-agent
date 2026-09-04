@@ -211,6 +211,7 @@ impl Compactor {
             effort: String::new(),
             channel: None,
             origin: SessionOrigin::User,
+            awaiting: None,
         };
         let answer = match tokio::time::timeout(SUMMARY_TIMEOUT, self.aux.complete(&session)).await
         {

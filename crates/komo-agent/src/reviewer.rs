@@ -61,6 +61,7 @@ impl ReflectiveReviewer {
             effort: String::new(),
             channel: None,
             origin: SessionOrigin::User,
+            awaiting: None,
         }
     }
 
@@ -695,6 +696,7 @@ mod tests {
             effort: String::new(),
             channel: None,
             origin: SessionOrigin::User,
+            awaiting: None,
         }
     }
 

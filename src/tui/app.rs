@@ -8,6 +8,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use komo_core::domain::awaiting::Awaiting;
 
 use super::approver::{Answer, ApprovalPrompt};
 use super::paste;
@@ -102,6 +103,11 @@ pub struct App {
     /// A mid-turn `ask_user` question is pending: the next submit is its
     /// answer (allowed through even though a turn is in flight).
     pub awaiting_answer: bool,
+    /// The wait a *suspended* turn of this session is stopped in, read from the
+    /// session projection when a conversation is resumed. Unlike
+    /// [`awaiting_answer`](Self::awaiting_answer) this outlives the process that
+    /// asked: the turn is parked in the log, not in a channel this UI holds.
+    pub awaiting: Option<Awaiting>,
     pub spinner: usize,
     pub modal: Option<ApprovalPrompt>,
     /// Set while the modal is collecting a *reason* for a denial (the user
@@ -141,6 +147,7 @@ impl App {
             connecting: false,
             turn_started_at: None,
             awaiting_answer: false,
+            awaiting: None,
             spinner: 0,
             modal: None,
             modal_reason: None,
@@ -223,6 +230,9 @@ impl App {
     pub fn start_turn(&mut self) {
         self.in_flight = true;
         self.turn_started_at = Some(Instant::now());
+        // Saying something else *is* the answer to a pending wait (the gateway
+        // resolves it as moved-on), so the badge goes with the message.
+        self.awaiting = None;
     }
 
     /// Mark a turn as complete and clear its elapsed-time counter.

@@ -232,6 +232,21 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled("· Esc 中断 ", Style::new().fg(Color::DarkGray)),
         ])
+    } else if let Some(awaiting) = &app.awaiting {
+        // A turn of this conversation is parked somewhere else — waiting on an
+        // approval answered from a chat, on a timer, on a background job. It is
+        // not this UI's turn, so nothing else here would ever mention it.
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        Line::from(vec![
+            Span::styled(
+                format!(" ⏸ {} ", awaiting.label(now)),
+                Style::new().fg(Color::Yellow),
+            ),
+            Span::styled(
+                "这条对话有一个 turn 停在等待 · 直接发消息会取代它",
+                Style::new().fg(Color::DarkGray),
+            ),
+        ])
     } else {
         Line::from(Span::styled(
             " ● 就绪  · Enter 发送 · Shift-Enter/Ctrl-J 换行 · /new 新会话 · ↑↓ 滚动 · Ctrl-C 退出",

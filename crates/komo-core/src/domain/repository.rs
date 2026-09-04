@@ -77,6 +77,24 @@ pub trait SessionRepository: Send + Sync {
     async fn delete_session(&self, _session_id: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
+
+    /// Fold `events` onto the session's cached wait
+    /// ([`Session::awaiting`](Session::awaiting)) and store the result.
+    ///
+    /// Called where the run ledger is committed, with the events that commit
+    /// already read: a turn's own tail is enough, because folding a prefix and
+    /// then the rest gives what folding everything gives. The stored value is a
+    /// query index over `domain::awaiting::project_awaiting`, never a second
+    /// authority — clearing the column and re-folding the log restores it.
+    /// Default is a no-op so stores without the column aren't forced to
+    /// implement it.
+    async fn commit_awaiting(
+        &self,
+        _session_id: &str,
+        _events: &[SessionEvent],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Read the conversation a session holds.

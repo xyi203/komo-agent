@@ -139,6 +139,7 @@ impl AutoReviewApprover {
             effort: String::new(),
             channel: None,
             origin: SessionOrigin::User,
+            awaiting: None,
         };
         // One attempt, no retry (fx's `single_transport_attempt`): a retry
         // doubles the operator's wait for a decision that has a good fallback.

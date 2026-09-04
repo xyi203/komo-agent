@@ -15,6 +15,7 @@ use crate::persistence::{
 };
 
 use komo_core::domain::{
+    awaiting::{Awaiting, project_awaiting},
     briefing::BriefingMarkRepository,
     context::SessionOrigin,
     cron::CronJobRepository,
@@ -77,6 +78,12 @@ struct SessionRecord {
     /// `delegate`). Additive column; decides titling, list visibility and
     /// learning eligibility. Was encoded in the id as a prefix.
     origin: String,
+
+    /// The wait this session is stopped in, as JSON (empty = not waiting).
+    /// Additive column, and a **cache**: `domain::awaiting::project_awaiting`
+    /// folds it out of the log, `commit_awaiting` stores it, and an unreadable
+    /// or cleared value costs a badge, never a fact.
+    awaiting: String,
 }
 
 #[derive(Debug, toasty::Model)]
@@ -369,6 +376,7 @@ impl Db {
                     "\"channel_peer_id\" text NOT NULL DEFAULT ''",
                 ),
                 ("origin", "\"origin\" text NOT NULL DEFAULT 'user'"),
+                ("awaiting", "\"awaiting\" text NOT NULL DEFAULT ''"),
             ];
             ensure_columns(p, "session_records", SESSION_COLUMNS).await?;
             // Columns this komo no longer models. `reviewed_through` was the
@@ -679,6 +687,7 @@ impl SessionRepository for Db {
                     .map(|c| c.peer_id.clone())
                     .unwrap_or_default(),
                 origin: session.origin.as_str().to_string(),
+                awaiting: String::new(),
             })
             .exec(&mut conn)
             .await;
@@ -752,6 +761,20 @@ impl SessionRepository for Db {
             Ok(Some(session_id.to_string()))
         })
         .await
+    }
+
+    async fn commit_awaiting(
+        &self,
+        session_id: &str,
+        events: &[SessionEvent],
+    ) -> anyhow::Result<()> {
+        let mut conn = self.inner.connection().await?;
+        let Ok(record) = SessionRecord::get_by_id(&mut conn, session_id).await else {
+            return Ok(()); // no such session
+        };
+        let prior = serde_json::from_str(&record.awaiting).ok();
+        self.write_awaiting(session_id, project_awaiting(prior, events).as_ref())
+            .await
     }
 
     async fn set_title(&self, session_id: &str, title: &str) -> anyhow::Result<()> {
@@ -1564,14 +1587,20 @@ impl RunProjectionStore for Db {
 }
 
 impl Db {
-    /// Re-commit every session's ledger out of its log, watermarks ignored.
+    /// Re-fold every session's log into the rows projected from it — the run
+    /// ledger and each session's open wait — watermarks ignored.
     ///
     /// The repair path: these tables are disposable, and this is what makes
-    /// that true of the ledger too. Answers how many runs it wrote.
-    pub async fn rebuild_run_projection(&self) -> anyhow::Result<usize> {
+    /// that true of everything folded into them. The wait is re-folded from
+    /// `None`, not merged onto the stored value: a rebuild is the log having the
+    /// last word, which is the whole point of the column being a cache. Answers
+    /// how many runs it wrote.
+    pub async fn rebuild_projections(&self) -> anyhow::Result<usize> {
         let mut total = 0;
         for session_id in self.events.session_ids().await? {
             let events = self.events.events(&session_id).await?;
+            self.write_awaiting(&session_id, project_awaiting(None, &events).as_ref())
+                .await?;
             let runs = project_runs(&session_id, &events);
             if runs.is_empty() {
                 continue;
@@ -1583,6 +1612,34 @@ impl Db {
             total += runs.len();
         }
         Ok(total)
+    }
+
+    /// Store one session's open wait (`None` = not waiting).
+    async fn write_awaiting(
+        &self,
+        session_id: &str,
+        awaiting: Option<&Awaiting>,
+    ) -> anyhow::Result<()> {
+        let stored = match awaiting {
+            Some(awaiting) => serde_json::to_string(awaiting)?,
+            None => String::new(),
+        };
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let Ok(mut record) = SessionRecord::get_by_id(&mut conn, session_id).await else {
+                return Ok(()); // no such session
+            };
+            if record.awaiting == stored {
+                return Ok(());
+            }
+            record
+                .update()
+                .awaiting(stored.clone())
+                .exec(&mut conn)
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Write one session's fold as rows, in a single transaction.
@@ -1877,6 +1934,9 @@ fn session_from_record(record: SessionRecord, messages: Vec<Message>) -> Session
     let channel = (!record.channel_platform.is_empty() && !record.channel_peer_id.is_empty())
         .then(|| ChannelPeer::new(&record.channel_platform, &record.channel_peer_id));
     let origin = SessionOrigin::parse(&record.origin);
+    // A cache that will not parse is a cache miss: the fold puts it back at the
+    // next turn boundary, and a rebuild puts it back now.
+    let awaiting = serde_json::from_str(&record.awaiting).ok();
     Session {
         id,
         workspace,
@@ -1888,6 +1948,7 @@ fn session_from_record(record: SessionRecord, messages: Vec<Message>) -> Session
         effort,
         channel,
         origin,
+        awaiting,
     }
 }
 
@@ -3635,7 +3696,7 @@ mod tests {
         // Same watermark: the second call is the one that must not double-write.
         project(&db, "s-idem").await;
         // And once more with the watermark ignored, as a rebuild does.
-        db.rebuild_run_projection().await.unwrap();
+        db.rebuild_projections().await.unwrap();
 
         assert_eq!(RunRepository::list(&db, 10).await.unwrap().len(), 1);
         assert_eq!(RunRepository::steps(&db, "t1").await.unwrap().len(), 1);
@@ -3667,7 +3728,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.rebuild_run_projection().await.unwrap();
+        db.rebuild_projections().await.unwrap();
 
         let run = RunRepository::get(&db, "t1").await.unwrap().unwrap();
         assert_eq!(run.outcome, "{\"verdict\":\"success\"}");
@@ -3677,6 +3738,78 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// The session's own projection: a turn that stopped to wait is invisible
+    /// everywhere else, and the column that says so is a cache — clearing it and
+    /// re-folding the log has to put back exactly what the fold says.
+    #[tokio::test]
+    async fn the_wait_a_session_is_stopped_in_rebuilds_from_the_log() {
+        use komo_core::domain::session_event::{TurnSuspendedEvent, Wakeup, WakeupKind};
+
+        let db = Db::connect(&sqlite_url("komo_awaiting_rebuild.db"))
+            .await
+            .unwrap();
+        SessionRepository::save(&db, &Session::new("s-wait"))
+            .await
+            .unwrap();
+        SessionEventRepository::append(
+            &db,
+            "s-wait",
+            vec![
+                SessionEventKind::TurnStarted {
+                    turn_id: "t1".into(),
+                    resumed_from: None,
+                },
+                SessionEventKind::TurnSuspended(TurnSuspendedEvent {
+                    turn_id: "t1".into(),
+                    wakeup: Wakeup::Approval {
+                        call_id: "c1".into(),
+                    },
+                    summary: "shell: rm -rf build".into(),
+                    expires_at: Some(9_999),
+                }),
+            ],
+        )
+        .await
+        .unwrap();
+        SessionEventRepository::durable_flush(&db, "s-wait")
+            .await
+            .unwrap();
+
+        let events = SessionEventRepository::events(&db, "s-wait").await.unwrap();
+        SessionRepository::commit_awaiting(&db, "s-wait", &events)
+            .await
+            .unwrap();
+        let waiting = SessionRepository::find(&db, "s-wait")
+            .await
+            .unwrap()
+            .unwrap()
+            .awaiting
+            .expect("the session is waiting on an approval");
+        assert_eq!(waiting.kind, WakeupKind::Approval);
+        assert_eq!(waiting.summary, "shell: rm -rf build");
+
+        // Clear the cache and let the log speak.
+        db.write_awaiting("s-wait", None).await.unwrap();
+        assert!(
+            SessionRepository::find(&db, "s-wait")
+                .await
+                .unwrap()
+                .unwrap()
+                .awaiting
+                .is_none()
+        );
+        db.rebuild_projections().await.unwrap();
+        assert_eq!(
+            SessionRepository::find(&db, "s-wait")
+                .await
+                .unwrap()
+                .unwrap()
+                .awaiting,
+            project_awaiting(None, &events),
+            "the column is a query index over the fold, not a second record"
         );
     }
 
@@ -3758,7 +3891,7 @@ mod tests {
             "a fresh state.db holds no ledger"
         );
 
-        assert_eq!(db.rebuild_run_projection().await.unwrap(), 2);
+        assert_eq!(db.rebuild_projections().await.unwrap(), 2);
         assert_eq!(snapshot(&db).await, before);
     }
 

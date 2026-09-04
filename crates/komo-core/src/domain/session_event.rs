@@ -271,13 +271,49 @@ pub enum Wakeup {
 
 impl Wakeup {
     /// A stable short name for the projection and for operator surfaces.
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> WakeupKind {
         match self {
-            Self::At { .. } => "at",
-            Self::Approval { .. } => "approval",
+            Self::At { .. } => WakeupKind::At,
+            Self::Approval { .. } => WakeupKind::Approval,
+            Self::UserReply => WakeupKind::UserReply,
+            Self::TaskDone { .. } => WakeupKind::TaskDone,
+            Self::Event { .. } => WakeupKind::Event,
+        }
+    }
+}
+
+/// A [`Wakeup`] with its payload dropped: which of the five kinds of waiting
+/// this is. What a projection stores and what an operator surface renders — the
+/// payload is the runtime's business, "what are we waiting for" is theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WakeupKind {
+    At,
+    Approval,
+    UserReply,
+    TaskDone,
+    Event,
+}
+
+impl WakeupKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::At => "at",
+            Self::Approval => "approval",
             Self::UserReply => "user-reply",
-            Self::TaskDone { .. } => "task-done",
-            Self::Event { .. } => "event",
+            Self::TaskDone => "task-done",
+            Self::Event => "event",
+        }
+    }
+
+    /// What the operator sees.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::At => "定时等待",
+            Self::Approval => "等你审批",
+            Self::UserReply => "等待回答",
+            Self::TaskDone => "等后台任务",
+            Self::Event => "等事件",
         }
     }
 }

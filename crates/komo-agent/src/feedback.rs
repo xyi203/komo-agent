@@ -94,6 +94,7 @@ pub async fn classify(
         effort: String::new(),
         channel: None,
         origin: SessionOrigin::User,
+        awaiting: None,
     };
 
     let answer = match tokio::time::timeout(CLASSIFY_TIMEOUT, llm.complete(&session)).await {

@@ -37,6 +37,7 @@ mod ui;
 
 use komo_agent::interaction::CancelState;
 use komo_agent::runtime::AgentRuntime;
+use komo_core::domain::awaiting::Awaiting;
 use komo_core::domain::cancel::{CANCELLED_REPLY, is_cancelled};
 use komo_infra::persistence::db::Db;
 use komo_services::clarify::ClarifyState;
@@ -165,6 +166,9 @@ struct Boot {
     history: Vec<Message>,
     /// The session's own workspace on resume; the startup directory otherwise.
     workspace: PathBuf,
+    /// The wait a turn of this session is stopped in, on resume. A fresh
+    /// session has none.
+    awaiting: Option<Awaiting>,
 }
 
 type BootTask = tokio::task::JoinHandle<anyhow::Result<Boot>>;
@@ -193,6 +197,7 @@ pub async fn run(config: ConfigSnapshot) -> anyhow::Result<()> {
                 session,
                 history: Vec::new(),
                 workspace,
+                awaiting: None,
             })
         }
     });
@@ -215,12 +220,14 @@ pub async fn resume(config: ConfigSnapshot, id: &str) -> anyhow::Result<()> {
             let session = resolve_resume_id(&connected.backend, &id).await?;
             let workspace = resume_workspace(&connected.backend, &session, fallback).await?;
             let history = resume_messages(&connected.backend, &session).await?;
+            let awaiting = resume_awaiting(&connected.backend, &session).await?;
             Ok(Boot {
                 backend: connected.backend,
                 clarify: connected.clarify,
                 session,
                 history,
                 workspace,
+                awaiting,
             })
         }
     });
@@ -270,6 +277,26 @@ async fn resume_messages(backend: &Backend, id: &str) -> anyhow::Result<Vec<Mess
     match backend {
         Backend::Remote { gateway, .. } => gateway.session_messages(id).await,
         Backend::Local { db, .. } => MessageRepository::list_by_session(&**db, id).await,
+    }
+}
+
+/// The wait this session is stopped in, if any — the session projection's
+/// `awaiting`, folded from the log at the last turn boundary.
+///
+/// Read once, on resume: a turn suspended in *this* UI is a turn this UI is
+/// still holding, so the only wait it can learn about here is one another
+/// ingress parked.
+async fn resume_awaiting(backend: &Backend, id: &str) -> anyhow::Result<Option<Awaiting>> {
+    match backend {
+        Backend::Remote { gateway, .. } => Ok(gateway
+            .sessions()
+            .await?
+            .into_iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.awaiting)),
+        Backend::Local { db, .. } => Ok(SessionRepository::find(&**db, id)
+            .await?
+            .and_then(|session| session.awaiting)),
     }
 }
 
@@ -464,6 +491,7 @@ async fn event_loop(
                 app.connecting = false;
                 app.session_id = ready.session;
                 workspace = ready.workspace;
+                app.awaiting = ready.awaiting;
                 for message in ready.history {
                     let role = match message.role {
                         MessageRole::User => Role::You,

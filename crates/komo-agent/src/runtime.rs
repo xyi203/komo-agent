@@ -659,6 +659,20 @@ impl AgentRuntime {
         if let Err(error) = self.projection.commit(session_id, &runs, through).await {
             warn!(%error, "failed to open the turn in the ledger (non-fatal)");
         }
+        // A continuation's opening is what takes the badge off: the wait ended
+        // when the work restarted, not when it next finishes.
+        self.commit_awaiting(session_id, opening).await;
+    }
+
+    /// Fold this turn's events onto the session's cached wait, best-effort.
+    ///
+    /// Rides on the reads the ledger commit already did — a suspension and its
+    /// wake are events in the same tail — so a session list can say which
+    /// conversations are stopped on someone without folding every transcript.
+    async fn commit_awaiting(&self, session_id: &str, events: &[SessionEvent]) {
+        if let Err(error) = self.sessions.commit_awaiting(session_id, events).await {
+            warn!(%error, "failed to project the session's wait (non-fatal)");
+        }
     }
 
     /// Append and make durable. Every way a turn can end goes through here:
@@ -704,6 +718,7 @@ impl AgentRuntime {
         if let Err(error) = self.projection.commit(session_id, &runs, through).await {
             warn!(%error, "failed to project the run ledger (non-fatal)");
         }
+        self.commit_awaiting(session_id, &events).await;
         // Before the boundary, so the checkpoint written there already holds the
         // summary — and inside this turn's session slot, which is what keeps two
         // compactions from planning against the same surface.
@@ -2020,6 +2035,75 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "and the suspended attempt still has no step: it never ran the call"
+        );
+    }
+
+    /// The waiting is visible. A suspended turn holds no slot and writes no
+    /// reply, so without this the conversation reads as idle in every list the
+    /// operator has — and the run ledger is not where anyone looks for "which
+    /// chat is stuck on me".
+    #[tokio::test]
+    async fn a_suspended_turn_shows_up_as_the_session_waiting() {
+        use komo_core::domain::session_event::{ApprovalResolvedEvent, WakeupKind};
+
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_awaiting.db"))
+                .await
+                .unwrap(),
+        );
+
+        let rt = gated_runtime(db.clone(), Arc::new(Suspending));
+        assert!(
+            rt.handle_input("cli:awaiting", "delete it".into())
+                .await
+                .is_err()
+        );
+        drop(rt);
+
+        let waiting = SessionRepository::find(&*db, "cli:awaiting")
+            .await
+            .unwrap()
+            .unwrap()
+            .awaiting
+            .expect("the session is stopped on an approval");
+        assert_eq!(waiting.kind, WakeupKind::Approval);
+        assert!(
+            waiting.expires_at.is_some(),
+            "and it says when the question runs out"
+        );
+
+        // The answer lands and the turn is picked up again: the badge comes off
+        // when the work restarts, not when it next finishes.
+        let suspended = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+        SessionEventRepository::append(
+            &*db,
+            "cli:awaiting",
+            vec![SessionEventKind::ApprovalResolved(ApprovalResolvedEvent {
+                turn_id: suspended.id.clone(),
+                call_id: "id-gated".into(),
+                call_index: 0,
+                allowed: true,
+                decided_by: "human".into(),
+                reason: String::new(),
+                waited_ms: 1_000,
+            })],
+        )
+        .await
+        .unwrap();
+        let rt = gated_runtime(db.clone(), Arc::new(NeverAsked(Arc::new(Mutex::new(0)))));
+        rt.resume_interrupted(&suspended)
+            .await
+            .unwrap()
+            .expect("a suspended turn is continuable");
+
+        assert!(
+            SessionRepository::find(&*db, "cli:awaiting")
+                .await
+                .unwrap()
+                .unwrap()
+                .awaiting
+                .is_none(),
+            "nothing is waiting once the continuation has the turn"
         );
     }
 

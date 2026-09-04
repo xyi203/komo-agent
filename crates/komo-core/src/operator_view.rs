@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::awaiting::Awaiting;
+
 /// A session list row (full transcripts are never dumped in a list view).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
@@ -34,6 +36,10 @@ pub struct SessionSummary {
     /// Per-session reasoning effort (empty = the provider default).
     #[serde(default)]
     pub effort: String,
+    /// The wait this conversation is stopped in, when it is stopped in one — a
+    /// suspended turn is otherwise indistinguishable from an idle chat.
+    #[serde(default)]
+    pub awaiting: Option<Awaiting>,
 }
 
 fn default_workspace() -> String {
