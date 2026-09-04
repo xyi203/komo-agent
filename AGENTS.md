@@ -321,7 +321,7 @@ CLI/channel → AgentRuntime ─ run_agent_loop ─┬→ LlmClient::begin_turn 
 
 komo owns the tool loop **and its provider layer** (`crates/komo-provider`, no
 LLM crate): one completion per round, `run_agent_loop` (`agent/runtime.rs`) is where
-round-level control lives (`max_turns` budget, cancellation, clarify). Tool
+round-level control lives (`max_turns` budget, cancellation, suspension). Tool
 errors return as outcome content the model can recover from; only a driver/LLM
 error aborts the turn.
 

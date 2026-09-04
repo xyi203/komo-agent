@@ -31,6 +31,8 @@ routines，可以被消息、定时器和外部事件唤醒，持续执行跨小
 
 ## 1. 现状核对
 
+> 2026-09-02 动工前的快照，保留作对照；每一项的实现状态以 §5 为准。
+
 | 能力 | 现状 | 缺口 |
 |---|---|---|
 | 审批等待 | 内存 `oneshot`，`APPROVAL_TIMEOUT = 300s`，超时即拒绝（`komo-agent/src/interaction.rs`）；`approval/requested`/`resolved` 已是 durable 事件（turn-durability 1.5） | 等待不跨进程；没有 `expired` 结局；无人值守 turn 根本到不了人 |
@@ -472,10 +474,11 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   `a_suspended_turn_nothing_is_watching_is_re_registered`（幂等）、
   `a_running_or_finished_turn_is_not_re_registered`，加 store 侧四条（五种变体往返、
   无 turn 的登记、认领两次成功一次、按 turn 一起退休）。
-  **dispatch 还没有实现者**：`wakeups: None` 挂在 sweep 上，等 5.3 把挂起路径接上来——
-  现在还没有任何东西会写登记，所以生产行为一字未变。
-- **5.3 审批改造** —— **机制半已完成，答案半还没接**。
-  已完成：`Decision::Suspend`（不是拒绝，是「答案还没到」，只存在于审批器↔gate 之间，
+  dispatch 的实现者是 5.3 的 `TurnWaker`（薄适配器，续跑逻辑收在
+  `GatewayDispatcher::continue_turn_with` 一处）；5.9 起 `fire` 多带一个 payload，
+  后台任务的结果和 webhook 的 body 都从这里进日志。
+- **5.3 审批改造** —— **已完成**（TUI 的 approver 刻意留在进程内，见末尾）。
+  机制侧：`Decision::Suspend`（不是拒绝，是「答案还没到」，只存在于审批器↔gate 之间，
   tool 永远看不到它——顺手把三个 gated tool 的 `match Decision` 改成读 `is_allowed()` +
   `feedback()`）；gate 记下等待，executor **不结算**那次调用（无 step、无
   `tool/call-settled`——停下来等的调用没有发生），loop 以 `Suspended` 结束 turn，
@@ -531,7 +534,9 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   验证：`saying_something_else_takes_the_place_of_a_pending_approval`、
   `a_noted_prompt_is_visible_until_it_is_answered`、
   `a_dangerous_prompt_narrows_a_widening_answer`（`Risk::Dangerous` 仍只批一次）。
-  还没接：TUI approver 仍在进程内等（它本来就守着自己的 turn，不需要跨进程恢复）。
+  刻意保留：TUI 的 approver 仍在进程内等——它守着自己的 turn，不需要跨进程恢复；
+  TUI 本地模式（无 gateway）的 `ask_user` / `wait` 续跑由 TUI 自己驱动（5.8 接上，
+  `tui/mod.rs`），日志那一半共用 `interaction::record_wake`。
 - **5.4 无人值守审批** —— **已完成**：cron runtime 的内层 approver 换成 `UnattendedSuspend`
   （`komo-agent` 的 `unattended`）：`Risk::Normal` 答 `Suspend`，`Risk::Dangerous` 仍拒绝——
   无人值守永不放行危险动作，事后 `/approve` 也不行。提示由 `CronJobSweep` 发而不是 approver 发，
@@ -944,12 +949,13 @@ wakeups}` 答给调用方而直接 await。
 - **Q2 审批挂起期间用户在同一 session 说话** → 视为放弃审批：`Deny{feedback: 那条消息}` 结算并恢复
   turn，见 §4.1。Grok widget 的 `dismissOnMoveOn` 与现有 `Answer::Deny(feedback)` 都是这个形状。
 
-待拍板：
+已决（2026-09-04，随实现落地）：
 
-- **Q3 登记存 cron.db 还是 state.db**。本 PRD 选 cron.db（durable，与 routine 同 sweep）。
-  反对意见：登记可由日志重建，属于 disposable。反驳：重建要扫所有 session 的尾部，
-  启动时做不起；durable + 启动时只核对最近 N 个更便宜。
-- **Q4 过期时长默认值**（§3.2）：Approval 24h、UserReply 7d、Task 等待 `due_at` 否则 30d、Event 30d、At 无。
+- **Q3 登记存哪** → ADR 0004 合库后只有一个 `komo.db`，问题消解：`wakeup_records` 是其中一张
+  durable 表（5.2），启动时 `reregister_suspended_turns` 只核对最近 N 个 session。
+- **Q4 过期时长默认值** → 按 §3.2 落在 `wakeup::default_expiry_secs`：Approval 24h、UserReply 7d、
+  Event 30d、At 与 TaskDone 无（前者的 `at` 就是期限，后者由任务自己的超时结算）；
+  kanban Task 的等待用 `due_at`，没有则 30d（`TaskWaiting`，5.10）。
 
 ---
 
