@@ -30,9 +30,9 @@
 
 use komo_agent::gateway::Channel;
 use komo_agent::interaction::GatewayDispatcher;
-use komo_agent::pairing::PairingGuard;
+use komo_agent::pairing::{PairingGuard, Principal};
 use komo_core::domain::inbox::InboundOrigin;
-use komo_core::domain::session::ChannelPeer;
+use komo_core::domain::session::{ChannelPeer, InboundPeer};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -303,17 +303,17 @@ impl WeChatChannel {
                     // DM-only: sender and chat are the same iLink user id.
                     let reply_bot = bot.clone();
                     let reply_user = user_id.clone();
-                    let admitted = guard
+                    let Some(principal) = guard
                         .admit(&user_id, &user_id, move |reply| async move {
                             reply_bot
                                 .send(&reply_user, &reply)
                                 .await
                                 .map_err(|e| anyhow::anyhow!("{e}"))
                         })
-                        .await;
-                    if !admitted {
+                        .await
+                    else {
                         return;
-                    }
+                    };
                     info!(user = %user_id, "wechat message received");
                     let sink: Arc<dyn ReplySink> = Arc::new(WeChatReplySink {
                         bot: bot.clone(),
@@ -321,7 +321,18 @@ impl WeChatChannel {
                     });
                     let origin = InboundOrigin::new("wechat", message_key);
                     dispatcher
-                        .handle(&ChannelPeer::new("wechat", user_id), origin, text, sink)
+                        .handle(
+                            // WeChat is DM-only — the bot cannot join a group —
+                            // so every message here is a private one.
+                            &InboundPeer::new(
+                                ChannelPeer::new("wechat", user_id),
+                                true,
+                                principal == Principal::Operator,
+                            ),
+                            origin,
+                            text,
+                            sink,
+                        )
                         .await;
                 });
             }))

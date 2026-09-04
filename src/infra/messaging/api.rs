@@ -332,6 +332,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/sessions/{id}/title", post(set_session_title))
         .route("/api/sessions/{id}/status", post(set_session_status))
         .route("/api/sessions/{id}/delete", post(delete_session))
+        .route("/api/sessions/{id}/boundary", post(conversation_boundary))
         .route("/api/pairings/approve", post(pair_approve))
         .route("/api/pairings/{id}/revoke", post(pair_revoke))
         .route("/api/dream/apply", post(dream_apply))
@@ -372,6 +373,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/models", get(list_model_menu))
         .route("/api/workspaces", get(list_workspaces))
         .route("/api/home", get(get_home))
+        .route("/api/home-session", get(get_home_session))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{id}/messages", get(session_messages))
         .route("/api/tasks", get(list_tasks))
@@ -584,18 +586,20 @@ async fn chat_completions(
     };
 
     let is_loopback = peer.ip().is_loopback();
-    let requested_workspace = requested_workspace(&state, &headers, is_loopback);
-    // A session's workspace is a creation-time choice. Once a row exists, its
-    // stored id wins over every later header so an old conversation can never
-    // silently run tools in a different directory.
-    let workspace = bind_session_workspace(&state, &session_id, &requested_workspace).await?;
+    // Where this *turn* runs. Not a creation-time choice the session row wins
+    // forever: the operator's home conversation is entered from a TUI in
+    // whatever directory they are standing in, and binding it to the first one
+    // would silently redirect every later turn's file tools (docs/bot-runtime.md
+    // §2 D6). The header is still only honored for a local caller, below.
+    let workspace = requested_workspace(&state, &headers, is_loopback);
+    open_session(&state, &session_id, &workspace).await?;
 
-    // The model / effort choice, unlike the workspace, is *not* creation-locked:
-    // a conversation may switch models mid-thread. The client sends its current
-    // selection on every turn and we persist it, so the choice travels with the
-    // session — the turn itself reads it back off the session row (see
-    // `infra::llm::RigLlm::agent_for`), which is also what makes it visible to
-    // another client opening the same conversation.
+    // The model / effort choice travels with the session rather than with the
+    // turn: a conversation may switch models mid-thread. The client sends its
+    // current selection on every turn and we persist it — the turn itself reads
+    // it back off the session row (see `infra::llm::RigLlm::agent_for`), which
+    // is also what makes it visible to another client opening the same
+    // conversation.
     if let Some(selection) = requested_model(&state.models, &state.model, &headers) {
         state
             .actions
@@ -842,28 +846,19 @@ fn requested_workspace(
         .to_string()
 }
 
-async fn bind_session_workspace(
-    state: &AppState,
-    session_id: &str,
-    requested_workspace: &str,
-) -> Result<String, ApiError> {
-    if let Some(session) = state.actions.sessions.find(session_id).await? {
-        return Ok(session.workspace);
+/// Make sure the session row exists before the turn lands on it, recording
+/// where it was first spoken from. Descriptive only — the turn's own root is
+/// the header's, resolved above.
+async fn open_session(state: &AppState, session_id: &str, workspace: &str) -> Result<(), ApiError> {
+    if state.actions.sessions.find(session_id).await?.is_some() {
+        return Ok(());
     }
     state
         .actions
         .sessions
-        .save(&Session::with_workspace(session_id, requested_workspace))
+        .save(&Session::with_workspace(session_id, workspace))
         .await?;
-    // `save` is idempotent under a concurrent first request. Read back so both
-    // requests honor the workspace chosen by the insert that won the race.
-    Ok(state
-        .actions
-        .sessions
-        .find(session_id)
-        .await?
-        .map(|session| session.workspace)
-        .unwrap_or_else(|| requested_workspace.to_string()))
+    Ok(())
 }
 
 /// Decode a `folder:<base64url path>` workspace id into an existing directory.
@@ -1145,6 +1140,23 @@ fn model_context_window(model: &str) -> Option<u64> {
 async fn get_home(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let over = state.actions.home_override().await?;
     Ok(Json(json!({ "override": over })))
+}
+
+/// The operator's home conversation, opened on first ask. What a local client
+/// starts in, so the TUI and a Telegram DM are one thread rather than two.
+async fn get_home_session(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "session": state.actions.home_session().await? }),
+    ))
+}
+
+/// `/new`: draw a context boundary in this conversation.
+async fn conversation_boundary(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    state.actions.conversation_boundary(&id).await?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -1706,7 +1718,7 @@ async fn cancel_turn(State(state): State<AppState>, Path(session): Path<String>)
     let denied = state.approvals.resolve(&session, Answer::Deny(None));
     let answered = state
         .dispatcher
-        .answer_question(&session, CANCELLED_REPLY)
+        .answer_question(&session, CANCELLED_REPLY, None)
         .await;
     let cancelled = state.cancels.cancel(&session);
     if cancelled {
@@ -1775,7 +1787,10 @@ async fn answer_question(
     Path(session): Path<String>,
     Json(body): Json<AnswerBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let resolved = state.dispatcher.answer_question(&session, &body.text).await;
+    let resolved = state
+        .dispatcher
+        .answer_question(&session, &body.text, None)
+        .await;
     Ok(Json(json!({ "resolved": resolved })))
 }
 

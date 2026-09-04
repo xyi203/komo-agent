@@ -58,6 +58,6 @@ pub struct TodoItem {
 pub trait SessionTodoRepository: Send + Sync {
     async fn get(&self, session_id: &str) -> anyhow::Result<Vec<TodoItem>>;
     async fn set(&self, session_id: &str, items: &[TodoItem]) -> anyhow::Result<()>;
-    /// Drop the list for `session_id` (on `/new` rotate).
+    /// Drop the list for `session_id` (on a `/new` conversation boundary).
     async fn clear(&self, session_id: &str) -> anyhow::Result<()>;
 }

@@ -42,11 +42,52 @@ impl ChannelPeer {
     }
 }
 
+/// One inbound message's provenance, as the ingress channel knows it: where it
+/// came from, whether that chat is private, and whether the sender is the
+/// operator.
+///
+/// The input to conversation resolution (docs/bot-runtime.md §3.8). A transport
+/// peer says where a reply goes; it does **not** decide which conversation this
+/// is. The operator writing privately — from a DM on any platform, or from a
+/// local surface — is always the one home conversation; anyone else gets a
+/// session of their own, keyed by [`ChannelPeer`] as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundPeer {
+    pub peer: ChannelPeer,
+    /// A one-to-one chat, as the platform reports it (`p2p`, `private`, a
+    /// WeChat DM). A group is never private however few people are in it.
+    pub private: bool,
+    /// The sender is the operator themself. Answered by the channel's own
+    /// admission gate: a pre-trusted `allow_from` id is the operator, and a
+    /// sender admitted through pairing is a correspondent.
+    pub operator: bool,
+}
+
+impl InboundPeer {
+    pub fn new(peer: ChannelPeer, private: bool, operator: bool) -> Self {
+        Self {
+            peer,
+            private,
+            operator,
+        }
+    }
+
+    /// Whether this message belongs to the operator's home conversation.
+    pub fn is_home(&self) -> bool {
+        self.private && self.operator
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
-    /// Immutable workspace identity chosen when the session is first created.
-    /// Older sessions predate workspaces and therefore belong to the default.
+    /// Where this conversation was first spoken from. **Descriptive, not
+    /// binding**: which directory a turn's tools are confined to is the turn's
+    /// own answer (`SessionContext::workspace_root`), because one home
+    /// conversation is entered from a TUI in whatever directory the operator
+    /// happens to be in (docs/bot-runtime.md §2 D6). Kept because the session
+    /// log's manifest and the operator's session list both want to say where a
+    /// conversation lives.
     #[serde(default = "default_workspace")]
     pub workspace: String,
     pub messages: Vec<Message>,
@@ -61,8 +102,7 @@ pub struct Session {
     #[serde(default = "default_status")]
     pub status: String,
     /// Per-session model override (empty = the gateway's configured model).
-    /// Unlike [`workspace`](Self::workspace) this is *not* creation-locked — a
-    /// conversation may switch models mid-thread, and the last choice is what
+    /// A conversation may switch models mid-thread, and the last choice is what
     /// the next turn (and any other client opening the session) uses. Only
     /// honored for the main agent; aux/reviewer/briefing keep their own model.
     #[serde(default)]
@@ -73,8 +113,10 @@ pub struct Session {
     #[serde(default)]
     pub effort: String,
     /// The correspondent this conversation talks to, when it has one. `None`
-    /// for every local surface (TUI, desktop, web, CLI) and for komo's own
-    /// sessions — a sweep and a sub-agent answer to nobody.
+    /// for the operator's own home conversation (every private surface writes
+    /// into it) and for komo's own sessions — a sweep and a sub-agent answer to
+    /// nobody. Set only on a conversation with *someone else*: a Feishu group,
+    /// a paired correspondent's DM.
     ///
     /// Creation-locked in practice: a channel looks a session up by this and
     /// would not find one whose address had changed.

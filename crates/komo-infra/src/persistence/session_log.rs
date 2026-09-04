@@ -148,6 +148,9 @@ impl RetentionBase {
 
         // The envelope: without it a resumed turn would re-assemble a *different*
         // request. Same "latest at or below the cut" rule the folds read it by.
+        // The conversation boundary rides along for the same reason: it is not a
+        // surface node, so dropping it would quietly put everything the operator
+        // drew a line under back in front of the model.
         let covered = |e: &&SessionEvent| e.seq <= through_seq;
         for latest in [
             events
@@ -158,6 +161,10 @@ impl RetentionBase {
                 .iter()
                 .filter(covered)
                 .rfind(|e| matches!(e.kind, SessionEventKind::RequestContext(_))),
+            events
+                .iter()
+                .filter(covered)
+                .rfind(|e| matches!(e.kind, SessionEventKind::ConversationBoundary { .. })),
         ]
         .into_iter()
         .flatten()
@@ -928,6 +935,46 @@ mod tests {
         );
         // Above the cut is the retained tail's business, not the base's.
         assert!(base.events.iter().all(|e| e.seq <= 4));
+    }
+
+    #[test]
+    fn a_cut_keeps_the_conversation_boundary_it_passes() {
+        // The boundary is not a surface node, so it would fall out with the
+        // turn markers — and everything the operator drew a line under would
+        // quietly be in front of the model again.
+        use komo_core::domain::session_event::{AssistantMessageEvent, SurfaceProjection};
+        let answered = |text: &str| {
+            SessionEventKind::AssistantMessage(AssistantMessageEvent {
+                turn_id: "turn-1".into(),
+                content: text.into(),
+                tool_note: String::new(),
+                surface: SurfacePlacement::append(),
+            })
+        };
+        let events = vec![
+            SessionEvent::now(0, say("q1")),
+            SessionEvent::now(1, answered("a1")),
+            SessionEvent::now(2, SessionEventKind::ConversationBoundary { turn_id: None }),
+            SessionEvent::now(3, say("q2")),
+        ];
+        let base = RetentionBase::cut(&events, 2, 0).unwrap();
+        assert_eq!(
+            base.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the line survives the cut alongside the surface"
+        );
+        let mut folded: Vec<SessionEvent> = base.events.clone();
+        folded.push(events[3].clone());
+        let projection = SurfaceProjection::fold(&folded, 3).unwrap();
+        assert_eq!(
+            projection
+                .replay()
+                .unwrap()
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            vec!["q2"],
+        );
     }
 
     #[test]

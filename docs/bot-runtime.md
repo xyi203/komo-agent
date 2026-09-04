@@ -189,7 +189,7 @@ wakeup/fired     { turn_id, wakeup_id, cause: "approve"|"deny"|"reply"|"time"|"e
 approval/expired { turn_id, call_id, call_index }
 task/spawned     { turn_id, task_id, kind: "shell"|"delegate", label }
 task/settled     { task_id, outcome, result_ref, elapsed_ms }
-conversation/boundary { }                      ← /new；只影响 surface fold 与窗口起点（§3.8）
+conversation/boundary { turn_id? }             ← /new；只影响 surface fold 与窗口起点（§3.8）
 ```
 
 - `turn/suspended` 是 durable barrier（同 `approval/requested`）：挂起前落盘，否则崩溃后不知道
@@ -546,15 +546,59 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   `the_continuation_that_picks_the_turn_up_ends_the_wait`、
   `the_wait_a_session_is_stopped_in_rebuilds_from_the_log`（清空列后重建 = fold）、
   `a_suspended_turn_shows_up_as_the_session_waiting`（写入点确实接上了）。
-- **5.6 Home conversation（D6）**：principal → conversation 两步解析进 `GatewayDispatcher`；home
-  session id 记 settings；TUI 默认进入 home session；`/new` 改为写 `conversation/boundary`，不再
-  `rotate`；`Session.workspace` 的 creation-locked 语义放弃，workspace 只从 `SessionContext` 读；
-  `todo` 随 boundary 失效。**只改 identity / routing**，不碰事件日志、恢复、审批、storage；system
-  的 context 层保持 per process。**前置：turn-durability 第三批 compaction 已落地**，否则同时调小
-  `max_history_bytes`。
-  验证：Telegram DM 与 TUI 各发一条，两条落在同一 session 且 seq 连续；飞书群消息落在另一条 session；
-  TUI 关掉重开看到同一段对话；`/new` 之后模型历史从边界开始，但挂起中的审批仍可被 `/approve` 唤醒、
-  kanban Task 与 memory 原样；在 TUI 挂起、从 Telegram `/approve` 的 turn，回复回到 Telegram。
+- **5.6 Home conversation（D6）** —— **已完成**：解析分两步，都在 `GatewayDispatcher` 里。
+  **principal** 不新发明判据——`PairingGuard` 本来就先查 `allow_from` 再查配对行，那两条分支
+  正好是「操作者本人」和「他配对进来的人」，所以 `Gate::Allowed` 改成带一个 `Principal`，
+  `admit` 返回 `Option<Principal>`。`allow_from` 是操作者写自己 id 的地方，pairing 是放别人
+  进来的地方，这个区分本来就在配置里，读一下就是了。**conversation**：channel 交给 `handle`
+  的不再是裸 `ChannelPeer` 而是 `InboundPeer { peer, private, operator }`，
+  `private && operator` ⇒ 唯一的 home session（`HomeRepository::home_session()`，
+  `setting_records` 一行 `home_session`，首次需要时铸一个 uuid；session 行照旧由第一个 turn 建，
+  没人说过话的会话不该先有行），否则 `find_by_peer` 一 correspondent 一条。飞书 `p2p`、
+  Telegram `private`、微信（本来就只有 DM）各自把 `private` 报上来。
+  TUI 启动读同一个 id（本地直接读库，远端走 `GET /api/home-session`），
+  `komo resume <id>` 留给 correspondent session 和历史排查。
+  **`/new` 写 `conversation/boundary`**（`SessionEventKind` 加一个 required 变体），
+  `SessionRepository::rotate` 连同它的实现和测试一起删掉——没有第二个调用者了。
+  边界只改一件事：`SurfaceProjection::replayed()`。`messages()` 仍是整条 transcript
+  （`komo run inspect`、episodic 索引、reviewer、客户端 hydrate 都读它），
+  `replay()` 才是模型的历史，`find_windowed` 走后者，compaction 也只在后者上排计划——
+  否则一条跨越边界的 summary 会把被划掉的段落原样送回模型面前。
+  切点落在**边界之前最后一条 assistant 节点**，不是边界本身：挂起在审批上的 turn 有一条
+  没有答案的用户消息，藏掉它等于让续跑对着看不见的对话回答，而 `/new` 不结束 turn。
+  `RetentionBase::cut` 把最近一条边界跟 header/context 一起留下——它不是 surface 节点，
+  掉了就等于边界被忘掉。
+  `/new` 清掉的只有 **todo**（`komo-services` 的 `conversation::mark_boundary`，
+  聊天命令、TUI、api 路由三个入口共用一份）；`ApprovalState`（含 `/approve session` 的授权）、
+  挂起的 turn 和它的 `WakeupRegistration`（不管它等的是审批还是 5.8 的提问）、
+  `Awaiting` 投影、kanban Task、memory 全部不动——把 Conversation / Task / Policy
+  三种生命周期重新耦合起来正是这条规则要防的事。边界对 `project_awaiting` 落在
+  `_ => {}`，一条测试钉住（`a_conversation_boundary_leaves_the_wait_alone`）。
+  `ApprovalState::clear` 因此没有调用者了，删掉。
+  **回复随 turn 走**：`continue_turn_with` / `start_turn_with` 在 5.7 的 `payload` 之后
+  再收一个可选 `ReplySink`——`payload` 是「唤醒带来了什么」，sink 是「回答送到哪儿」，
+  两件事。`/approve`、`/deny`、`/skip` 和答问题的那条普通消息都把自己那条 sink 传下去，
+  所以在 TUI 挂起、从 Telegram 答的 turn 回 Telegram；sweep 的定时唤醒、结算的后台任务、
+  GUI 弹窗传 `None`（它们没人站在那头，回复落 transcript，GUI 本来就轮询它）。
+  **`Session.workspace` 放弃 creation-locked**：字段留着（日志 manifest 和会话列表还在读），
+  但语义改成「这条会话最早是从哪儿说的」；TUI 的 `resume_workspace` 和 api 的
+  `bind_session_workspace` 都删了——一条 home session 会从不同目录的 TUI 进入，
+  按建会话时那次锁定会悄悄改写后面每个 turn 的文件根。
+  system prompt 的 context 层文档改成 per process。
+  验证：`every_private_surface_of_the_operator_is_one_conversation`（Telegram DM + 飞书 DM +
+  TUI 读到的 id 是同一条，日志 seq 连续；飞书群落在另一条）、
+  `a_boundary_moves_the_replay_without_ending_anything`（边界后模型只看到边界之后 +
+  仍在等的那个 turn，transcript 三条一条不少，run 投影仍读出边界前的 turn，
+  `/approve` 仍把挂起的 turn 唤回来，todo 被清）、
+  `a_woken_turn_answers_the_surface_that_released_it`、
+  `a_boundary_moves_the_replay_and_leaves_the_transcript_whole`、
+  `a_boundary_does_not_hide_a_turn_that_was_still_open`、
+  `a_cut_keeps_the_conversation_boundary_it_passes`，
+  以及 `a_checkpoint_plus_its_tail_is_the_whole_log` 的用例里加进了一条边界
+  （任意切点 checkpoint + tail 折出来的 transcript 和 replay 都要与全量 fold 一致）。
+  一个取舍写在这里：**「是不是我」以 `allow_from` 为准**。用配对把自己放进来的人会被当成
+  correspondent，各自一条会话——这是配置里就能改的事，而反过来把配对进来的人都当成操作者，
+  会让别人的私聊并进 home。
 
 ### 第二批 · `wait` 与后台任务
 

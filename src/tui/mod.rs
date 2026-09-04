@@ -62,11 +62,11 @@ use crate::{
         approval::Approver,
         events::{ToolEventSink, TurnEvent},
         gateway::ReplySink,
+        home::HomeRepository,
         message::{Message, Role as MessageRole},
         repository::{MessageRepository, SessionRepository},
-        session::Session,
     },
-    infra::gateway_client::{GatewayClient, folder_workspace_id, folder_workspace_path},
+    infra::gateway_client::{GatewayClient, folder_workspace_id},
 };
 use komo_config::ConfigSnapshot;
 
@@ -163,7 +163,10 @@ struct Boot {
     session: String,
     /// The resumed transcript; empty for a fresh session.
     history: Vec<Message>,
-    /// The session's own workspace on resume; the startup directory otherwise.
+    /// Where this TUI's turns run: the directory it was started in, always.
+    /// A session no longer carries a root of its own — one home conversation is
+    /// opened from wherever the operator happens to be standing, so the
+    /// workspace is a property of the turn (docs/bot-runtime.md §2 D6).
     workspace: PathBuf,
     /// The wait a turn of this session is stopped in, on resume. A fresh
     /// session has none.
@@ -172,34 +175,50 @@ struct Boot {
 
 type BootTask = tokio::task::JoinHandle<anyhow::Result<Boot>>;
 
-/// Start the TUI on a fresh session: paint immediately, and connect in the
-/// background — a running gateway holds the db lock, so route turns to it;
-/// otherwise run in-process.
+/// Start the TUI on the operator's **home conversation**: paint immediately, and
+/// connect in the background — a running gateway holds the db lock, so route
+/// turns to it; otherwise run in-process.
+///
+/// Not a fresh session id per launch. One principal writing privately is one
+/// conversation whichever surface they picked up (docs/bot-runtime.md §2 D6),
+/// so closing the terminal and reopening it continues where the Telegram DM at
+/// lunch left off. `komo resume <id>` is what opens some *other* session — a
+/// correspondent's, or an old one being looked into.
 pub async fn run(config: ConfigSnapshot) -> anyhow::Result<()> {
     let workspace = startup_workspace()?;
     let (approval_tx, approval_rx) = mpsc::unbounded_channel();
-    let session = new_session_id();
     let boot: BootTask = tokio::spawn({
-        let (workspace, session) = (workspace.clone(), session.clone());
+        let workspace = workspace.clone();
         let approval_tx = approval_tx.clone();
         async move {
             let connected = connect(&config, &workspace, approval_tx).await?;
-            // The session row must exist before the first turn lands on it;
-            // rotation via `/new` is gated until this task completes, so the
-            // id ensured here is the id the first turn uses.
-            if let Backend::Local { db, .. } = &connected.backend {
-                ensure_session(db, &session, &workspace).await?;
-            }
+            let session = home_session(&connected.backend).await?;
+            let history = resume_messages(&connected.backend, &session).await?;
+            // The home conversation is shared, so it may already be stopped in
+            // a wait another ingress parked — a `/approve` prompt sent to
+            // Telegram, a question asked there. Same read as `resume`.
+            let awaiting = resume_awaiting(&connected.backend, &session).await?;
             Ok(Boot {
                 backend: connected.backend,
                 session,
-                history: Vec::new(),
+                history,
                 workspace,
-                awaiting: None,
+                awaiting,
             })
         }
     });
-    drive(boot, (approval_tx, approval_rx), session, false, workspace).await
+    // The home id is not known until the backend is up, so the placeholder
+    // stands in until the boot task installs the real one — the same shape
+    // `resume` already used for an id it has to resolve.
+    drive(boot, (approval_tx, approval_rx), String::new(), workspace).await
+}
+
+/// The one home conversation, from whichever store this backend speaks to.
+async fn home_session(backend: &Backend) -> anyhow::Result<String> {
+    match backend {
+        Backend::Remote { gateway, .. } => gateway.home_session().await,
+        Backend::Local { db, .. } => HomeRepository::home_session(&**db).await,
+    }
 }
 
 /// Continue an existing session (`komo resume <id>` on a TTY). Errors if the
@@ -216,14 +235,13 @@ pub async fn resume(config: ConfigSnapshot, id: &str) -> anyhow::Result<()> {
         async move {
             let connected = connect(&config, &fallback, approval_tx).await?;
             let session = resolve_resume_id(&connected.backend, &id).await?;
-            let workspace = resume_workspace(&connected.backend, &session, fallback).await?;
             let history = resume_messages(&connected.backend, &session).await?;
             let awaiting = resume_awaiting(&connected.backend, &session).await?;
             Ok(Boot {
                 backend: connected.backend,
                 session,
                 history,
-                workspace,
+                workspace: fallback,
                 awaiting,
             })
         }
@@ -231,14 +249,7 @@ pub async fn resume(config: ConfigSnapshot, id: &str) -> anyhow::Result<()> {
     // The raw argument stands in as the session id until the boot task
     // resolves it; a queued draft dispatches only after the resolved id is
     // installed.
-    drive(
-        boot,
-        (approval_tx, approval_rx),
-        id,
-        true,
-        fallback_workspace,
-    )
-    .await
+    drive(boot, (approval_tx, approval_rx), id, fallback_workspace).await
 }
 
 /// Confirm the id names a session that exists. A session id is a UUID and
@@ -297,24 +308,6 @@ async fn resume_awaiting(backend: &Backend, id: &str) -> anyhow::Result<Option<A
     }
 }
 
-/// Local sessions persist an opaque folder id. Honor it on resume so reopening
-/// a conversation from a different terminal directory cannot redirect its
-/// filesystem tools. Older sessions and unavailable folders retain the startup
-/// directory as their backward-compatible default.
-async fn resume_workspace(
-    backend: &Backend,
-    id: &str,
-    fallback: PathBuf,
-) -> anyhow::Result<PathBuf> {
-    let Backend::Local { db, .. } = backend else {
-        return Ok(fallback);
-    };
-    Ok(SessionRepository::find(&**db, id)
-        .await?
-        .and_then(|session| folder_workspace_path(&session.workspace))
-        .unwrap_or(fallback))
-}
-
 struct Connected {
     backend: Backend,
 }
@@ -358,7 +351,6 @@ async fn drive(
         mpsc::UnboundedReceiver<ApprovalPrompt>,
     ),
     session: String,
-    resuming: bool,
     workspace: PathBuf,
 ) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
@@ -374,7 +366,7 @@ async fn drive(
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )
         .is_ok();
-    let result = event_loop(&mut terminal, boot, approvals, session, resuming, workspace).await;
+    let result = event_loop(&mut terminal, boot, approvals, session, workspace).await;
     if enhanced {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
@@ -398,7 +390,6 @@ async fn event_loop(
         mpsc::UnboundedReceiver<ApprovalPrompt>,
     ),
     session: String,
-    resuming: bool,
     workspace: PathBuf,
 ) -> anyhow::Result<Option<String>> {
     // Keep the sender alive for the whole loop (remote mode has no other
@@ -429,14 +420,12 @@ async fn event_loop(
     app.connecting = true;
     app.push(
         Role::Info,
-        if resuming {
-            format!("Komo v0.1 — resuming `{}`…", app.session_id)
+        if app.session_id.is_empty() {
+            // `komo chat` opens the home conversation, whose id only the store
+            // knows — it lands with the backend a moment from now.
+            format!("Komo v0.1 — opening…\nworkspace: `{}`", workspace.display())
         } else {
-            format!(
-                "Komo v0.1 — session `{}`\nworkspace: `{}`",
-                app.session_id,
-                workspace.display(),
-            )
+            format!("Komo v0.1 — resuming `{}`…", app.session_id)
         },
     );
 
@@ -499,15 +488,11 @@ async fn event_loop(
                 };
                 app.push(
                     Role::Info,
-                    if resuming {
-                        format!(
-                            "{mode}, resumed session `{}`\nworkspace: `{}`",
-                            app.session_id,
-                            workspace.display(),
-                        )
-                    } else {
-                        mode.to_string()
-                    },
+                    format!(
+                        "{mode}, session `{}`\nworkspace: `{}`",
+                        app.session_id,
+                        workspace.display(),
+                    ),
                 );
                 backend = Some(ready.backend);
                 if let Some(text) = pending.take() {
@@ -629,26 +614,36 @@ async fn event_loop(
                     }
                 }
                 Some(Action::NewSession) => {
-                    // The boot task ensures the fresh session's row under the
-                    // id it was given; rotating before it lands would leave
-                    // the first turn on a row nobody created.
+                    // A line in the log, not a new session id: the conversation
+                    // continues, the model just stops being replayed what came
+                    // before (docs/bot-runtime.md §3.8). Nothing else is torn
+                    // down — a suspended turn is still owed its answer.
                     let Some(backend) = &backend else {
                         app.push(Role::Info, "正在启动，稍候再 /new。".to_string());
                         continue;
                     };
-                    // Turns are keyed by session id, so an in-flight turn
-                    // for the old id can finish and render harmlessly. A
-                    // question left standing stays answerable on its own
-                    // session — `/new` ends the conversation, not the turn.
-                    app.awaiting_answer = false;
-                    app.session_id = new_session_id();
-                    if let Backend::Local { db, .. } = backend {
-                        ensure_session(db, &app.session_id, &workspace).await?;
+                    let drawn = match backend {
+                        Backend::Remote { gateway, .. } => gateway
+                            .conversation_boundary(&app.session_id)
+                            .await
+                            .map(|_| ()),
+                        Backend::Local { db, .. } => {
+                            komo_services::conversation::mark_boundary(
+                                &**db,
+                                &**db,
+                                &app.session_id,
+                            )
+                            .await
+                        }
+                    };
+                    match drawn {
+                        Ok(()) => {
+                            app.push(Role::Info, "已开始新的上下文。".to_string());
+                        }
+                        Err(error) => {
+                            app.push(Role::Info, format!("开始新上下文失败：{error}"));
+                        }
                     }
-                    app.push(
-                        Role::Info,
-                        format!("Started new session `{}`", app.session_id),
-                    );
                 }
                 Some(Action::Answer { text, shown }) => {
                     let answered = match &backend {
@@ -888,34 +883,11 @@ fn classify_end(outcome: anyhow::Result<String>) -> TurnEnd {
     }
 }
 
-async fn ensure_session(db: &Db, session_id: &str, workspace: &PathBuf) -> anyhow::Result<()> {
-    if SessionRepository::find(db, session_id).await?.is_none() {
-        let workspace_id = folder_workspace_id(workspace)?;
-        SessionRepository::save(db, &Session::with_workspace(session_id, workspace_id)).await?;
-    }
-    Ok(())
-}
-
-fn new_session_id() -> String {
-    uuid::Uuid::now_v7().to_string()
-}
-
-/// Snapshot the TUI's startup folder once. A session's workspace is immutable,
-/// so later `cd`s in child shells must not redirect a conversation's tools.
+/// Snapshot the TUI's startup folder once, so later `cd`s in child shells
+/// cannot redirect this sitting's tools. It is this *process's* root, not the
+/// session's: the same conversation opened from another directory runs its
+/// turns there.
 fn startup_workspace() -> anyhow::Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     cwd.canonicalize().map_err(Into::into)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::new_session_id;
-
-    #[test]
-    fn a_new_session_id_is_a_bare_uuid() {
-        // The id the TUI prints in its `komo resume` hint is the id the gateway
-        // stores and the id the header carries — one form, nothing to strip.
-        let id = new_session_id();
-        assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
-    }
 }

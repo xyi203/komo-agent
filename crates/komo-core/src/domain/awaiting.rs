@@ -214,6 +214,25 @@ mod tests {
         assert_eq!(project_awaiting(prior, &tail), None);
     }
 
+    /// `/new` and this projection are about different things: one moves where
+    /// the model's replay starts, the other says what the session is stopped
+    /// in. A boundary drawn while a turn is parked must leave the wait exactly
+    /// where it was — the turn is still owed its answer.
+    #[test]
+    fn a_conversation_boundary_leaves_the_wait_alone() {
+        let waiting = project_awaiting(None, &[suspended(1, 1_000)]).expect("waiting");
+        let boundary = [event(
+            2,
+            1_100,
+            SessionEventKind::ConversationBoundary { turn_id: None },
+        )];
+        assert_eq!(
+            project_awaiting(Some(waiting.clone()), &boundary),
+            Some(waiting),
+            "`/new` is invisible to the awaiting projection"
+        );
+    }
+
     #[test]
     fn every_kind_says_what_it_is_waiting_for() {
         assert_eq!(WakeupKind::Approval.label(), "等你审批");

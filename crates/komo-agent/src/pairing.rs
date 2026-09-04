@@ -23,12 +23,27 @@ use komo_core::domain::pairing::{
 
 /// Outcome of the gate for one inbound message.
 pub enum Gate {
-    Allowed,
+    Allowed(Principal),
     /// Not paired: do not run the agent; send `reply` (the pairing prompt)
     /// back on the channel instead.
     Denied {
         reply: String,
     },
+}
+
+/// *Who* was admitted — the first half of conversation resolution
+/// (docs/bot-runtime.md §3.8).
+///
+/// The distinction is already in the config and costs nothing to read off it:
+/// `allow_from` is where the operator writes down their **own** ids on each
+/// platform, and pairing is how they admit **somebody else**. So a pre-trusted
+/// sender is the operator, and an approved pairing is a correspondent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Principal {
+    /// The operator themself. Their private chats are all one conversation.
+    Operator,
+    /// Someone the operator paired with. Gets a conversation of their own.
+    Correspondent,
 }
 
 pub struct PairingGuard {
@@ -50,40 +65,48 @@ impl PairingGuard {
         }
     }
 
-    /// Run the pairing gate and handle a denial in one place: `true` means the
-    /// sender may proceed; `false` means the message was consumed (an unpaired
-    /// sender was sent a pairing code, or the check errored) and the caller
-    /// should skip it. `send_reply` delivers the pairing prompt over the
-    /// channel — the one channel-specific bit (each has its own sender type).
-    /// Consolidates the identical gate/log block the ingress channels repeated.
-    pub async fn admit<F, Fut>(&self, sender_id: &str, chat_id: &str, send_reply: F) -> bool
+    /// Run the pairing gate and handle a denial in one place: `Some(principal)`
+    /// means the sender may proceed and says who they are; `None` means the
+    /// message was consumed (an unpaired sender was sent a pairing code, or the
+    /// check errored) and the caller should skip it. `send_reply` delivers the
+    /// pairing prompt over the channel — the one channel-specific bit (each has
+    /// its own sender type). Consolidates the identical gate/log block the
+    /// ingress channels repeated.
+    pub async fn admit<F, Fut>(
+        &self,
+        sender_id: &str,
+        chat_id: &str,
+        send_reply: F,
+    ) -> Option<Principal>
     where
         F: FnOnce(String) -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<()>>,
     {
         match self.check(sender_id, chat_id).await {
-            Ok(Gate::Allowed) => true,
+            Ok(Gate::Allowed(principal)) => Some(principal),
             Ok(Gate::Denied { reply }) => {
                 info!(platform = self.platform, sender = %sender_id, "sender unpaired; sent pairing code");
                 if let Err(error) = send_reply(reply).await {
                     error!(%error, platform = self.platform, chat = %chat_id, "failed to send pairing prompt");
                 }
-                false
+                None
             }
             Err(error) => {
                 warn!(%error, platform = self.platform, "pairing check failed; dropping message");
-                false
+                None
             }
         }
     }
 
     pub async fn check(&self, sender_id: &str, chat_id: &str) -> anyhow::Result<Gate> {
         if self.allow_from.iter().any(|s| s == sender_id) {
-            return Ok(Gate::Allowed);
+            return Ok(Gate::Allowed(Principal::Operator));
         }
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         match self.pairings.find(self.platform, sender_id).await? {
-            Some(p) if p.status == PairingStatus::Approved => Ok(Gate::Allowed),
+            Some(p) if p.status == PairingStatus::Approved => {
+                Ok(Gate::Allowed(Principal::Correspondent))
+            }
             Some(p) if !p.is_expired(now) => {
                 if now - p.created_at < PAIRING_RATE_LIMIT_SECS {
                     // A code was issued recently; don't mint another (and we
@@ -234,7 +257,7 @@ mod tests {
         let (guard, repo) = guard(vec!["42".to_string()]);
         assert!(matches!(
             guard.check("42", "42").await.unwrap(),
-            Gate::Allowed
+            Gate::Allowed(Principal::Operator)
         ));
         assert!(repo.rows.lock().unwrap().is_empty());
     }
@@ -253,7 +276,11 @@ mod tests {
                 }
             })
             .await;
-        assert!(admitted, "an allow_from sender is admitted");
+        assert_eq!(
+            admitted,
+            Some(Principal::Operator),
+            "an allow_from sender is the operator, admitted without pairing"
+        );
         assert!(sent.lock().unwrap().is_empty(), "no pairing prompt sent");
     }
 
@@ -271,7 +298,7 @@ mod tests {
                 }
             })
             .await;
-        assert!(!admitted, "an unpaired sender is not admitted");
+        assert!(admitted.is_none(), "an unpaired sender is not admitted");
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1, "exactly one pairing prompt sent");
         assert!(sent[0].contains("komo pair approve"), "{}", sent[0]);
@@ -305,7 +332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approved_sender_is_allowed() {
+    async fn approved_sender_is_allowed_as_a_correspondent() {
         let (guard, repo) = guard(vec![]);
         let (request, code) = PairingRequest::mint("telegram", "7", "7");
         repo.upsert(&request).await.unwrap();
@@ -313,10 +340,13 @@ mod tests {
             repo.approve_code(&code).await.unwrap(),
             ApproveOutcome::Approved(_)
         ));
-        assert!(matches!(
-            guard.check("7", "7").await.unwrap(),
-            Gate::Allowed
-        ));
+        assert!(
+            matches!(
+                guard.check("7", "7").await.unwrap(),
+                Gate::Allowed(Principal::Correspondent)
+            ),
+            "pairing admits somebody else, never the operator themself"
+        );
     }
 
     #[tokio::test]

@@ -20,4 +20,19 @@ pub trait HomeRepository: Send + Sync {
     async fn get(&self) -> anyhow::Result<Option<String>>;
     /// Set the home to `address` (`{platform}:{chat_id}`).
     async fn set(&self, address: &str) -> anyhow::Result<()>;
+
+    /// The operator's **home conversation** — one session id, minted the first
+    /// time anything asks for it and stored from then on.
+    ///
+    /// Every private surface the operator speaks to komo through lands here:
+    /// the TUI, the desktop and web clients, a Telegram or Feishu DM, WeChat.
+    /// That is the D6 invariant — same principal + private conversation ⇒ one
+    /// ordered timeline (docs/bot-runtime.md §3.8) — and it is a stored id
+    /// rather than a computed one for the same reason a chat's session id is:
+    /// a conversation's identity is its id and nothing else.
+    ///
+    /// Distinct from [`get`](Self::get), which is an *address* to deliver
+    /// proactive output to. The two are unrelated: a reminder can be sent to a
+    /// Feishu group without that group being the home conversation.
+    async fn home_session(&self) -> anyhow::Result<String>;
 }

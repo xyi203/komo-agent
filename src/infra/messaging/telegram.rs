@@ -20,9 +20,9 @@
 
 use komo_agent::gateway::Channel;
 use komo_agent::interaction::GatewayDispatcher;
-use komo_agent::pairing::PairingGuard;
+use komo_agent::pairing::{PairingGuard, Principal};
 use komo_core::domain::inbox::InboundOrigin;
-use komo_core::domain::session::ChannelPeer;
+use komo_core::domain::session::{ChannelPeer, InboundPeer};
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -237,6 +237,10 @@ struct Inbound {
     message_id: i64,
     sender_id: String,
     chat_id: String,
+    /// A `private` chat. Which conversation a message belongs to depends on it
+    /// (docs/bot-runtime.md §3.8): the operator's DM is their home
+    /// conversation, a group is a conversation with other people.
+    private: bool,
     text: String,
 }
 
@@ -329,15 +333,15 @@ impl Channel for TelegramChannel {
                 // the agent until `komo pair approve` runs on the host.
                 let sender = self.sender.clone();
                 let chat = msg.chat_id.clone();
-                let admitted = self
+                let Some(principal) = self
                     .guard
                     .admit(&msg.sender_id, &msg.chat_id, move |reply| async move {
                         sender.send_text(&chat, &reply).await
                     })
-                    .await;
-                if !admitted {
+                    .await
+                else {
                     continue;
-                }
+                };
                 info!(chat = %msg.chat_id, "telegram message received");
                 let sink: Arc<dyn ReplySink> = Arc::new(TelegramReplySink {
                     sender: self.sender.clone(),
@@ -351,7 +355,11 @@ impl Channel for TelegramChannel {
                 let origin = InboundOrigin::new("telegram", msg.message_id.to_string());
                 dispatcher
                     .handle(
-                        &ChannelPeer::new("telegram", msg.chat_id.to_string()),
+                        &InboundPeer::new(
+                            ChannelPeer::new("telegram", msg.chat_id.to_string()),
+                            msg.private,
+                            principal == Principal::Operator,
+                        ),
                         origin,
                         msg.text,
                         sink,
@@ -375,6 +383,7 @@ fn admit(message: Message, policy: &AdmitPolicy, bot_username: &str) -> Option<I
     let text = message.text?;
     let mention = format!("@{bot_username}");
     let is_group = matches!(message.chat.kind.as_str(), "group" | "supergroup");
+    let private = message.chat.kind == "private";
     if is_group {
         // Group chat-id allowlist (when set): only handle whitelisted chats.
         if !policy.allowed_chats.is_empty()
@@ -401,6 +410,7 @@ fn admit(message: Message, policy: &AdmitPolicy, bot_username: &str) -> Option<I
         message_id: message.message_id,
         sender_id: from.id.to_string(),
         chat_id: message.chat.id.to_string(),
+        private,
         text,
     })
 }

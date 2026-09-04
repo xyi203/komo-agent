@@ -253,6 +253,8 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         let actions = Arc::new(OperatorActions {
             sessions: db.clone(),
             messages: db.clone(),
+            events: db.clone(),
+            todos: db.clone(),
             tasks: kanban.clone(),
             memories: wired.memories.clone(),
             runs: db.clone(),

@@ -24,13 +24,16 @@ use crate::domain::memory::{
 use crate::domain::message::Message;
 use crate::domain::pairing::{ApproveOutcome, PairingRepository, PairingRequest, PairingStatus};
 use crate::domain::reminder::{Reminder, ReminderRepository};
-use crate::domain::repository::{MessageRepository, SessionRepository, SkillRepository};
+use crate::domain::repository::{
+    MessageRepository, SessionEventRepository, SessionRepository, SkillRepository,
+};
 use crate::domain::run::{
     MemoryUse, Run, RunRepository, RunStep, resume_prompt, skill_viewed, step_views_skill,
 };
 use crate::domain::session::Session;
 use crate::domain::skill::Skill;
 use crate::domain::task::{Task, TaskRepository};
+use crate::domain::todo::SessionTodoRepository;
 
 use super::now;
 use super::request::{
@@ -90,6 +93,10 @@ impl WikiOps {
 pub struct OperatorActions {
     pub sessions: Arc<dyn SessionRepository>,
     pub messages: Arc<dyn MessageRepository>,
+    /// The session log — the authority a `/new` boundary is written into.
+    pub events: Arc<dyn SessionEventRepository>,
+    /// Session-scoped working state, retired by that same boundary.
+    pub todos: Arc<dyn SessionTodoRepository>,
     pub tasks: Arc<dyn TaskRepository>,
     pub memories: Arc<dyn MemoryRepository>,
     pub runs: Arc<dyn RunRepository>,
@@ -386,6 +393,22 @@ impl OperatorActions {
 
     pub async fn home_override(&self) -> anyhow::Result<Option<String>> {
         self.home.get().await
+    }
+
+    /// The operator's home conversation, opened the first time it is asked for.
+    /// What a local client (the TUI, the desktop app) starts in.
+    pub async fn home_session(&self) -> anyhow::Result<String> {
+        self.home.home_session().await
+    }
+
+    /// `/new` from a client that is not a chat channel.
+    pub async fn conversation_boundary(&self, session_id: &str) -> anyhow::Result<()> {
+        komo_services::conversation::mark_boundary(
+            self.events.as_ref(),
+            self.todos.as_ref(),
+            session_id,
+        )
+        .await
     }
 
     pub async fn list_cron_jobs(&self) -> anyhow::Result<Vec<CronJob>> {

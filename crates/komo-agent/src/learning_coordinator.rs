@@ -655,9 +655,6 @@ mod tests {
         async fn delete_empty_sessions(&self) -> anyhow::Result<usize> {
             Ok(0)
         }
-        async fn rotate(&self, _session_id: &str) -> anyhow::Result<Option<String>> {
-            Ok(None)
-        }
     }
 
     /// Records the episodes it was handed, per call.

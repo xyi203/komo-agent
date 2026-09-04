@@ -259,6 +259,21 @@ pub enum SessionEventKind {
     /// inside a run that had already closed.
     #[serde(rename = "task/settled")]
     TaskSettled(TaskSettledEvent),
+
+    /// `/new`: the operator drew a line under the conversation so far.
+    ///
+    /// One appended event, not a new session id — the home conversation is one
+    /// ordered timeline (docs/bot-runtime.md §3.8), and rotating the id would
+    /// break that. It is invisible to seq, recovery, approvals and every
+    /// projection; the *only* thing it decides is how far back the model is
+    /// replayed by default ([`SurfaceProjection::replayed`]).
+    #[serde(rename = "conversation/boundary")]
+    ConversationBoundary {
+        /// The turn that wrote it, when a turn did. A chat `/new` is not part
+        /// of any turn, so it usually has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+    },
 }
 
 /// What a suspended turn is waiting for.
@@ -1096,6 +1111,7 @@ pub const KNOWN_EVENT_TYPES: &[&str] = &[
     "wakeup/fired",
     "task/spawned",
     "task/settled",
+    "conversation/boundary",
 ];
 
 /// The ordered conversation surface, folded from a log.
@@ -1108,6 +1124,13 @@ pub struct Surface {
     /// Committed positional replacements, so an incremental consumer can tell
     /// plain tail growth from a rewrite.
     replace_generation: u64,
+    /// The seq of the most recent `conversation/boundary`, when one was drawn.
+    ///
+    /// Nothing leaves the surface for it: the conversation still happened, and
+    /// the transcript still shows it. It only marks where the model's default
+    /// replay starts — see [`SurfaceProjection::replayed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boundary: Option<u64>,
 }
 
 impl Surface {
@@ -1117,6 +1140,10 @@ impl Surface {
 
     pub fn replace_generation(&self) -> u64 {
         self.replace_generation
+    }
+
+    pub fn boundary(&self) -> Option<u64> {
+        self.boundary
     }
 
     /// Drop every node the predicate rejects. Used by the pristine-cancel rule;
@@ -1222,6 +1249,9 @@ pub fn fold_surface_from(
             expected += 1;
         }
         previous = Some(event.seq);
+        if let SessionEventKind::ConversationBoundary { .. } = &event.kind {
+            surface.boundary = Some(event.seq);
+        }
         if let Some(placement) = event.surface() {
             surface.apply(event.seq, placement)?;
             if let Some(turn) = event.turn_id() {
@@ -1340,15 +1370,59 @@ impl SurfaceProjection {
         })
     }
 
-    /// The messages a later turn replays.
+    /// The whole conversation, oldest first — the transcript.
+    ///
+    /// A `conversation/boundary` is deliberately invisible here: what the
+    /// operator drew a line under still happened, and every reader of the
+    /// *record* (the session tool, episodic indexing, the reviewer, a client
+    /// hydrating a window) must still see it. What the boundary decides is
+    /// [`replay`](Self::replay).
     pub fn messages(&self) -> Result<Vec<Message>, FoldError> {
+        self.messages_of(self.surface.nodes())
+    }
+
+    /// The messages a later turn replays: everything after the most recent
+    /// `conversation/boundary`.
+    ///
+    /// The cut lands on the **last assistant node at or before the boundary**,
+    /// not on the boundary itself. A turn that was still open when the line was
+    /// drawn — one suspended on an approval, say — has a user message on the
+    /// surface with no answer under it, and hiding that would leave its
+    /// continuation replying to a conversation it cannot see. `/new` ends a
+    /// context, not a turn already in flight (docs/bot-runtime.md §3.8).
+    pub fn replayed(&self) -> Vec<u64> {
+        let nodes = self.surface.nodes();
+        let Some(boundary) = self.surface.boundary() else {
+            return nodes.to_vec();
+        };
         let content: std::collections::HashMap<u64, &SurfaceContent> = self
             .content
             .iter()
             .map(|(seq, node)| (*seq, node))
             .collect();
-        let mut out: Vec<Message> = Vec::with_capacity(self.surface.nodes().len());
-        for seq in self.surface.nodes() {
+        let cut = nodes.iter().rposition(|seq| {
+            *seq <= boundary
+                && content.get(seq).map(|node| node.role) == Some(SurfaceRole::Assistant)
+        });
+        match cut {
+            Some(last) => nodes[last + 1..].to_vec(),
+            None => nodes.to_vec(),
+        }
+    }
+
+    /// [`messages`](Self::messages), cut at the conversation boundary.
+    pub fn replay(&self) -> Result<Vec<Message>, FoldError> {
+        self.messages_of(&self.replayed())
+    }
+
+    fn messages_of(&self, nodes: &[u64]) -> Result<Vec<Message>, FoldError> {
+        let content: std::collections::HashMap<u64, &SurfaceContent> = self
+            .content
+            .iter()
+            .map(|(seq, node)| (*seq, node))
+            .collect();
+        let mut out: Vec<Message> = Vec::with_capacity(nodes.len());
+        for seq in nodes {
             let Some(node) = content.get(seq) else {
                 // The surface only ever holds nodes this folded, so this is
                 // unreachable through `fold` — but a caller assembling one by
@@ -1700,6 +1774,14 @@ mod tests {
         )
     }
 
+    fn boundary(seq: u64) -> SessionEvent {
+        SessionEvent::new(
+            seq,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::ConversationBoundary { turn_id: None },
+        )
+    }
+
     fn said(seq: u64, turn: &str, text: &str, source: MessageSource) -> SessionEvent {
         SessionEvent::new(
             seq,
@@ -1742,6 +1824,11 @@ mod tests {
             cancelled(7, "turn-4", true),
             said(8, "turn-5", "q3", MessageSource::User),
             assistant(9, "a3"),
+            // `/new`: nothing leaves the surface, so the transcript is
+            // unchanged — but every split has to fold the same boundary.
+            boundary(10),
+            said(11, "turn-6", "q4", MessageSource::User),
+            assistant(12, "a4"),
         ];
 
         // `Message` is not comparable, so compare what it carries.
@@ -1765,7 +1852,26 @@ mod tests {
                 .iter()
                 .map(|(_, content, _)| content.as_str())
                 .collect::<Vec<_>>(),
-            vec!["earlier: q1/a1", "q2\nand also this", "a2", "q3", "a3"],
+            vec![
+                "earlier: q1/a1",
+                "q2\nand also this",
+                "a2",
+                "q3",
+                "a3",
+                "q4",
+                "a4"
+            ],
+        );
+        let replayed: Vec<String> = cold
+            .replay()
+            .unwrap()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(
+            replayed,
+            vec!["q4", "a4"],
+            "the model starts after the line"
         );
 
         for split in 0..=events.len() {
@@ -1779,8 +1885,71 @@ mod tests {
                 expected,
                 "a checkpoint after {split} events must not change the history"
             );
+            assert_eq!(
+                shape(&warm.replay().unwrap()),
+                shape(&cold.replay().unwrap()),
+                "nor where the boundary puts the model's replay"
+            );
             assert_eq!(warm.surface, cold.surface, "split at {split}");
         }
+    }
+
+    /// `/new` draws a line; it does not delete. The transcript keeps every
+    /// word — that is what `komo run inspect`, episodic search and a client
+    /// hydrating the window read — and only the model's replay moves.
+    #[test]
+    fn a_boundary_moves_the_replay_and_leaves_the_transcript_whole() {
+        let mut events = vec![
+            said(0, "turn-1", "q1", MessageSource::User),
+            assistant(1, "a1"),
+            boundary(2),
+            said(3, "turn-2", "q2", MessageSource::User),
+            assistant(4, "a2"),
+        ];
+        let folded = SurfaceProjection::fold(&events, 0).unwrap();
+        assert_eq!(folded.surface.nodes(), &[0, 1, 3, 4], "nothing left");
+        assert_eq!(folded.messages().unwrap().len(), 4);
+        assert_eq!(
+            folded
+                .replay()
+                .unwrap()
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            vec!["q2", "a2"],
+        );
+
+        // A second line supersedes the first.
+        events.push(boundary(5));
+        let folded = SurfaceProjection::fold(&events, 0).unwrap();
+        assert!(folded.replay().unwrap().is_empty());
+        assert_eq!(folded.messages().unwrap().len(), 4, "still all of it");
+    }
+
+    /// The one thing a boundary must not do: strand a turn that was still in
+    /// flight when it was drawn. A turn suspended on an approval has a user
+    /// message and no answer under it; hiding that would leave its continuation
+    /// replying to a conversation it cannot see, and `/new` does not end turns.
+    #[test]
+    fn a_boundary_does_not_hide_a_turn_that_was_still_open() {
+        let events = vec![
+            said(0, "turn-1", "q1", MessageSource::User),
+            assistant(1, "a1"),
+            said(2, "turn-2", "删掉那个目录", MessageSource::User),
+            // turn-2 suspends on an approval — no assistant message.
+            boundary(3),
+        ];
+        let folded = SurfaceProjection::fold(&events, 0).unwrap();
+        assert_eq!(
+            folded
+                .replay()
+                .unwrap()
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            vec!["删掉那个目录"],
+            "the unanswered question stays; the settled exchange before it goes"
+        );
     }
 
     /// A checkpoint written before a retention cut is not resumable: every seq

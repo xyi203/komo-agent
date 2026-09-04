@@ -375,7 +375,8 @@ impl ProviderLlm {
         // Window the replayed history to the most recent `max_history_messages`
         // (0 = keep everything). Without this a long-lived chat session
         // (telegram/feishu/wechat are keyed by chat id and only rotate on an
-        // explicit `/new`) would resend its entire transcript every turn —
+        // explicit context boundary) would resend its entire transcript every
+        // turn —
         // unbounded token cost and latency, eventually overflowing the context
         // window. The stable system-prompt + memory prefix is untouched, so the
         // upstream prompt cache is unaffected by trimming the tail.
@@ -1561,7 +1562,7 @@ fn endpoint_url(provider: Provider, base_url: Option<&str>) -> String {
 /// as model history, under two independent bounds.
 ///
 /// Without a window, a long-lived chat session — telegram/feishu/wechat are keyed
-/// by chat id and only rotate on an explicit `/new` — resends its whole transcript
+/// by chat id and only cut on an explicit `/new` — resends its whole transcript
 /// every turn. `max_messages` is the count bound (`0` = keep everything);
 /// `max_bytes` is the size bound (`0` = no size limit), and it exists because a
 /// count says nothing about volume: twenty messages of pasted build output

@@ -83,19 +83,6 @@ pub fn folder_workspace_id(dir: &Path) -> anyhow::Result<String> {
     ))
 }
 
-/// Resolve a persisted `folder:` workspace identity back to its canonical local
-/// directory. Invalid or no-longer-existing folders deliberately have no
-/// workspace rather than widening a resumed session to the caller's cwd.
-pub fn folder_workspace_path(id: &str) -> Option<std::path::PathBuf> {
-    let encoded = id.strip_prefix("folder:")?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded)
-        .ok()?;
-    let path = std::path::PathBuf::from(String::from_utf8(bytes).ok()?);
-    let path = path.canonicalize().ok()?;
-    path.is_dir().then_some(path)
-}
-
 pub struct GatewayClient {
     base: String,
     key: String,
@@ -272,6 +259,23 @@ impl GatewayClient {
 
     pub async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
         self.get_field("/api/sessions", "sessions").await
+    }
+
+    /// The operator's home conversation, opened on first ask. A local client
+    /// starts here rather than minting its own id, which is what makes the TUI
+    /// and a Telegram DM one thread (docs/bot-runtime.md §2 D6).
+    pub async fn home_session(&self) -> anyhow::Result<String> {
+        self.get_field("/api/home-session", "session").await
+    }
+
+    /// `/new`: draw a context boundary in `session`.
+    pub async fn conversation_boundary(&self, session: &str) -> anyhow::Result<bool> {
+        self.post_field(
+            &format!("/api/sessions/{session}/boundary"),
+            json!({}),
+            "ok",
+        )
+        .await
     }
 
     /// Transcript entries for one known session, used to hydrate a resumed TUI.
@@ -753,16 +757,6 @@ mod workspace_tests {
             Path::new(std::str::from_utf8(&decoded).unwrap()),
             dir.canonicalize().unwrap()
         );
-    }
-
-    #[test]
-    fn folder_workspace_path_decodes_an_existing_directory() {
-        let dir = std::env::temp_dir();
-        assert_eq!(
-            folder_workspace_path(&folder_workspace_id(&dir).unwrap()),
-            Some(dir.canonicalize().unwrap())
-        );
-        assert_eq!(folder_workspace_path("folder:not-base64"), None);
     }
 }
 

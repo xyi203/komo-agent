@@ -42,7 +42,7 @@ use komo_core::domain::{
     policy::{Rule, RuleSpec},
     repository::{SessionEventRepository, SessionRepository},
     run::RunRepository,
-    session::{ChannelPeer, Session},
+    session::{InboundPeer, Session},
     session_event::{
         ApprovalResolvedEvent, MessageSource, SessionEventKind, SurfacePlacement, UserMessageEvent,
         Wakeup, WakeupCause, WakeupFiredEvent,
@@ -243,7 +243,7 @@ impl CancelSignal for WatchCancel {
 /// Shared approval state, keyed by session: the pending prompt's reply channel
 /// plus the set of scope keys the user has approved "for this session". Shared
 /// between [`ChatApprover`] (registers/awaits) and [`GatewayDispatcher`]
-/// (resolves on `/approve`, clears on `/new`).
+/// (resolves on `/approve`).
 pub struct ApprovalState {
     pending: Mutex<HashMap<String, PendingApproval>>,
     approved: Mutex<HashMap<String, HashSet<String>>>,
@@ -345,19 +345,12 @@ impl ApprovalState {
             .insert(scope_key.to_string());
     }
 
-    /// Forget all approval state for `session` (on `/new`): cancel any pending
-    /// wait and drop the session's "allow for this session" set.
-    pub fn clear(&self, session: &str) {
-        self.forget_pending(session);
-        self.approved.lock().unwrap().remove(session);
-        self.gates.lock().unwrap().remove(session);
-    }
-
     /// Reclaim the session's transient serialization gate between turns
     /// (recreated on demand by [`gate`](Self::gate)). Called when a turn
     /// finishes so the `gates` map doesn't accumulate one entry per session for
     /// the gateway's lifetime. The `approved` set is deliberately *not* touched
-    /// — it is session-scoped and must survive until `/new`.
+    /// — it is session-scoped and outlives a conversation boundary, because it
+    /// is an answer about what komo may do rather than about what was discussed.
     fn release_gate(&self, session: &str) {
         self.gates.lock().unwrap().remove(session);
     }
@@ -724,8 +717,11 @@ impl WakeupDispatch for TurnWaker {
         cause: WakeupCause,
         payload: &str,
     ) -> anyhow::Result<()> {
+        // No sink: a sweep tick and a settling background task have nobody
+        // standing at a channel waiting for the answer — it lands in the
+        // transcript, which is where the next reader looks.
         self.dispatcher
-            .continue_turn_with(registration, cause, payload)
+            .continue_turn_with(registration, cause, payload, None)
             .await
     }
 }
@@ -939,18 +935,31 @@ impl GatewayDispatcher {
         registration: &WakeupRegistration,
         cause: WakeupCause,
     ) -> anyhow::Result<()> {
-        self.continue_turn_with(registration, cause, "").await
+        self.continue_turn_with(registration, cause, "", None).await
     }
 
-    /// The same, carrying what the wake brought — the user's answer to an
-    /// `ask_user` question, a webhook's body. It rides on `wakeup/fired`, which
-    /// is where the call that stopped reads it when it is re-dispatched: one
-    /// record, so what woke the turn and what it was handed cannot disagree.
+    /// The same, carrying what the wake brought and where to answer.
+    ///
+    /// `payload` is what the thing that happened produced — the user's answer
+    /// to an `ask_user` question, a webhook's body. It rides on `wakeup/fired`,
+    /// which is where the call that stopped reads it when it is re-dispatched:
+    /// one record, so what woke the turn and what it was handed cannot
+    /// disagree.
+    ///
+    /// `sink` is where the continuation's reply goes, and it is **the surface
+    /// that answered, not the one that asked**. A turn suspended in the TUI and
+    /// released by `/approve` from Telegram answers into Telegram — the
+    /// operator is standing there, and a reply that only lands in a transcript
+    /// nobody is looking at reads as silence. It lands in the log either way,
+    /// which is what the TUI shows when it is opened again. `None` for a wake
+    /// nobody is waiting on the other end of — a sweep firing a timer, a
+    /// settling background task, the GUI's modal (which polls the transcript).
     pub async fn continue_turn_with(
         self: &Arc<Self>,
         registration: &WakeupRegistration,
         cause: WakeupCause,
         payload: &str,
+        sink: Option<Arc<dyn ReplySink>>,
     ) -> anyhow::Result<()> {
         let Some(waits) = self.waits.clone() else {
             anyhow::bail!("this dispatcher has no store to continue a turn from");
@@ -961,7 +970,7 @@ impl GatewayDispatcher {
             // What it brought is the whole message — a wake with no turn and
             // nothing to say would open a turn about nothing.
             return self
-                .start_turn_with(&registration.session_id, payload)
+                .start_turn_with(&registration.session_id, payload, sink)
                 .await;
         };
         let Some(run) = waits.runs.get(&turn_id).await? else {
@@ -994,7 +1003,12 @@ impl GatewayDispatcher {
             .await;
             claim.release();
             match outcome {
-                Ok(Some(_)) => {
+                Ok(Some(reply)) => {
+                    if let Some(sink) = &sink
+                        && let Err(error) = sink.send(&reply).await
+                    {
+                        warn!(%error, turn = %run.id, "failed to deliver a woken turn's reply");
+                    }
                     info!(turn = %run.id, cause = cause.as_str(), "continued a woken turn")
                 }
                 // The continuation declined — the transcript already ends in a
@@ -1024,6 +1038,7 @@ impl GatewayDispatcher {
         self: &Arc<Self>,
         session_id: &str,
         payload: &str,
+        sink: Option<Arc<dyn ReplySink>>,
     ) -> anyhow::Result<()> {
         if payload.trim().is_empty() {
             warn!(session = %session_id, "a wake with no turn and nothing to say opens nothing");
@@ -1042,7 +1057,18 @@ impl GatewayDispatcher {
             let outcome = with_session(ctx, dispatcher.handler.handle(&session, input)).await;
             claim.release();
             match outcome {
-                Ok(_) => info!(session = %session, "opened a turn with what a wake carried"),
+                Ok(reply) => {
+                    // Same rule as a continuation's: deliver where the wake was
+                    // answered from when someone is there, and otherwise let the
+                    // transcript be the record. A settling background task has
+                    // nobody there, so this is usually `None`.
+                    if let Some(sink) = &sink
+                        && let Err(error) = sink.send(&reply).await
+                    {
+                        warn!(%error, session = %session, "failed to deliver a woken turn's reply");
+                    }
+                    info!(session = %session, "opened a turn with what a wake carried")
+                }
                 Err(error) => warn!(%error, session = %session, "a woken turn failed"),
             }
         });
@@ -1065,6 +1091,19 @@ impl GatewayDispatcher {
         }
     }
 
+    /// `/new`: draw a context boundary in this conversation's log.
+    async fn mark_boundary(&self, session_id: &str) -> anyhow::Result<()> {
+        let Some(waits) = self.waits.as_ref() else {
+            anyhow::bail!("this dispatcher has no log to write a boundary into");
+        };
+        komo_services::conversation::mark_boundary(
+            waits.events.as_ref(),
+            self.todos.as_ref(),
+            session_id,
+        )
+        .await
+    }
+
     /// A plain message while this session has an approval parked on it.
     ///
     /// Answers whether it was taken as an answer. The message is appended to
@@ -1076,7 +1115,12 @@ impl GatewayDispatcher {
     /// Not "deny and start a new turn": the model would then answer the new
     /// message without knowing the action it asked about was dropped, and the
     /// user would see two turns for one exchange.
-    async fn moved_on(self: &Arc<Self>, session_id: &str, input: &str) -> bool {
+    async fn moved_on(
+        self: &Arc<Self>,
+        session_id: &str,
+        input: &str,
+        sink: Arc<dyn ReplySink>,
+    ) -> bool {
         let Some(waits) = self.waits.clone() else {
             return false;
         };
@@ -1112,7 +1156,8 @@ impl GatewayDispatcher {
         )));
         self.approvals.resolve(session_id, refusal.clone());
         matches!(
-            self.answer_suspended(session_id, None, &refusal).await,
+            self.answer_suspended(session_id, None, &refusal, Some(sink))
+                .await,
             Answered::Here | Answered::Elsewhere(_)
         )
     }
@@ -1133,7 +1178,9 @@ impl GatewayDispatcher {
     ) -> bool {
         let granted = self.approvals.resolve_scoped(session_id, answer.clone());
         let narrowed = granted.clone().unwrap_or_else(|| narrow_unknown(answer));
-        let woken = self.answer_suspended(session_id, id, &narrowed).await;
+        // No sink: the GUI reads the continuation's reply out of the transcript
+        // it is already polling.
+        let woken = self.answer_suspended(session_id, id, &narrowed, None).await;
         granted.is_some() || woken != Answered::Nothing
     }
 
@@ -1149,6 +1196,7 @@ impl GatewayDispatcher {
         session_id: &str,
         id: Option<&str>,
         answer: &Answer,
+        sink: Option<Arc<dyn ReplySink>>,
     ) -> Answered {
         let Some(waits) = self.waits.clone() else {
             return Answered::Nothing;
@@ -1223,7 +1271,10 @@ impl GatewayDispatcher {
             true => WakeupCause::Approve,
             false => WakeupCause::Deny,
         };
-        if let Err(error) = self.continue_turn(&registration, cause).await {
+        if let Err(error) = self
+            .continue_turn_with(&registration, cause, "", sink)
+            .await
+        {
             warn!(%error, turn = %turn_id, "failed to continue an answered turn");
         }
         match registration.session_id == session_id {
@@ -1286,7 +1337,16 @@ impl GatewayDispatcher {
     /// plain chat message, the GUI's inline reply, `/skip` (an empty answer,
     /// which the tool reads as "nobody answered"). Answers whether anything was
     /// waiting.
-    pub async fn answer_question(self: &Arc<Self>, session_id: &str, text: &str) -> bool {
+    ///
+    /// `sink` is where the continuation replies — the surface that answered,
+    /// which need not be the one that asked. `None` for the GUI and the api,
+    /// which read the reply out of the transcript they already poll.
+    pub async fn answer_question(
+        self: &Arc<Self>,
+        session_id: &str,
+        text: &str,
+        sink: Option<Arc<dyn ReplySink>>,
+    ) -> bool {
         let Some(waits) = self.waits.clone() else {
             return false;
         };
@@ -1313,7 +1373,10 @@ impl GatewayDispatcher {
             true => WakeupCause::MovedOn,
             false => WakeupCause::Reply,
         };
-        if let Err(error) = self.continue_turn_with(&registration, cause, text).await {
+        if let Err(error) = self
+            .continue_turn_with(&registration, cause, text, sink)
+            .await
+        {
             warn!(%error, "failed to continue an answered turn");
             return false;
         }
@@ -1367,17 +1430,17 @@ impl GatewayDispatcher {
     /// three copies of "find or open the session".
     pub async fn handle(
         self: &Arc<Self>,
-        peer: &ChannelPeer,
+        from: &InboundPeer,
         origin: InboundOrigin,
         text: String,
         sink: Arc<dyn ReplySink>,
     ) {
-        let session_id = match self.session_for(peer).await {
+        let session_id = match self.session_for(from).await {
             Ok(id) => id,
             Err(error) => {
                 // Without a session there is nowhere to put the turn, so say so
                 // rather than drop the message silently.
-                warn!(%error, platform = %peer.platform, "could not open a session for this chat");
+                warn!(%error, platform = %from.peer.platform, "could not open a session for this chat");
                 let _ = sink.send("会话打开失败，请稍后再试。").await;
                 return;
             }
@@ -1399,7 +1462,7 @@ impl GatewayDispatcher {
                 warn!(%error, "inbox claim failed; handling the message anyway");
             }
         }
-        self.dispatch(session_id, peer, text, sink).await;
+        self.dispatch(session_id, from, text, sink).await;
         if let Err(error) = self.inbox.complete(&origin).await {
             // The row stays `claimed`. Harmless today (the key already blocks a
             // redelivery); it becomes the signal for crash re-delivery later.
@@ -1407,22 +1470,34 @@ impl GatewayDispatcher {
         }
     }
 
-    /// The session that answers `peer`, opening one the first time that
-    /// correspondent writes.
+    /// Which conversation this message belongs to — the two-step resolution of
+    /// docs/bot-runtime.md §3.8.
+    ///
+    /// **Principal first**: the channel's admission gate already knows whether
+    /// the sender is the operator (`allow_from`) or somebody they paired with.
+    /// **Then conversation**: the operator writing privately is always the one
+    /// home conversation, whichever surface they picked up — a Telegram DM at
+    /// lunch and the TUI in the afternoon are one continuous timeline, not two
+    /// half-informed ones. Everything else is a conversation *with someone*, and
+    /// keys on the correspondent exactly as it always did.
     ///
     /// A conversation's identity is its session id and nothing else, so the map
     /// from an address to that id is **stored**, not computed. It used to be
     /// computed — the session id *was* `feishu:{chat_id}` — which meant a
     /// conversation could not exist without an address, an address could not
     /// change, and anything able to name a session id could name a channel.
-    async fn session_for(&self, peer: &ChannelPeer) -> anyhow::Result<String> {
-        if let Some(existing) = self.sessions.find_by_peer(peer).await? {
+    async fn session_for(&self, from: &InboundPeer) -> anyhow::Result<String> {
+        if from.is_home() {
+            return self.home.home_session().await;
+        }
+        if let Some(existing) = self.sessions.find_by_peer(&from.peer).await? {
             return Ok(existing.id);
         }
-        let session = Session::new(uuid::Uuid::now_v7().to_string()).with_channel(peer.clone());
+        let session =
+            Session::new(uuid::Uuid::now_v7().to_string()).with_channel(from.peer.clone());
         self.sessions.save(&session).await?;
         info!(
-            platform = %peer.platform,
+            platform = %from.peer.platform,
             session = %session.id,
             "opened a session for a new chat"
         );
@@ -1433,7 +1508,7 @@ impl GatewayDispatcher {
     async fn dispatch(
         self: &Arc<Self>,
         session_id: &str,
-        peer: &ChannelPeer,
+        from: &InboundPeer,
         text: String,
         sink: Arc<dyn ReplySink>,
     ) {
@@ -1447,7 +1522,7 @@ impl GatewayDispatcher {
                 let granted = self.approvals.resolve_scoped(session_id, answer.clone());
                 let narrowed = granted.clone().unwrap_or_else(|| narrow_unknown(answer));
                 let woken = self
-                    .answer_suspended(session_id, id.as_deref(), &narrowed)
+                    .answer_suspended(session_id, id.as_deref(), &narrowed, Some(sink.clone()))
                     .await;
                 if granted.is_none() && woken != Answered::Nothing {
                     let _ = sink.send(answered_elsewhere(&woken)).await;
@@ -1475,7 +1550,7 @@ impl GatewayDispatcher {
                 let answer = Answer::Deny(reason);
                 let in_memory = self.approvals.resolve(session_id, answer.clone());
                 let woken = self
-                    .answer_suspended(session_id, id.as_deref(), &answer)
+                    .answer_suspended(session_id, id.as_deref(), &answer, Some(sink.clone()))
                     .await;
                 if !in_memory && woken != Answered::Nothing {
                     let _ = sink.send(answered_elsewhere(&woken)).await;
@@ -1493,39 +1568,41 @@ impl GatewayDispatcher {
                 let _ = sink.send(reply).await;
             }
             Command::Skip => {
-                let reply = match self.answer_question(session_id, "").await {
+                let reply = match self
+                    .answer_question(session_id, "", Some(sink.clone()))
+                    .await
+                {
                     true => "已跳过，这一轮正在继续。",
                     false => "当前没有待回答的问题。",
                 };
                 let _ = sink.send(reply).await;
             }
             Command::New => {
-                self.approvals.clear(session_id);
-                // A suspended turn deliberately survives `/new` (its question
-                // can still be answered, its approval still granted) — the
-                // rotate only ends the *conversation*.
-                // The working todo list is session-scoped; a fresh conversation
-                // starts with an empty one. (The session id is reused across the
-                // rotate, so the row must be cleared explicitly.)
-                if let Err(error) = self.todos.clear(session_id).await {
-                    warn!(%error, "failed to clear session todos (non-fatal)");
-                }
-                // Rotate (hermes-style): archive the old transcript, leave the
-                // chat's session empty for a fresh conversation.
-                match self.sessions.rotate(session_id).await {
-                    Ok(archived) => {
-                        info!(session = %session_id, ?archived, "session rotated via /new")
+                // A line in the log, not a new session: the conversation is
+                // one ordered timeline and rotating its id would break that
+                // (§3.8). Nothing else here is touched — a turn suspended on a
+                // question or an approval is still owed its answer,
+                // `/approve session` grants are about permission rather than
+                // about what was being discussed, and tasks and memories were
+                // never this conversation's to end.
+                let reply = match self.mark_boundary(session_id).await {
+                    Ok(()) => {
+                        info!(session = %session_id, "conversation boundary via /new");
+                        "已开始新的上下文；之前的对话仍在这条会话里，只是不再默认带给模型。"
                     }
-                    Err(error) => warn!(%error, "session rotate failed (non-fatal)"),
-                }
-                let _ = sink.send("已开始新会话，之前的上下文已归档。").await;
+                    Err(error) => {
+                        warn!(%error, "failed to record a conversation boundary");
+                        "开始新上下文失败，请稍后再试。"
+                    }
+                };
+                let _ = sink.send(reply).await;
             }
             Command::SetHome => {
                 // The *address*, not the session: proactive output is delivered
                 // to a correspondent, and a session id names no channel.
-                let reply = match self.home.set(&peer.address()).await {
+                let reply = match self.home.set(&from.peer.address()).await {
                     Ok(()) => {
-                        info!(home = %peer.address(), "home channel set via /sethome");
+                        info!(home = %from.peer.address(), "home channel set via /sethome");
                         "✅ 已将当前会话设为提醒与通知的接收频道。"
                     }
                     Err(error) => {
@@ -1546,7 +1623,10 @@ impl GatewayDispatcher {
                 // turn starts. Control commands above keep priority (`/deny`
                 // etc. never reach here), and a second message while the turn
                 // keeps running queues as usual via `spawn_turn`.
-                if self.answer_question(session_id, &input).await {
+                if self
+                    .answer_question(session_id, &input, Some(sink.clone()))
+                    .await
+                {
                     return;
                 }
                 // Same rule for an approval this session is parked on: the user
@@ -1555,7 +1635,7 @@ impl GatewayDispatcher {
                 // joins the suspended turn, the approval resolves as refused,
                 // and the turn continues — so the model sees both the refusal
                 // and what was actually said, in one turn instead of two.
-                if self.moved_on(session_id, &input).await {
+                if self.moved_on(session_id, &input, sink.clone()).await {
                     return;
                 }
                 self.spawn_turn(session_id, input, sink)
@@ -1760,7 +1840,7 @@ impl GatewayDispatcher {
     fn finish_turn(self: &Arc<Self>, session: &str) {
         // Any approval the turn abandoned (a tool call never resolved) is dropped,
         // and the transient serialization gate is reclaimed (the session-scoped
-        // "approved for session" set stays until `/new`).
+        // "approved for session" set stays for the session).
         self.approvals.forget_pending(session);
         self.approvals.release_gate(session);
         let next = {
@@ -1923,6 +2003,8 @@ impl Drop for TurnGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use komo_core::domain::session::ChannelPeer;
+    use komo_core::domain::session_event::SurfaceRole;
     use std::time::Duration;
 
     #[test]
@@ -2060,14 +2142,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clearing_drops_the_pending_prompt() {
-        let state = ApprovalState::new();
-        state.note_pending("s1", sample_pending());
-        state.clear("s1");
-        assert!(state.pending_info("s1").is_none());
-    }
-
-    #[tokio::test]
     async fn session_approval_cache_remembers_scope_keys() {
         let state = ApprovalState::new();
         assert!(!state.is_session_approved("s1", "file:write"));
@@ -2075,8 +2149,6 @@ mod tests {
         assert!(state.is_session_approved("s1", "file:write"));
         // Scoped per session.
         assert!(!state.is_session_approved("s2", "file:write"));
-        state.clear("s1");
-        assert!(!state.is_session_approved("s1", "file:write"));
     }
 
     // --- GatewayDispatcher turn queue / panic recovery -----------------------
@@ -2105,6 +2177,81 @@ mod tests {
             permit.forget();
             Ok(input)
         }
+    }
+
+    /// A turn that actually writes to the session log: reports the session it
+    /// ran on, and appends the user/assistant pair a real turn would. Enough to
+    /// prove two ingresses share one ordered timeline.
+    struct SayingHandler {
+        entered: mpsc::UnboundedSender<String>,
+        events: Arc<dyn SessionEventRepository>,
+    }
+
+    #[async_trait]
+    impl MessageHandler for SayingHandler {
+        async fn handle(&self, session_id: &str, input: String) -> anyhow::Result<String> {
+            said(
+                self.events.as_ref(),
+                session_id,
+                "turn",
+                SurfaceRole::User,
+                &input,
+            )
+            .await;
+            said(
+                self.events.as_ref(),
+                session_id,
+                "turn",
+                SurfaceRole::Assistant,
+                "ok",
+            )
+            .await;
+            let _ = self.entered.send(session_id.to_string());
+            Ok("ok".to_string())
+        }
+    }
+
+    /// Append one surface message to a session's log.
+    async fn said(
+        events: &dyn SessionEventRepository,
+        session_id: &str,
+        turn: &str,
+        role: SurfaceRole,
+        text: &str,
+    ) {
+        let kind = match role {
+            SurfaceRole::Assistant => SessionEventKind::AssistantMessage(
+                komo_core::domain::session_event::AssistantMessageEvent {
+                    turn_id: turn.to_string(),
+                    content: text.to_string(),
+                    tool_note: String::new(),
+                    surface: SurfacePlacement::append(),
+                },
+            ),
+            _ => SessionEventKind::UserMessage(UserMessageEvent {
+                turn_id: turn.to_string(),
+                content: text.to_string(),
+                source: MessageSource::User,
+                surface: SurfacePlacement::append(),
+            }),
+        };
+        events.append(session_id, vec![kind]).await.unwrap();
+        events.durable_flush(session_id).await.unwrap();
+    }
+
+    /// A real store under a scratch home, so a test can read a log back.
+    async fn test_db(name: &str) -> Arc<komo_infra::persistence::db::Db> {
+        let home = std::env::temp_dir().join(name);
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        Arc::new(
+            komo_infra::persistence::db::Db::connect(&format!(
+                "turso:{}",
+                home.join("komo.db").display()
+            ))
+            .await
+            .unwrap(),
+        )
     }
 
     /// A sink that records every text sent through it.
@@ -2189,33 +2336,49 @@ mod tests {
         async fn delete_empty_sessions(&self) -> anyhow::Result<usize> {
             unimplemented!()
         }
-        async fn rotate(&self, _session_id: &str) -> anyhow::Result<Option<String>> {
-            unimplemented!()
-        }
     }
 
-    struct UnusedHome;
+    /// The home conversation's stored id, minted on first ask like the real one.
+    #[derive(Default)]
+    struct MemoryHome {
+        address: Mutex<Option<String>>,
+        session: Mutex<Option<String>>,
+    }
+
     #[async_trait]
-    impl HomeRepository for UnusedHome {
+    impl HomeRepository for MemoryHome {
         async fn get(&self) -> anyhow::Result<Option<String>> {
-            unimplemented!()
+            Ok(self.address.lock().unwrap().clone())
         }
-        async fn set(&self, _session_id: &str) -> anyhow::Result<()> {
-            unimplemented!()
+        async fn set(&self, address: &str) -> anyhow::Result<()> {
+            *self.address.lock().unwrap() = Some(address.to_string());
+            Ok(())
+        }
+        async fn home_session(&self) -> anyhow::Result<String> {
+            let mut held = self.session.lock().unwrap();
+            Ok(held
+                .get_or_insert_with(|| uuid::Uuid::now_v7().to_string())
+                .clone())
         }
     }
 
-    struct UnusedTodos;
+    /// Records what a boundary cleared, so `/new`'s blast radius is testable.
+    #[derive(Default)]
+    struct MemoryTodos {
+        cleared: Mutex<Vec<String>>,
+    }
+
     #[async_trait]
-    impl SessionTodoRepository for UnusedTodos {
+    impl SessionTodoRepository for MemoryTodos {
         async fn get(&self, _session_id: &str) -> anyhow::Result<Vec<TodoItem>> {
-            unimplemented!()
+            Ok(Vec::new())
         }
         async fn set(&self, _session_id: &str, _items: &[TodoItem]) -> anyhow::Result<()> {
-            unimplemented!()
+            Ok(())
         }
-        async fn clear(&self, _session_id: &str) -> anyhow::Result<()> {
-            unimplemented!()
+        async fn clear(&self, session_id: &str) -> anyhow::Result<()> {
+            self.cleared.lock().unwrap().push(session_id.to_string());
+            Ok(())
         }
     }
 
@@ -2266,17 +2429,29 @@ mod tests {
             handler,
             Arc::new(ApprovalState::new()),
             sessions,
-            Arc::new(UnusedHome),
-            Arc::new(UnusedTodos),
+            Arc::new(MemoryHome::default()),
+            Arc::new(MemoryTodos::default()),
             None,
             Arc::new(UnusedPairings),
             inbox,
         ))
     }
 
-    /// The correspondent the dispatcher tests speak as.
-    fn peer() -> ChannelPeer {
-        ChannelPeer::new("telegram", "1")
+    /// A paired correspondent's own DM: private to *them*, not the operator's,
+    /// so it keys on the peer exactly as every chat did before D6.
+    fn peer() -> InboundPeer {
+        InboundPeer::new(ChannelPeer::new("telegram", "1"), true, false)
+    }
+
+    /// The operator, writing from a private surface. Whichever one they pick
+    /// up, it is the same conversation.
+    fn operator_dm(platform: &str, peer_id: &str) -> InboundPeer {
+        InboundPeer::new(ChannelPeer::new(platform, peer_id), true, true)
+    }
+
+    /// A chat with other people in it — a Feishu group.
+    fn group(peer_id: &str) -> InboundPeer {
+        InboundPeer::new(ChannelPeer::new("feishu", peer_id), false, false)
     }
 
     /// Dedupe has its own test below; every other test wants each message
@@ -2345,7 +2520,7 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
 
-        let alice = ChannelPeer::new("feishu", "oc_alice");
+        let alice = group("oc_alice");
         for text in ["第一句", "第二句"] {
             dispatcher
                 .handle(&alice, InboundOrigin::local(), text.into(), sink.clone())
@@ -2357,7 +2532,7 @@ mod tests {
         // A different chat on the same platform is a different conversation.
         dispatcher
             .handle(
-                &ChannelPeer::new("feishu", "oc_bob"),
+                &group("oc_bob"),
                 InboundOrigin::local(),
                 "你好".into(),
                 sink,
@@ -2373,8 +2548,258 @@ mod tests {
             assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
         }
         // The address lives in a field, where one reader can find it.
-        let stored = sessions.find_by_peer(&alice).await.unwrap().unwrap();
-        assert_eq!(stored.channel.as_ref(), Some(&alice));
+        let stored = sessions.find_by_peer(&alice.peer).await.unwrap().unwrap();
+        assert_eq!(stored.channel.as_ref(), Some(&alice.peer));
+    }
+
+    /// D6: same principal + private conversation => one ordered timeline.
+    ///
+    /// The operator's Telegram DM, their Feishu DM and the local client (which
+    /// asks the store for the same id rather than minting one) are one
+    /// conversation, and the messages land in one log with contiguous seqs. A
+    /// Feishu group has someone else in it, so it is a conversation of its own.
+    #[tokio::test]
+    async fn every_private_surface_of_the_operator_is_one_conversation() {
+        let db = test_db("komo-home-conversation").await;
+
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let sessions = Arc::new(MemorySessions::default());
+        let home_repo: Arc<dyn HomeRepository> = db.clone();
+        let dispatcher = Arc::new(GatewayDispatcher::new(
+            Arc::new(SayingHandler {
+                entered: entered_tx,
+                events: db.clone(),
+            }),
+            Arc::new(ApprovalState::new()),
+            sessions.clone(),
+            home_repo.clone(),
+            Arc::new(MemoryTodos::default()),
+            None,
+            Arc::new(UnusedPairings),
+            Arc::new(AlwaysFreshInbox),
+        ));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
+
+        // The local client (TUI / desktop / web) opens the stored home id.
+        let tui = home_repo.home_session().await.unwrap();
+
+        for (from, text) in [
+            (
+                operator_dm("telegram", "42"),
+                "\u{4e0a}\u{5348}\u{5728}\u{624b}\u{673a}\u{4e0a}\u{95ee}\u{7684}",
+            ),
+            (
+                operator_dm("feishu", "ou_me"),
+                "\u{4e2d}\u{5348}\u{6362}\u{98de}\u{4e66}\u{63a5}\u{7740}\u{8bf4}",
+            ),
+        ] {
+            dispatcher
+                .handle(&from, InboundOrigin::local(), text.into(), sink.clone())
+                .await;
+            assert_eq!(
+                next_entered(&mut entered_rx).await,
+                tui,
+                "a private surface of the operator is the home conversation"
+            );
+        }
+
+        // One log, one writer, no holes.
+        let events = SessionEventRepository::events(db.as_ref(), &tui)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 4, "two exchanges");
+        assert!(
+            events.iter().enumerate().all(|(i, e)| e.seq == i as u64),
+            "seqs stay contiguous across ingresses: {:?}",
+            events.iter().map(|e| e.seq).collect::<Vec<_>>()
+        );
+        assert!(
+            sessions.ids().is_empty(),
+            "the home conversation is not opened per peer"
+        );
+
+        // A group has other people in it, so it keys on the correspondent.
+        dispatcher
+            .handle(
+                &group("oc_team"),
+                InboundOrigin::local(),
+                "\u{7fa4}\u{91cc}\u{95ee}\u{4e00}\u{53e5}".into(),
+                sink,
+            )
+            .await;
+        let group_session = next_entered(&mut entered_rx).await;
+        assert_ne!(group_session, tui);
+        assert_eq!(sessions.ids(), vec![group_session]);
+    }
+
+    /// `/new` is a line in the log, not a rotate and not a cleanup button.
+    ///
+    /// After it the model is replayed only what came since — but the transcript
+    /// and the run ledger still hold everything before, and the approval the
+    /// operator left parked is still answerable, still on the same session.
+    #[tokio::test]
+    async fn a_boundary_moves_the_replay_without_ending_anything() {
+        use komo_core::domain::run::Run;
+
+        let db = test_db("komo-boundary").await;
+        let home_repo: Arc<dyn HomeRepository> = db.clone();
+        let session = home_repo.home_session().await.unwrap();
+
+        // One finished exchange, then a turn suspended on an approval.
+        let mut run = Run::start(&session, "delete the tree");
+        run.status = komo_core::domain::run::RunStatus::Suspended;
+        komo_core::domain::run_projection::RunProjectionStore::commit(
+            db.as_ref(),
+            &session,
+            &[komo_core::domain::run_projection::ProjectedRun {
+                run: run.clone(),
+                steps: Vec::new(),
+                start_seq: 0,
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+        said(
+            db.as_ref(),
+            &session,
+            "turn-1",
+            SurfaceRole::User,
+            "\u{7b2c}\u{4e00}\u{8f6e}",
+        )
+        .await;
+        said(
+            db.as_ref(),
+            &session,
+            "turn-1",
+            SurfaceRole::Assistant,
+            "\u{7b54}\u{7b2c}\u{4e00}\u{8f6e}",
+        )
+        .await;
+        SessionEventRepository::append(
+            db.as_ref(),
+            &session,
+            vec![
+                SessionEventKind::TurnStarted {
+                    turn_id: run.id.clone(),
+                    resumed_from: None,
+                },
+                SessionEventKind::UserMessage(UserMessageEvent {
+                    turn_id: run.id.clone(),
+                    content: "\u{5220}\u{6389}\u{90a3}\u{4e2a}\u{76ee}\u{5f55}".into(),
+                    source: MessageSource::User,
+                    surface: SurfacePlacement::append(),
+                }),
+                SessionEventKind::ApprovalRequested(
+                    komo_core::domain::session_event::ApprovalRequestedEvent {
+                        turn_id: run.id.clone(),
+                        call_id: "c1".into(),
+                        call_index: 0,
+                        scope_key: String::new(),
+                    },
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        SessionEventRepository::durable_flush(db.as_ref(), &session)
+            .await
+            .unwrap();
+        let registration = WakeupRegistration::new(
+            &session,
+            Wakeup::Approval {
+                call_id: "c1".into(),
+            },
+            1_000,
+        )
+        .continuing(&run.id);
+        WakeupRepository::save(db.as_ref(), &registration)
+            .await
+            .unwrap();
+
+        let todos = Arc::new(MemoryTodos::default());
+        let resumed = Arc::new(RecordingResume(Mutex::new(Vec::new())));
+        let dispatcher = Arc::new(
+            GatewayDispatcher::new(
+                resumed.clone(),
+                Arc::new(ApprovalState::new()),
+                Arc::new(MemorySessions::default()),
+                home_repo.clone(),
+                todos.clone(),
+                None,
+                Arc::new(UnusedPairings),
+                Arc::new(AlwaysFreshInbox),
+            )
+            .with_waits(WaitParts {
+                runs: db.clone(),
+                events: db.clone(),
+                wakeups: db.clone(),
+            }),
+        );
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
+
+        dispatcher
+            .handle(
+                &operator_dm("telegram", "42"),
+                InboundOrigin::local(),
+                "/new".into(),
+                sink,
+            )
+            .await;
+
+        // The conversation keeps its id — this is the same session throughout.
+        assert_eq!(home_repo.home_session().await.unwrap(), session);
+        assert_eq!(
+            todos.cleared.lock().unwrap().as_slice(),
+            [session.clone()],
+            "the working todo list is what a boundary retires"
+        );
+
+        let projection = SessionEventRepository::surface(db.as_ref(), &session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projection.messages().unwrap().len(),
+            3,
+            "the transcript still holds everything before the line"
+        );
+        assert_eq!(
+            projection
+                .replay()
+                .unwrap()
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            vec!["\u{5220}\u{6389}\u{90a3}\u{4e2a}\u{76ee}\u{5f55}"],
+            "the model sees nothing before the line — bar the turn still waiting"
+        );
+
+        // The ledger reads back every turn, boundary or no boundary.
+        let events = SessionEventRepository::events(db.as_ref(), &session)
+            .await
+            .unwrap();
+        let runs = komo_core::domain::run_projection::project_runs(&session, &events);
+        assert!(
+            runs.iter().any(|r| r.run.id == run.id),
+            "the suspended turn is still in the ledger"
+        );
+
+        // And the approval left parked is still answerable.
+        assert!(
+            dispatcher
+                .answer_approval(&session, None, Answer::Once)
+                .await,
+            "`/new` does not end a turn that is still owed an answer"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            resumed.0.lock().unwrap().as_slice(),
+            [run.id.clone()],
+            "the woken turn continued"
+        );
     }
 
     // An HTTP turn takes the same per-session slot a chat turn takes, so two
@@ -2419,6 +2844,85 @@ mod tests {
             .expect("the slot must be handed over once the first turn releases")
             .expect("the waiting task must not panic");
         second.release();
+    }
+
+    /// The reply goes where the *answer* came from, not where the question was
+    /// asked. Suspended in the TUI, released by `/approve` from Telegram: the
+    /// continuation answers into Telegram, because that is where the operator
+    /// is standing. The transcript has it either way.
+    #[tokio::test]
+    async fn a_woken_turn_answers_the_surface_that_released_it() {
+        use komo_core::domain::run::Run;
+
+        let db = test_db("komo-woken-reply").await;
+        let home_repo: Arc<dyn HomeRepository> = db.clone();
+        let session = home_repo.home_session().await.unwrap();
+
+        let mut run = Run::start(&session, "delete the tree");
+        run.status = komo_core::domain::run::RunStatus::Suspended;
+        komo_core::domain::run_projection::RunProjectionStore::commit(
+            db.as_ref(),
+            &session,
+            &[komo_core::domain::run_projection::ProjectedRun {
+                run: run.clone(),
+                steps: Vec::new(),
+                start_seq: 0,
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+        WakeupRepository::save(
+            db.as_ref(),
+            &WakeupRegistration::new(
+                &session,
+                Wakeup::Approval {
+                    call_id: "c1".into(),
+                },
+                1_000,
+            )
+            .continuing(&run.id),
+        )
+        .await
+        .unwrap();
+
+        let dispatcher = Arc::new(
+            GatewayDispatcher::new(
+                Arc::new(RecordingResume(Mutex::new(Vec::new()))),
+                Arc::new(ApprovalState::new()),
+                Arc::new(MemorySessions::default()),
+                home_repo,
+                Arc::new(MemoryTodos::default()),
+                None,
+                Arc::new(UnusedPairings),
+                Arc::new(AlwaysFreshInbox),
+            )
+            .with_waits(WaitParts {
+                runs: db.clone(),
+                events: db.clone(),
+                wakeups: db.clone(),
+            }),
+        );
+
+        // `/approve` arrives from Telegram — the same home conversation, a
+        // different surface from the one that asked.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let telegram = Arc::new(RecordingSink { sent: sent.clone() }) as Arc<dyn ReplySink>;
+        dispatcher
+            .handle(
+                &operator_dm("telegram", "42"),
+                InboundOrigin::local(),
+                "/approve".into(),
+                telegram,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let sent = sent.lock().unwrap().clone();
+        assert!(
+            sent.iter().any(|line| line == "continued"),
+            "the continuation's answer reaches the surface that answered: {sent:?}"
+        );
     }
 
     /// The waker's own three jobs: record *why* the turn came back, retire the
@@ -2479,8 +2983,8 @@ mod tests {
                 handler.clone(),
                 Arc::new(ApprovalState::new()),
                 Arc::new(MemorySessions::default()),
-                Arc::new(UnusedHome),
-                Arc::new(UnusedTodos),
+                Arc::new(MemoryHome::default()),
+                Arc::new(MemoryTodos::default()),
                 None,
                 Arc::new(UnusedPairings),
                 Arc::new(AlwaysFreshInbox),
@@ -2611,8 +3115,8 @@ mod tests {
                 }),
                 Arc::new(ApprovalState::new()),
                 Arc::new(MemorySessions::default()),
-                Arc::new(UnusedHome),
-                Arc::new(UnusedTodos),
+                Arc::new(MemoryHome::default()),
+                Arc::new(MemoryTodos::default()),
                 None,
                 Arc::new(UnusedPairings),
                 Arc::new(AlwaysFreshInbox),
@@ -2624,7 +3128,15 @@ mod tests {
             }),
         );
         assert!(
-            dispatcher.moved_on("s1", "算了，先别删").await,
+            dispatcher
+                .moved_on(
+                    "s1",
+                    "算了，先别删",
+                    Arc::new(RecordingSink {
+                        sent: Arc::new(Mutex::new(Vec::new())),
+                    }),
+                )
+                .await,
             "the message answers the pending approval"
         );
         assert!(
@@ -2740,8 +3252,8 @@ mod tests {
                 handler.clone(),
                 Arc::new(ApprovalState::new()),
                 Arc::new(MemorySessions::default()),
-                Arc::new(UnusedHome),
-                Arc::new(UnusedTodos),
+                Arc::new(MemoryHome::default()),
+                Arc::new(MemoryTodos::default()),
                 None,
                 Arc::new(UnusedPairings),
                 Arc::new(AlwaysFreshInbox),
@@ -3009,7 +3521,7 @@ mod tests {
                 permits: permits.clone(),
             }),
             Arc::new(AlwaysFreshInbox),
-            MemorySessions::seeded("s7", &peer()),
+            MemorySessions::seeded("s7", &peer().peer),
         );
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;

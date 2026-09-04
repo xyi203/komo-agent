@@ -12,7 +12,14 @@
 //!     mtime moves.
 //!   * **context**  — the project instruction file (`AGENTS.md`, else
 //!     `CLAUDE.md`, else `.cursorrules`) found in the working directory. Stable
-//!     within a session.
+//!     **per process**, not per session: it is read from the process's own
+//!     working directory, and one conversation is now entered from wherever the
+//!     operator happens to be (docs/bot-runtime.md §2 D6). It deliberately does
+//!     not follow a turn's workspace — the cache prefix runs tools → system →
+//!     messages, so a system tier that moved every turn would invalidate the
+//!     whole history behind it. A turn that needs its own directory's
+//!     instructions gets them as an `Injected` block at the tail of its user
+//!     message, where the new bytes already are.
 //!   * **volatile** — day-precision date, model, provider. The only part that
 //!     drifts, kept last so the stable+context prefix stays byte-identical and
 //!     upstream prompt caches stay warm.
@@ -221,7 +228,9 @@ than expecting events to be pushed here.\n\
 pairing code, which the operator approves with `komo pair approve <code>` on \
 the host. Pre-trusted ids go in the channel's `allow_from` list.\n\
 - `/sethome` sent in any chat makes it the delivery target for proactive \
-output (reminders, daily briefing). `/new` starts a fresh session; \
+output (reminders, daily briefing). `/new` draws a line under the conversation \
+so far — it starts a fresh context, not a fresh session, and leaves tasks, \
+memories and any pending approval alone; \
 `/approve` / `/deny` answer tool-approval prompts.\n\
 - `komo doctor` (host terminal) shows config, model, and channel health; \
 `komo logs` tails the gateway log.";

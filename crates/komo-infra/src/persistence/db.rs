@@ -108,7 +108,7 @@ struct ReminderRecord {
 
 /// Session-scoped working todo list (`domain/todo.rs`). One row per session;
 /// `items` is the JSON-serialized `Vec<TodoItem>`. Disposable working state —
-/// cleared on `/new` rotate.
+/// cleared at a `/new` conversation boundary.
 #[derive(Debug, toasty::Model)]
 struct SessionTodoRecord {
     #[key]
@@ -302,6 +302,8 @@ const INBOX_STATUS_COMPLETED: &str = "completed";
 
 /// Setting key for the runtime home channel (`/sethome`).
 const HOME_SETTING_KEY: &str = "home_chat";
+/// Setting key for the operator's home conversation (D6).
+const HOME_SESSION_KEY: &str = "home_session";
 /// Setting key for the briefing watermark (local date last handled).
 const BRIEFING_MARK_KEY: &str = "briefing_last_handled";
 
@@ -731,38 +733,6 @@ impl SessionRepository for Db {
         Ok(removed)
     }
 
-    async fn rotate(&self, session_id: &str) -> anyhow::Result<Option<String>> {
-        // `/new` used to move the transcript to an archived id and leave the
-        // live id empty, because the chat's session id *was* its address and so
-        // could not change. It is a UUID now and the address is a field, which
-        // makes the whole move unnecessary: retiring a conversation is dropping
-        // its correspondent. The session keeps its id, its log and its history;
-        // it simply stops answering for that chat, and the next message from
-        // the peer opens a new one (`find_by_peer` finds none).
-        //
-        // Nothing moves, so there is no half-done state to reason about — the
-        // whole rotation is one row update.
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            let Ok(mut record) = SessionRecord::get_by_id(&mut conn, session_id).await else {
-                return Ok(None);
-            };
-            // A session with no correspondent has nothing to be retired *from*:
-            // a local surface rotates by minting a new id client-side.
-            if record.channel_platform.is_empty() && record.channel_peer_id.is_empty() {
-                return Ok(None);
-            }
-            record
-                .update()
-                .channel_platform(String::new())
-                .channel_peer_id(String::new())
-                .exec(&mut conn)
-                .await?;
-            Ok(Some(session_id.to_string()))
-        })
-        .await
-    }
-
     async fn commit_awaiting(
         &self,
         session_id: &str,
@@ -835,7 +805,7 @@ impl SessionRepository for Db {
     async fn delete_session(&self, session_id: &str) -> anyhow::Result<bool> {
         // Transactional cascade: remove the session's messages then the session
         // row itself, so a mid-sequence failure rolls back cleanly (mirrors
-        // `rotate` / `RunRepository::prune`). Runs/todos keyed by this session
+        // `RunRepository::prune`). Runs/todos keyed by this session
         // are left as harmless orphans — they never surface in the session list.
         with_write_retry(|| async {
             let mut conn = self.inner.connection().await?;
@@ -1287,6 +1257,24 @@ impl HomeRepository for Db {
 
     async fn set(&self, session_id: &str) -> anyhow::Result<()> {
         self.setting_set(HOME_SETTING_KEY, session_id).await
+    }
+
+    async fn home_session(&self) -> anyhow::Result<String> {
+        if let Some(id) = self.setting_get(HOME_SESSION_KEY).await? {
+            return Ok(id);
+        }
+        // Only the settings row is minted here. The session record itself is
+        // written by the first turn that lands on the id, the same way every
+        // other conversation's is — a row nobody ever spoke into would be a
+        // conversation that never happened.
+        self.setting_set(HOME_SESSION_KEY, &uuid::Uuid::now_v7().to_string())
+            .await?;
+        // Read back rather than returning what was written: two processes
+        // racing the first ask must agree on one id, and the row is what they
+        // agree through.
+        self.setting_get(HOME_SESSION_KEY)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("home session id did not persist"))
     }
 }
 
@@ -2918,71 +2906,6 @@ mod tests {
                 .unwrap(),
             ApproveOutcome::Locked { .. }
         ));
-    }
-
-    #[tokio::test]
-    async fn rotate_retires_a_chat_session_by_dropping_its_correspondent() {
-        // `/new` used to move the transcript to an archived id and leave the
-        // live id empty, because a chat's session id *was* its address. The id
-        // is a UUID now and the address is a field, so retiring a conversation
-        // is dropping the correspondent — nothing moves.
-        let db = Db::connect(&sqlite_url("komo_rotate_test.db"))
-            .await
-            .unwrap();
-        let peer = ChannelPeer::new("telegram", "rot");
-        let sid = "019fad18-0000-7461-9d48-0a6c779f1c8d";
-        SessionRepository::save(&db, &Session::new(sid).with_channel(peer.clone()))
-            .await
-            .unwrap();
-        say(&db, sid, &Message::user("hi")).await;
-        say(&db, sid, &Message::assistant("hello")).await;
-
-        assert_eq!(
-            SessionRepository::rotate(&db, sid).await.unwrap(),
-            Some(sid.to_string())
-        );
-
-        // The conversation keeps its id and every word of it.
-        assert_eq!(
-            MessageRepository::list_by_session(&db, sid)
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
-        // But it no longer answers for that chat, so the peer's next message
-        // opens a fresh session.
-        assert!(
-            SessionRepository::find_by_peer(&db, &peer)
-                .await
-                .unwrap()
-                .is_none(),
-            "a retired session must not keep answering for its correspondent"
-        );
-        // Rotating it again finds nothing left to retire.
-        assert_eq!(SessionRepository::rotate(&db, sid).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn rotate_is_a_no_op_for_a_session_with_no_correspondent() {
-        // A local surface rotates by minting a new id client-side; there is no
-        // address to drop, so the store has nothing to do.
-        let db = Db::connect(&sqlite_url("komo_rotate_local.db"))
-            .await
-            .unwrap();
-        let sid = "019fad19-0000-7461-9d48-0a6c779f1c8d";
-        SessionRepository::save(&db, &Session::new(sid))
-            .await
-            .unwrap();
-        say(&db, sid, &Message::user("hi")).await;
-        assert_eq!(SessionRepository::rotate(&db, sid).await.unwrap(), None);
-        assert_eq!(
-            MessageRepository::list_by_session(&db, sid)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
     }
 
     #[tokio::test]

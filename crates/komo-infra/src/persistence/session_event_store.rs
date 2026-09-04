@@ -155,7 +155,12 @@ impl SessionEventStore {
         serde_json::from_slice(&bytes).ok()
     }
 
-    /// The most recent `limit` messages, still oldest first. `0` means all.
+    /// The most recent `limit` messages a turn would replay, still oldest
+    /// first. `0` means all.
+    ///
+    /// Served from [`SurfaceProjection::replay`], so the window never reaches
+    /// past a `conversation/boundary` — `/new` is exactly "stop replaying what
+    /// came before this". The transcript itself is [`Self::messages`].
     ///
     /// Derives the whole surface and then cuts. A window over an *event* log
     /// cannot be taken by reading the tail alone the way a message log's could:
@@ -164,7 +169,10 @@ impl SessionEventStore {
     /// the projection checkpoint's job (batch 3), not a shortcut here — a
     /// wrong-but-fast window would hand the model a history that never existed.
     pub async fn windowed(&self, session_id: &str, limit: usize) -> Result<Vec<Message>> {
-        let mut all = self.messages(session_id).await?;
+        let mut all = match self.surface(session_id).await? {
+            Some(projection) => projection.replay()?,
+            None => Vec::new(),
+        };
         if limit > 0 && all.len() > limit {
             all.drain(..all.len() - limit);
         }

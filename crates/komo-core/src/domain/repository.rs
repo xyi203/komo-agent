@@ -36,11 +36,6 @@ pub trait SessionRepository: Send + Sync {
     async fn save(&self, session: &Session) -> anyhow::Result<()>;
     /// Delete every session that has zero messages. Returns the count removed.
     async fn delete_empty_sessions(&self) -> anyhow::Result<usize>;
-    /// Rotate a session (hermes' `/new`): move its messages to a fresh archived
-    /// id so `session_id` is left empty for a new conversation, while the old
-    /// transcript is preserved (the reviewer can still see it). Returns the
-    /// archived id, or `None` when there was nothing to archive.
-    async fn rotate(&self, session_id: &str) -> anyhow::Result<Option<String>>;
 
     /// Set a session's display title (operator rename). No-op if the session
     /// does not exist. Default is a no-op so stores that don't support titling

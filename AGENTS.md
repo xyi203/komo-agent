@@ -93,6 +93,21 @@ reject two consecutive user messages on replay. Keeping that true at each write
 site took three separate patches; it is now one function, testable without a
 database. **Add a new read path through `projected`, never `entries`.**
 
+**A transcript and a replay are different reads of one surface.**
+`SurfaceProjection::messages()` is the whole conversation — what `komo run
+inspect`, episodic indexing, the reviewer and a client hydrating a window all
+read. `replayed()` / `replay()` is what the *model* is handed, and the only
+thing that separates them is the newest `conversation/boundary`: `/new` appends
+one (it does not rotate the session, archive anything, or end a turn), and the
+replay starts after the last assistant node at or before it. The cut lands
+there rather than on the boundary itself so a turn that was still open — one
+suspended on an approval — keeps the unanswered user message its continuation
+replies to. `find_windowed` and compaction both read `replayed()`; a summary
+that reached across a boundary would put the shadowed stretch straight back in
+front of the model. `RetentionBase::cut` keeps the newest boundary alongside
+the header/context envelope, because it is not a surface node and losing it
+loses the line.
+
 A **windowed** read (`find_windowed`, every turn) is served from the session's
 **surface checkpoint** (`sessions/<id>/surface.json`, `SurfaceProjection`) plus
 the events appended since — reading a whole conversation to discard all but its
@@ -380,7 +395,8 @@ call the same functions, which is what keeps validation from forking.
   one approval per batch, no rollback — reports exactly what landed),
   `web_fetch` (content-type gated, 256 KB download cap, deny-only network
   policy), `homeassistant` (`call_service` approval-gated; `BLOCKED_DOMAINS`
-  hardline), `task`, `todo` (session-scoped, dies on `/new`), `memory`,
+  hardline), `task`, `todo` (session-scoped, dies at a `/new` boundary — the
+  only thing that does), `memory`,
   `skill`, `cron`, `ask_user` / `wait` (the two sentinel tools: both stop the
   turn through `ToolContext::wait_for` and come back with the wake as their
   result — no process waits, and a restart loses nothing), `logs` (tail of komo's own
@@ -809,8 +825,19 @@ call the same functions, which is what keeps validation from forking.
   commands too, since a redelivered `/approve` would approve twice. `dispatch`
   is the un-gated inner routine and stays private. Channels that have no
   platform message id use `InboundOrigin::local()`, which is never a duplicate.
-  Chat commands: `/new` (rotate
-  session, clear todos + approval state), `/approve [session|always]`,
+  **Which conversation a message belongs to is resolved in two steps**
+  (docs/bot-runtime.md §3.8, D6). Principal first, off the channel's own
+  admission gate: `PairingGuard` already checks `allow_from` before pairing
+  rows, and those two branches *are* "the operator" and "somebody they paired
+  with", so `Gate::Allowed` carries a `Principal`. Then conversation: the
+  operator writing **privately** — TUI, desktop, web, Telegram/Feishu DM,
+  WeChat — is always the one **home session** (`HomeRepository::home_session()`,
+  a `setting_records` row minted on first ask); anything with other people in it
+  keys on the correspondent through `find_by_peer` as before. The home session
+  has no `channel`, so its memory writes are `Global` — which is the right
+  scope for it.
+  Chat commands: `/new` (append `conversation/boundary`),
+  `/approve [session|always]`,
   `/deny`, `/skip` (decline an `ask_user` question — the turn continues on its
   own assumptions instead of standing for a week), `/sethome`,
   `/wechat login`. A plain message answers a pending question
@@ -829,10 +856,11 @@ call the same functions, which is what keeps validation from forking.
 - `infra/messaging/` — channels: feishu (ws long connection on a dedicated
   thread), telegram (long polling, Markdown with plain-text fallback), wechat
   (iLink, DM-only, shared `WeChatBot` instance, in-memory reply tokens).
-  A channel hands `GatewayDispatcher::handle` a **`ChannelPeer`** (platform +
-  that platform's chat id), never a session id: which conversation that is
-  belongs to the store (`SessionRepository::find_by_peer`, opening one on first
-  contact). Session ids are UUIDs and carry nothing — they used to *be* the
+  A channel hands `GatewayDispatcher::handle` an **`InboundPeer`** — a
+  `ChannelPeer` (platform + that platform's chat id), plus whether the chat is
+  private and whether the sender is the operator — never a session id: which
+  conversation that is belongs to the dispatcher and the store (see the two-step
+  resolution above). Session ids are UUIDs and carry nothing — they used to *be* the
   address (`feishu:{chat_id}`), which made every consumer re-derive it by
   splitting a string. Home Assistant is **not** a channel —
   it is reachable only through the `homeassistant` tool (agent pulls on
@@ -849,9 +877,15 @@ call the same functions, which is what keeps validation from forking.
   conversation's hooks. Adding a runtime is a profile, not a struct literal
   whose three real differences hide among nine identical fields.
 - `tui/` — ratatui chat front end over gateway-or-in-process backends; state +
-  key handling terminal-free in `tui/app.rs`. `komo resume <id>` (or the
-  compatible `komo session resume <id>`) re-enters a session by its UUID and
-  hydrates the transcript. Input:
+  key handling terminal-free in `tui/app.rs`. `komo chat` opens the operator's
+  **home conversation** — not a fresh id per launch — so closing the terminal
+  and reopening it continues the same thread the morning's Telegram DM is in.
+  `komo resume <id>` (or the compatible `komo session resume <id>`) is what
+  opens some *other* session by its UUID: a correspondent's, or an old one being
+  looked into. A turn's workspace is the **process's** startup directory, not
+  the session's: one conversation is entered from wherever the operator is
+  standing, so `Session.workspace` is descriptive only (the log manifest and the
+  session list read it) and nothing rewrites a turn's tool root from it. Input:
   Enter sends, Shift/Alt-Enter (kitty protocol) or Ctrl-J newline, **Esc stops
   the turn in flight** (nothing when idle — a stop key that sometimes discards the
   draft is worse than one extra keystroke; under the approval modal Esc keeps

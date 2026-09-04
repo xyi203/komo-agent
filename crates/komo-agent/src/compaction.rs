@@ -269,7 +269,10 @@ impl Plan {
         if window == 0 {
             return None;
         }
-        let nodes = projection.surface.nodes();
+        // Only what the model is actually replayed: a `conversation/boundary`
+        // already keeps the older stretch out of the window, and a summary that
+        // reached across one would put it straight back.
+        let nodes = projection.replayed();
         if nodes.len() <= window {
             return None;
         }

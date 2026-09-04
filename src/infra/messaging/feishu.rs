@@ -20,9 +20,9 @@
 
 use komo_agent::gateway::Channel;
 use komo_agent::interaction::GatewayDispatcher;
-use komo_agent::pairing::PairingGuard;
+use komo_agent::pairing::{PairingGuard, Principal};
 use komo_core::domain::inbox::InboundOrigin;
-use komo_core::domain::session::ChannelPeer;
+use komo_core::domain::session::{ChannelPeer, InboundPeer};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -232,6 +232,10 @@ struct Inbound {
     message_id: String,
     sender_id: String,
     chat_id: String,
+    /// A `p2p` chat. Feishu's own word for it, carried through because which
+    /// conversation a message belongs to depends on it (docs/bot-runtime.md
+    /// §3.8): the operator's DM is their home conversation, a group is not.
+    private: bool,
     text: String,
 }
 
@@ -311,15 +315,15 @@ impl Channel for FeishuChannel {
                 // the agent until `komo pair approve` runs on the host.
                 let sender = self.sender.clone();
                 let chat = msg.chat_id.clone();
-                let admitted = self
+                let Some(principal) = self
                     .guard
                     .admit(&msg.sender_id, &msg.chat_id, move |reply| async move {
                         sender.send_text(&chat, &reply).await
                     })
-                    .await;
-                if !admitted {
+                    .await
+                else {
                     continue;
-                }
+                };
 
                 info!(chat = %msg.chat_id, "feishu message received");
                 let sink: Arc<dyn ReplySink> = Arc::new(FeishuReplySink {
@@ -334,7 +338,11 @@ impl Channel for FeishuChannel {
                 let origin = InboundOrigin::new("feishu", msg.message_id.clone());
                 dispatcher
                     .handle(
-                        &ChannelPeer::new("feishu", &msg.chat_id),
+                        &InboundPeer::new(
+                            ChannelPeer::new("feishu", &msg.chat_id),
+                            msg.private,
+                            principal == Principal::Operator,
+                        ),
                         origin,
                         msg.text,
                         sink,
@@ -541,6 +549,7 @@ fn admit(event: ReceiveEvent, policy: &AdmitPolicy) -> Option<Inbound> {
     Some(Inbound {
         message_id: message.message_id,
         sender_id,
+        private: message.chat_type == "p2p",
         chat_id: message.chat_id,
         text,
     })
