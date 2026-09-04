@@ -34,6 +34,7 @@ pub use context::{
 
 use crate::tool_output_store::{Bounded, ToolOutputStore};
 use komo_core::domain::approval::{ApprovalRequest, Approver, Decision};
+use komo_core::domain::background::BackgroundTasks;
 use komo_core::domain::catalog::{CatalogSnapshot, ToolCatalog};
 use komo_core::domain::context::ApprovalGate;
 use komo_core::domain::events::TurnEvent;
@@ -204,6 +205,10 @@ pub struct ToolExecutionCore {
     /// holds the work and not only what was said. `None` (tests, aux executors)
     /// ⇒ nothing is recorded, which is what the transcript looked like before.
     events: Option<Arc<dyn SessionEventRepository>>,
+    /// Who runs work that outlives a turn (`domain/background.rs`). `None` on
+    /// every executor whose runtime cannot outlive its own turns — a tool asked
+    /// to detach then says so rather than pretending to.
+    background: Option<Arc<dyn BackgroundTasks>>,
 }
 
 impl ToolExecutor {
@@ -223,6 +228,7 @@ impl ToolExecutor {
                 output_store: None,
                 hooks: Vec::new(),
                 events: None,
+                background: None,
             }),
         }
     }
@@ -250,6 +256,7 @@ impl ToolExecutor {
                 output_store: self.core.output_store.clone(),
                 hooks: self.core.hooks.clone(),
                 events: self.core.events.clone(),
+                background: self.core.background.clone(),
             }),
         }
     }
@@ -300,6 +307,16 @@ impl ToolExecutor {
         let core = Arc::get_mut(&mut self.core)
             .expect("set the transcript during wiring, before the executor is shared");
         core.events = Some(events);
+        self
+    }
+
+    /// Install who holds work a tool hands off to run past the turn's end.
+    /// Absent ⇒ `shell {background}` and `delegate {detach}` report that this
+    /// runtime cannot detach, rather than silently running in the foreground.
+    pub fn with_background(mut self, background: Arc<dyn BackgroundTasks>) -> Self {
+        let core = Arc::get_mut(&mut self.core)
+            .expect("set the background runtime during wiring, before the executor is shared");
+        core.background = Some(background);
         self
     }
 
@@ -649,6 +666,9 @@ impl ToolExecutionCore {
                 // Which call this is — what a tool that stops to wait names, so
                 // the continuation re-dispatches it as itself.
                 .with_call(call_id, call_index);
+                if let Some(background) = &self.background {
+                    ctx = ctx.with_background(background.clone());
+                }
                 // Makes this call's approval a durable fact — the widest crash
                 // window in a turn is a person deciding.
                 if let (Some(events), Some(run)) = (&self.events, &context.run) {

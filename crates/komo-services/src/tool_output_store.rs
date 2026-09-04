@@ -120,6 +120,34 @@ impl ToolOutputStore {
         }
     }
 
+    /// Keep `output` in full under `key`, whatever its size, and answer where.
+    ///
+    /// [`bound`](Self::bound) writes only what overflows a round's budget; a
+    /// background task has no round to overflow — its output arrives after the
+    /// turn is over, and the wake that reports it carries a summary plus this
+    /// path. Same directory, same retention, same read gate, so a
+    /// `task/settled`'s `result_ref` is a path the model can already `read` and
+    /// `grep`.
+    ///
+    /// `None` when it could not be written: a task still settles, it just
+    /// settles with nothing to point at.
+    pub fn store(&self, session_id: &str, key: &str, output: &str) -> Option<PathBuf> {
+        let path = self
+            .root
+            .join(sanitize(session_id))
+            .join(format!("{}.txt", sanitize(key)));
+        match write_full(&path, output) {
+            Ok(()) => {
+                self.maybe_sweep();
+                Some(path)
+            }
+            Err(error) => {
+                warn!(%error, path = %path.display(), "could not store a background task's output");
+                None
+            }
+        }
+    }
+
     /// Delete stored outputs past [`RETENTION`], and any session directory left
     /// empty. Best-effort: an unreadable entry is skipped, never fatal. Returns
     /// how many files were removed.

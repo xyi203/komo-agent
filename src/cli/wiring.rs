@@ -26,6 +26,7 @@ use komo_infra::embedding::{GatedEmbedder, OllamaEmbedder};
 use komo_infra::permissions_store::PermissionsStore;
 use komo_infra::persistence::db::Db;
 use komo_infra::skills::FsSkillStore;
+use komo_services::background_tasks::BackgroundTaskRuntime;
 use komo_services::memory_enrichment::MemoryEnricher;
 use komo_services::skill_registry::SkillRegistry;
 use komo_services::tool_execution::{ToolExecutionConfig, ToolExecutor};
@@ -69,6 +70,11 @@ pub struct Wiring {
     /// hourly on its own, and this is deliberately not a cron schedule: expiring
     /// a scratch file does not need to happen on the minute.
     pub output_store: Arc<ToolOutputStore>,
+    /// Who holds a background `shell` or a detached `delegate` while it runs.
+    /// Exposed because the dispatcher that wakes a turn when one settles only
+    /// exists after this — the gateway attaches it, and runs the restart check
+    /// that settles what a dead process left open.
+    pub background: Arc<BackgroundTaskRuntime>,
     /// Note-vault handles, shared with the operator surface so `komo wiki` works
     /// while the gateway holds the index open.
     pub wiki: Option<crate::services::operator_control::actions::WikiOps>,
@@ -246,6 +252,16 @@ pub async fn build(
     // directory. Local files are readable from any directory (subject to the
     // file-read permission policy); managed tool output is retained as an
     // explicit root for session-derived workspaces as well.
+    // Work a turn hands off and does not wait for (docs/bot-runtime.md §5.9).
+    // Only the main runtime gets it, for the same reason only the main runtime
+    // records its tool calls: a detached task settles into a session log, and a
+    // sweep's synthetic session has none to settle into.
+    let background = Arc::new(BackgroundTaskRuntime::new(
+        db.clone(),
+        db.clone(),
+        output_store.clone(),
+    ));
+
     let mut readonly_roots = config.runtime.readable_roots.clone();
     readonly_roots.push(output_store.root().to_path_buf());
     let workspace = Arc::new(
@@ -461,6 +477,7 @@ pub async fn build(
         // core, and the setters take `Arc::get_mut`.
         if scope == Scope::MAIN {
             tools = tools.with_events(db.clone());
+            tools = tools.with_background(background.clone());
         }
         for tool in registry.tools_for(scope) {
             tools.register(tool.clone());
@@ -788,6 +805,7 @@ pub async fn build(
         briefing_runtime,
         cron_runtime,
         output_store,
+        background,
         wiki: wiki_ops,
     })
 }

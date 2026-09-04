@@ -166,6 +166,26 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // Built here because it needs the dispatcher (for the session slot) and the
     // handler (for the continuation) — the two things only the gateway holds.
     let waker: Arc<dyn WakeupDispatch> = Arc::new(TurnWaker::new(dispatcher.clone()));
+    // A background task settling wakes a turn the same way a sweep does, so it
+    // takes the same dispatcher — attached here because the runtime holding the
+    // task store was built before the dispatcher existed.
+    let background = wired.background.clone();
+    background.attach_dispatch(waker.clone());
+    // The third crash-residue check, after the interrupted runs and the
+    // suspended turns: a task the dead process was still running. Settled
+    // `uncertain` and never re-run — the process group is gone and whether the
+    // work landed is not knowable. Runs after the suspended-turn repair above,
+    // so a turn parked on `wait { for_task }` has its wait back to be woken by.
+    match background
+        .reconcile_orphans(
+            komo_services::background_tasks::ORPHAN_RECHECK_SESSIONS,
+            now,
+        )
+        .await
+    {
+        0 => {}
+        n => tracing::info!(count = n, "settled background tasks lost to a restart"),
+    }
 
     // ── Plugin phase 3: scheduled sweeps ─────────────────────────────────────
     let mut sweep_reg = SweepRegistry::default();

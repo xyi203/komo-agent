@@ -587,8 +587,53 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   `komo chat` 里照常工作（没有 sweep，所以本地模式等不到 `wait 2h`——那要等 gateway 起来）。
   验证：`a_question_answered_after_a_restart_comes_back_as_the_answer`、
   `a_question_nobody_answered_comes_back_saying_so`（日志有 `wakeup/fired{expired}`）。
-- **5.9 后台 shell / delegate**：`task/spawned|settled`，结算唤醒或开新 turn；重启后 running 判 uncertain。
-  验证：turn 结束后任务完成，session 收到带结果的新 turn；父 turn 挂起在 TaskDone 时精确恢复。
+- **5.9 后台 shell / delegate** —— **已完成**：`shell {background: true}` 与
+  `delegate {detach: true}` 立即返回 task_id，turn 照常结束；活干完了再把结果送回来。
+  两个新事件是全部的状态：`task/spawned {turn_id, task_id, kind, label}` 与
+  `task/settled {task_id, outcome, result_ref, summary, elapsed_ms}`。**没有状态表**——
+  「还在跑的任务」是 `unsettled()` 折日志折出来的（有 spawned 无 settled），
+  `MAX_BACKGROUND_TASKS_PER_SESSION = 3` 数的是它，重启后的核对读的也是它。
+  `task/settled` **不带 turn_id**，`turn_id_of_work()` 对两个事件都答 `None`：它可以落在
+  turn 结束之后，run 投影要是把它当成某个 step 的 settle，就是往一个已经关掉的 run 里塞活。
+  `outcome` 直接复用 `ToolOutcome`——「不知道有没有落地」在这里和在工具调用里是同一句话，
+  值得同一个类型；`result_ref` 指向 `tool_output_store` 里的完整输出
+  （新增 `store()`：`bound()` 只写超限的那部分，而后台任务没有「一轮预算」可超，
+  同目录、同保留期、同读闸，所以 `result_ref` 是模型能直接 `read`/`grep` 的路径）。
+  **持有者是 gateway 进程的一个 tokio task**，不是 turn 的：executor 到点会 abort 调用、
+  loop 会结束 turn，而这份活正是从这两者手里显式拆出来的。工具怎么拿到 store：
+  和审批 gate 同一条路——`ToolContext::with_background`，executor 在建每次调用的 ctx 时装上，
+  wiring 只给 `Scope::MAIN`（和 `with_events` 同一个判据：sweep 的合成 session 没有日志可落）。
+  唯一的晚绑定是 dispatch：实现它的 `TurnWaker` 要等 dispatcher，而 dispatcher 在 runtime 之后，
+  所以 `BackgroundTaskRuntime::attach_dispatch` 在 `cli/gateway.rs` 里补上——和 sweep 的
+  `WakeupWiring` 同一个形状。
+  结算按顺序问三件事，**先 take 认领再 fire**（`take` 答 `false` 就不动，sweep 在同一刻过期它
+  也只醒一次）：登记在且那个 turn 日志上仍是 `Suspended` → 精确续跑，payload 是结果摘要 +
+  `result_ref`，`wait` 从 `ctx.resumed_wait()` 读出来还给模型；登记在但 turn 已经不等了 →
+  结果还是得到达，开新 turn；没有登记（最常见——起了任务的 turn 通常就结束了）→ 也开新 turn。
+  开新 turn 这条路补上了 `continue_turn_with` 里 `turn_id: None` 的分支
+  （`start_turn_with`：payload 就是那条用户消息，抢 session slot，spawn）。
+  它**不写 `wakeup/fired`**——那是「挂起 ↔ 它的续跑」之间的因果链，这里没有挂起；
+  为什么会有这个 turn，日志里紧挨着的 `task/settled` 已经说了。
+  `WakeupDispatch::fire` 因此多一个 `payload` 参数，sweep 传空串：闹钟响了本来就什么也没带来。
+  **重启一律判 uncertain，绝不重放**：`reconcile_orphans` 在 gateway 启动跑（排在
+  `reregister_suspended_turns` **之后**，好让挂在 `wait { for_task }` 上的 turn 先把等待补回来），
+  扫最近 `ORPHAN_RECHECK_SESSIONS` 个 session，把每个没结算的任务补一条
+  `task/settled{uncertain}` 并走同一条唤醒路——进程组已经死了，命令有没有先跑完不可知，
+  这句话必须到达模型（§6「不自动重放 uncertain 的后台任务」）。
+  审批不变：起后台命令和跑前台命令是同一个动作的两种执行方式，`shell` 的 gate 在分叉之前，
+  `delegate` 沿用它今天的（子 agent 的工具各自受闸），递归仍由子 agent 工具集无 `delegate` 结构阻断。
+  验证：`a_background_command_returns_at_once_and_reports_when_it_lands`（turn 答
+  「started」没等命令、日志有 `task/spawned`、step 里给了模型 task_id；随后
+  `task/settled{ok}` 且 `result_ref` 非空，session 上出现一条带结果的新 turn）、
+  `a_turn_waiting_for_a_task_is_woken_when_it_settles`（`wait { for_task }` 挂起 →
+  结算 → `wakeup/fired{task}` → 续跑里那次调用只有一个 step 且返回结果摘要，
+  挂起的那次尝试始终没有 step）、
+  `a_fourth_background_task_is_refused_with_something_to_do_instead`（引导文案点名
+  `for_task`，且日志里仍然只有三条 `task/spawned`）、
+  `a_background_task_a_restart_lost_settles_as_uncertain`（**新 runtime 实例** +
+  启动核对，补 `task/settled{uncertain}`、没有第二条 `task/spawned`、新 turn 收到
+  「may or may not」，再核对一次什么也不做）、
+  `a_detached_delegation_answers_with_an_id_and_reports_later`。
 - **5.10 kanban Task ↔ Wakeup**：`waiting_on_peer` / `wakeup_id` 列（kanban.db 加列，`ensure_columns`）；
   进入/离开 `Waiting` 登记/撤销；`FromPeer` 过滤器；`wait { for_task }`。
   验证：Task 等某 feishu peer，该 peer 来消息后 `task.source` 上出现一个带消息内容的新 turn，

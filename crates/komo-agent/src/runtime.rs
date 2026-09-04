@@ -2242,9 +2242,11 @@ pub(crate) mod tests {
             &self,
             registration: &WakeupRegistration,
             cause: komo_core::domain::session_event::WakeupCause,
+            payload: &str,
         ) -> anyhow::Result<()> {
             let turn_id = registration.turn_id.clone().expect("a continuation");
-            crate::interaction::record_wake(&self.waits, registration, &turn_id, cause, "").await?;
+            crate::interaction::record_wake(&self.waits, registration, &turn_id, cause, payload)
+                .await?;
             let run = self
                 .waits
                 .runs
@@ -3966,5 +3968,581 @@ pub(crate) mod tests {
         );
         assert_eq!(seen[0].0, runs[0].id);
         assert_eq!(seen[0].1, RunStatus::Done, "and it was already terminal");
+    }
+
+    // ── background tasks (docs/bot-runtime.md §5.9) ──────────────────────────
+
+    use komo_core::domain::background::{BackgroundTasks, TaskReport, TaskSpec};
+    // `llm::ToolOutcome` is already in scope here and is a different type; the
+    // event vocabulary's one is what a task settles as.
+    use komo_core::domain::session_event::ToolOutcome as Outcome;
+    use komo_core::domain::session_event::{TaskKind, TaskSettledEvent, TaskSpawnedEvent};
+    use komo_core::domain::workspace::Workspace;
+    use komo_services::background_tasks::BackgroundTaskRuntime;
+    use komo_services::tool_output_store::ToolOutputStore;
+    use komo_tools::shell::ShellTool;
+
+    fn outputs(name: &str) -> Arc<ToolOutputStore> {
+        let dir = std::env::temp_dir().join(format!("komo-test-out-{name}"));
+        std::fs::remove_dir_all(&dir).ok();
+        Arc::new(ToolOutputStore::new(dir))
+    }
+
+    /// The approver a background `shell` still passes through: starting a
+    /// command detached and running it in the foreground are the same action,
+    /// so they are gated identically — and the executor's default denies
+    /// everything.
+    struct Allowing;
+
+    #[async_trait]
+    impl komo_core::domain::approval::Approver for Allowing {
+        async fn decide(
+            &self,
+            _request: &komo_core::domain::approval::ApprovalRequest,
+        ) -> komo_core::domain::approval::Decision {
+            komo_core::domain::approval::Decision::Allow
+        }
+    }
+
+    fn task_store(db: &Arc<Db>, name: &str) -> Arc<BackgroundTaskRuntime> {
+        Arc::new(BackgroundTaskRuntime::new(
+            db.clone(),
+            db.clone(),
+            outputs(name),
+        ))
+    }
+
+    /// A runtime that can hand work off to `tasks`, the way the main runtime is
+    /// wired.
+    fn task_runtime(
+        db: &Arc<Db>,
+        script: Vec<Step>,
+        tools: Vec<Arc<dyn Tool>>,
+        tasks: Arc<BackgroundTaskRuntime>,
+    ) -> (AgentRuntime, Arc<Mutex<Vec<Vec<ToolOutcome>>>>) {
+        let (mut rt, received) = scripted_runtime(db.clone(), script, vec![], 30);
+        let mut executor =
+            ToolExecutor::new(komo_services::tool_execution::ToolExecutionConfig::default());
+        for tool in tools {
+            executor.register(tool);
+        }
+        rt.tool_executor = executor
+            .with_events(db.clone())
+            .with_background(tasks)
+            .with_approver(Arc::new(Allowing));
+        rt.wakeups = Some(db.clone());
+        (rt, received)
+    }
+
+    /// The gateway's two halves of "a task settled", as a fixture: continue the
+    /// turn that was parked on it, or open a turn with what it produced.
+    struct TaskWaker {
+        continuation: Option<Arc<AgentRuntime>>,
+        fresh: Option<Arc<AgentRuntime>>,
+        waits: crate::interaction::WaitParts,
+    }
+
+    #[async_trait]
+    impl komo_core::domain::wakeup::WakeupDispatch for TaskWaker {
+        async fn fire(
+            &self,
+            registration: &WakeupRegistration,
+            cause: komo_core::domain::session_event::WakeupCause,
+            payload: &str,
+        ) -> anyhow::Result<()> {
+            match &registration.turn_id {
+                Some(turn_id) => {
+                    crate::interaction::record_wake(
+                        &self.waits,
+                        registration,
+                        turn_id,
+                        cause,
+                        payload,
+                    )
+                    .await?;
+                    let run = self
+                        .waits
+                        .runs
+                        .get(turn_id)
+                        .await?
+                        .expect("the suspended run");
+                    self.continuation
+                        .as_ref()
+                        .expect("a runtime to continue with")
+                        .resume_interrupted(&run)
+                        .await?;
+                }
+                None => {
+                    self.fresh
+                        .as_ref()
+                        .expect("a runtime to open a turn with")
+                        .handle_input(&registration.session_id, payload.to_string())
+                        .await?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// A task settles on its own schedule, so every assertion about one is a
+    /// poll. Five seconds is far longer than any of these need and short enough
+    /// that a broken settle path fails rather than hangs.
+    async fn until(
+        db: &Arc<Db>,
+        session: &str,
+        what: &str,
+        mut done: impl FnMut(&[SessionEvent]) -> bool,
+    ) -> Vec<SessionEvent> {
+        for _ in 0..200 {
+            let events = SessionEventRepository::events(&**db, session)
+                .await
+                .unwrap();
+            if done(&events) {
+                return events;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("{what} never happened");
+    }
+
+    /// The same poll over the ledger, for what only shows up once a turn has
+    /// closed and written its rows.
+    async fn until_run(db: &Arc<Db>, mut pick: impl FnMut(&[Run]) -> Option<Run>) -> Run {
+        for _ in 0..200 {
+            let runs = RunRepository::list(&**db, 20).await.unwrap();
+            if let Some(run) = pick(&runs) {
+                return run;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("no run ever matched");
+    }
+
+    fn spawned_of(events: &[SessionEvent]) -> Vec<TaskSpawnedEvent> {
+        events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::TaskSpawned(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn settled_of(events: &[SessionEvent]) -> Vec<TaskSettledEvent> {
+        events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::TaskSettled(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn temp_workspace() -> Arc<Workspace> {
+        Arc::new(Workspace::new(vec![std::env::temp_dir()]))
+    }
+
+    /// The headline of §5.9: the call returns before the command does, the turn
+    /// ends normally, and the result arrives later as a turn of its own.
+    #[tokio::test]
+    async fn a_background_command_returns_at_once_and_reports_when_it_lands() {
+        let db = Arc::new(Db::connect(&sqlite_url("komo_rt_bg.db")).await.unwrap());
+        let tasks = task_store(&db, "bg");
+
+        // The turn that reports the result is a turn of its own, run by a
+        // runtime of its own — which is what the gateway does with it.
+        let (reporting, _) = task_runtime(
+            &db,
+            vec![Step::Final("noted".into())],
+            vec![],
+            tasks.clone(),
+        );
+        tasks.attach_dispatch(Arc::new(TaskWaker {
+            continuation: None,
+            fresh: Some(Arc::new(reporting)),
+            waits: wait_parts(&db),
+        }));
+
+        let (rt, _) = task_runtime(
+            &db,
+            vec![
+                tool_calls(vec![call(
+                    "shell",
+                    r#"{"command":"sleep 0.2; echo hi","background":true}"#,
+                )]),
+                Step::Final("started".into()),
+            ],
+            vec![Arc::new(ShellTool::new(temp_workspace()))],
+            tasks.clone(),
+        );
+
+        let reply = rt.handle_input("cli:bg", "run it".into()).await.unwrap();
+        assert_eq!(
+            reply, "started",
+            "the turn answered without waiting for the command"
+        );
+
+        let events = SessionEventRepository::events(&*db, "cli:bg")
+            .await
+            .unwrap();
+        let spawned = spawned_of(&events);
+        assert_eq!(spawned.len(), 1, "the log records the hand-off");
+        assert_eq!(spawned[0].kind, TaskKind::Shell);
+
+        let first = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+        assert_eq!(first.status, RunStatus::Done, "the turn ended normally");
+        let steps = RunRepository::steps(&*db, &first.id).await.unwrap();
+        assert!(
+            steps[0].result.contains(&spawned[0].task_id),
+            "the model is handed the id it can wait on: {}",
+            steps[0].result
+        );
+
+        // …and later, without anyone asking again, the result comes back.
+        let events = until(&db, "cli:bg", "the task settled", |events| {
+            !settled_of(events).is_empty()
+        })
+        .await;
+        let settled = settled_of(&events).pop().unwrap();
+        assert_eq!(settled.task_id, spawned[0].task_id);
+        assert_eq!(settled.outcome, Outcome::Succeeded);
+        assert!(settled.summary.contains("hi"), "{}", settled.summary);
+        assert!(
+            !settled.result_ref.is_empty(),
+            "the whole output is kept where the model can read it"
+        );
+
+        let events = until(&db, "cli:bg", "a turn carrying the result", |events| {
+            events.iter().any(|e| {
+                matches!(&e.kind, SessionEventKind::UserMessage(m) if m.content.contains("has finished"))
+            })
+        })
+        .await;
+        let told = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                SessionEventKind::UserMessage(m) if m.content.contains("has finished") => {
+                    Some(m.content.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(told.contains("echo hi"), "it names the task: {told}");
+        assert!(
+            told.contains(&settled.result_ref),
+            "and points at its output: {told}"
+        );
+    }
+
+    /// The other consumer of the same settle: a turn parked on
+    /// `wait { for_task }` picks up exactly where it stopped.
+    #[tokio::test]
+    async fn a_turn_waiting_for_a_task_is_woken_when_it_settles() {
+        let db = Arc::new(Db::connect(&sqlite_url("komo_rt_bgwait.db")).await.unwrap());
+        let tasks = task_store(&db, "bgwait");
+
+        // A task under this test's control, so the turn is provably parked
+        // before it settles.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let task_id = tasks
+            .spawn(
+                "cli:bgwait",
+                "t-owner",
+                TaskSpec {
+                    kind: TaskKind::Shell,
+                    label: "the long build".into(),
+                },
+                Box::pin(async move {
+                    let _ = released.await;
+                    TaskReport {
+                        outcome: Outcome::Succeeded,
+                        summary: "the build is green".into(),
+                        full: "the build is green, in full".into(),
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let args = format!(r#"{{"for_task":"{task_id}"}}"#);
+        let rt = waiting_runtime(db.clone(), Arc::new(WaitTool), &args);
+        assert!(
+            rt.handle_input("cli:bgwait", "tell me when it is done".into())
+                .await
+                .is_err(),
+            "waiting is not failing"
+        );
+        drop(rt);
+        let suspended = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+        assert_eq!(suspended.status, RunStatus::Suspended);
+
+        tasks.attach_dispatch(Arc::new(TaskWaker {
+            continuation: Some(Arc::new(waiting_runtime(
+                db.clone(),
+                Arc::new(WaitTool),
+                &args,
+            ))),
+            fresh: None,
+            waits: wait_parts(&db),
+        }));
+        release.send(()).unwrap();
+
+        // The continuation is the last thing to land, and its ledger rows are
+        // written when it closes — so wait for those rather than for the wake
+        // that started it.
+        let continuation = until_run(&db, |runs| {
+            runs.iter()
+                .find(|r| r.resumed_from.as_deref() == Some(suspended.id.as_str()))
+                .filter(|r| r.status == RunStatus::Done)
+                .cloned()
+        })
+        .await;
+
+        let events = SessionEventRepository::events(&*db, "cli:bgwait")
+            .await
+            .unwrap();
+        let fired = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                SessionEventKind::WakeupFired(w) => Some(w.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            fired.cause,
+            komo_core::domain::session_event::WakeupCause::Task
+        );
+        assert_eq!(fired.turn_id, suspended.id);
+
+        assert_eq!(
+            continuation.resumed_from.as_deref(),
+            Some(suspended.id.as_str()),
+            "the continuation links back to the turn that waited"
+        );
+        let steps = RunRepository::steps(&*db, &continuation.id).await.unwrap();
+        assert_eq!(steps.len(), 1, "the wait ran once, on the way back");
+        assert!(
+            steps[0].result.contains("the build is green"),
+            "and returned what the task produced: {}",
+            steps[0].result
+        );
+        assert!(
+            RunRepository::steps(&*db, &suspended.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the attempt that stopped never ran the call"
+        );
+    }
+
+    /// The cap is counted from the log, and refusing says what to do instead —
+    /// a bare "no" would just be tried again next round.
+    #[tokio::test]
+    async fn a_fourth_background_task_is_refused_with_something_to_do_instead() {
+        let db = Arc::new(Db::connect(&sqlite_url("komo_rt_bgcap.db")).await.unwrap());
+        let tasks = task_store(&db, "bgcap");
+
+        let mut holding = Vec::new();
+        for i in 0..3 {
+            let (keep, running) = tokio::sync::oneshot::channel::<()>();
+            holding.push(keep);
+            tasks
+                .spawn(
+                    "cli:bgcap",
+                    "t-owner",
+                    TaskSpec {
+                        kind: TaskKind::Shell,
+                        label: format!("job {i}"),
+                    },
+                    Box::pin(async move {
+                        let _ = running.await;
+                        TaskReport {
+                            outcome: Outcome::Succeeded,
+                            summary: String::new(),
+                            full: String::new(),
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+
+        let (rt, received) = task_runtime(
+            &db,
+            vec![
+                tool_calls(vec![call(
+                    "shell",
+                    r#"{"command":"echo hi","background":true}"#,
+                )]),
+                Step::Final("ok".into()),
+            ],
+            vec![Arc::new(ShellTool::new(temp_workspace()))],
+            tasks.clone(),
+        );
+        rt.handle_input("cli:bgcap", "one more".into())
+            .await
+            .unwrap();
+
+        let refusal = received.lock().unwrap()[0][0].content.clone();
+        assert!(refusal.contains("limit is 3"), "{refusal}");
+        assert!(
+            refusal.contains("for_task"),
+            "it names the way out: {refusal}"
+        );
+        let events = SessionEventRepository::events(&*db, "cli:bgcap")
+            .await
+            .unwrap();
+        assert_eq!(
+            spawned_of(&events).len(),
+            3,
+            "the refused call started nothing"
+        );
+    }
+
+    /// A restart cannot know whether a detached command finished first, so it
+    /// says exactly that — and never runs it again.
+    #[tokio::test]
+    async fn a_background_task_a_restart_lost_settles_as_uncertain() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_bgcrash.db"))
+                .await
+                .unwrap(),
+        );
+
+        // What a process that died mid-task leaves behind: the hand-off on
+        // record, and nothing settling it.
+        SessionEventRepository::append(
+            &*db,
+            "cli:bgcrash",
+            vec![SessionEventKind::TaskSpawned(TaskSpawnedEvent {
+                turn_id: "t-gone".into(),
+                task_id: "task-gone".into(),
+                kind: TaskKind::Shell,
+                label: "deploy.sh".into(),
+            })],
+        )
+        .await
+        .unwrap();
+        SessionEventRepository::durable_flush(&*db, "cli:bgcrash")
+            .await
+            .unwrap();
+
+        // A new process comes up and checks.
+        let tasks = task_store(&db, "bgcrash");
+        let (reporting, _) = task_runtime(
+            &db,
+            vec![Step::Final("noted".into())],
+            vec![],
+            tasks.clone(),
+        );
+        tasks.attach_dispatch(Arc::new(TaskWaker {
+            continuation: None,
+            fresh: Some(Arc::new(reporting)),
+            waits: wait_parts(&db),
+        }));
+        assert_eq!(tasks.reconcile_orphans(20, now()).await, 1);
+
+        let events = SessionEventRepository::events(&*db, "cli:bgcrash")
+            .await
+            .unwrap();
+        let settled = settled_of(&events);
+        assert_eq!(settled.len(), 1);
+        assert_eq!(
+            settled[0].outcome,
+            Outcome::Uncertain,
+            "not failed: nobody knows whether it landed"
+        );
+        assert_eq!(
+            spawned_of(&events).len(),
+            1,
+            "and nothing was started again — an uncertain task is never replayed"
+        );
+
+        let events = until(&db, "cli:bgcrash", "a turn carrying the news", |events| {
+            events.iter().any(|e| {
+                matches!(&e.kind, SessionEventKind::UserMessage(m) if m.content.contains("uncertain"))
+            })
+        })
+        .await;
+        let told = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                SessionEventKind::UserMessage(m) if m.content.contains("uncertain") => {
+                    Some(m.content.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            told.contains("deploy.sh") && told.contains("may or may not"),
+            "the model has to be told, in as many words: {told}"
+        );
+
+        // A second check settles nothing: the task is no longer open.
+        assert_eq!(tasks.reconcile_orphans(20, now()).await, 0);
+    }
+
+    /// The same primitive under `delegate`: a sub-agent that outlives the turn
+    /// that asked for it.
+    #[tokio::test]
+    async fn a_detached_delegation_answers_with_an_id_and_reports_later() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_bgdeleg.db"))
+                .await
+                .unwrap(),
+        );
+        let tasks = task_store(&db, "bgdeleg");
+
+        let (sub, _) = task_runtime(
+            &db,
+            vec![Step::Final("the sub-agent's answer".into())],
+            vec![],
+            tasks.clone(),
+        );
+        let (reporting, _) = task_runtime(
+            &db,
+            vec![Step::Final("noted".into())],
+            vec![],
+            tasks.clone(),
+        );
+        tasks.attach_dispatch(Arc::new(TaskWaker {
+            continuation: None,
+            fresh: Some(Arc::new(reporting)),
+            waits: wait_parts(&db),
+        }));
+
+        let delegate = Arc::new(crate::delegate::DelegateTool::new(
+            Arc::new(sub),
+            db.clone(),
+            Vec::new(),
+            "test-model".into(),
+        ));
+        let (rt, _) = task_runtime(
+            &db,
+            vec![
+                tool_calls(vec![call(
+                    "delegate",
+                    r#"{"task":"audit the config","detach":true}"#,
+                )]),
+                Step::Final("started".into()),
+            ],
+            vec![delegate],
+            tasks.clone(),
+        );
+
+        let reply = rt
+            .handle_input("cli:bgdeleg", "look into it".into())
+            .await
+            .unwrap();
+        assert_eq!(reply, "started", "the turn did not wait for the sub-agent");
+
+        let events = until(&db, "cli:bgdeleg", "the delegation settled", |events| {
+            !settled_of(events).is_empty()
+        })
+        .await;
+        assert_eq!(spawned_of(&events)[0].kind, TaskKind::Delegate);
+        let settled = settled_of(&events).pop().unwrap();
+        assert_eq!(settled.outcome, Outcome::Succeeded);
+        assert_eq!(settled.summary, "the sub-agent's answer");
     }
 }

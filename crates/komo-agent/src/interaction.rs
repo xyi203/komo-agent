@@ -722,8 +722,11 @@ impl WakeupDispatch for TurnWaker {
         &self,
         registration: &WakeupRegistration,
         cause: WakeupCause,
+        payload: &str,
     ) -> anyhow::Result<()> {
-        self.dispatcher.continue_turn(registration, cause).await
+        self.dispatcher
+            .continue_turn_with(registration, cause, payload)
+            .await
     }
 }
 
@@ -953,10 +956,13 @@ impl GatewayDispatcher {
             anyhow::bail!("this dispatcher has no store to continue a turn from");
         };
         let Some(turn_id) = registration.turn_id.clone() else {
-            // A wake that *starts* a turn is a trigger, not a continuation —
-            // nothing writes one yet (docs/bot-runtime.md §3.3).
-            warn!(id = %registration.id, "a wakeup with no turn to continue is not dispatchable yet");
-            return Ok(());
+            // A wake with nothing to continue *starts* something instead: a
+            // background task that settled after its turn ended, a trigger.
+            // What it brought is the whole message — a wake with no turn and
+            // nothing to say would open a turn about nothing.
+            return self
+                .start_turn_with(&registration.session_id, payload)
+                .await;
         };
         let Some(run) = waits.runs.get(&turn_id).await? else {
             anyhow::bail!("no run `{turn_id}` to continue");
@@ -997,6 +1003,47 @@ impl GatewayDispatcher {
                 // whatever the log says it is.
                 Ok(None) => warn!(turn = %run.id, "a woken turn was not continuable"),
                 Err(error) => warn!(%error, turn = %run.id, "a woken turn failed"),
+            }
+        });
+        Ok(())
+    }
+
+    /// Open a turn on `session_id` with what a wake brought.
+    ///
+    /// The other half of `continue_turn_with`: a registration with no turn has
+    /// nothing to pick up, so what it carries becomes the turn's user message —
+    /// "the task you started has finished, here is what it produced". A wake
+    /// carrying nothing opens nothing; there would be no message to run.
+    ///
+    /// No `wakeup/fired` is written, and deliberately: that event is the causal
+    /// link between a suspension and *its* continuation, and it names the turn
+    /// it brought back. Nothing was suspended here. What caused this turn is
+    /// already a fact in the same log — the `task/settled` immediately before
+    /// it — and the turn's own user message says what it was told.
+    async fn start_turn_with(
+        self: &Arc<Self>,
+        session_id: &str,
+        payload: &str,
+    ) -> anyhow::Result<()> {
+        if payload.trim().is_empty() {
+            warn!(session = %session_id, "a wake with no turn and nothing to say opens nothing");
+            return Ok(());
+        }
+        let origin = self.session_origin(session_id).await;
+        let dispatcher = self.clone();
+        let session = session_id.to_string();
+        let input = payload.to_string();
+        tokio::spawn(async move {
+            // Takes the session's slot like any other turn: a task settling
+            // while the conversation is mid-turn queues behind it rather than
+            // running beside it.
+            let claim = dispatcher.claim_session(&session).await;
+            let ctx = SessionContext::detached(&session).with_origin(origin);
+            let outcome = with_session(ctx, dispatcher.handler.handle(&session, input)).await;
+            claim.release();
+            match outcome {
+                Ok(_) => info!(session = %session, "opened a turn with what a wake carried"),
+                Err(error) => warn!(%error, session = %session, "a woken turn failed"),
             }
         });
         Ok(())
@@ -2447,7 +2494,7 @@ mod tests {
         let waker = TurnWaker::new(dispatcher);
 
         waker
-            .fire(&approval, WakeupCause::Approve)
+            .fire(&approval, WakeupCause::Approve, "")
             .await
             .expect("the wake itself must land");
 
@@ -2707,7 +2754,7 @@ mod tests {
         );
 
         TurnWaker::new(dispatcher)
-            .fire(&registration, WakeupCause::Expired)
+            .fire(&registration, WakeupCause::Expired, "")
             .await
             .unwrap();
 

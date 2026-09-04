@@ -9,9 +9,11 @@ use serde_json::{Value, json};
 use crate::runtime::AgentRuntime;
 use komo_config::ModelEntry;
 use komo_core::domain::{
+    background::{TaskReport, TaskSpec},
     context::ToolContext,
     repository::SessionRepository,
     session::Session,
+    session_event::{TaskKind, ToolOutcome},
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
@@ -22,6 +24,9 @@ struct DelegateArgs {
     /// default. Validated against the configured menu.
     #[serde(default)]
     model: Option<String>,
+    /// Let the sub-agent run past this turn, reporting back when it is done.
+    #[serde(default)]
+    detach: bool,
 }
 
 /// Runs a self-contained subtask on a fresh sub-agent and returns its answer.
@@ -146,13 +151,17 @@ impl Tool for DelegateTool {
                         self.model_ids().join(", ")
                     ),
                     "enum": self.model_ids(),
+                },
+                "detach": {
+                    "type": "boolean",
+                    "description": "Let the sub-agent run past this turn: the call returns a task id at once and its answer comes back to this conversation when it finishes. For work measured in minutes — never for something you need in order to answer now."
                 }
             },
             "required": ["task"]
         })
     }
 
-    async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: DelegateArgs = parse_args(&input)?;
         let model = resolve_model(&self.models, args.model.as_deref())?;
 
@@ -166,10 +175,83 @@ impl Tool for DelegateTool {
         session.model = model;
         self.sessions.save(&session).await?;
 
+        if args.detach {
+            return self.detached(&session_id, args.task, ctx).await;
+        }
+
         // Deliberately *not* wrapped in a fresh session context: inheriting the
         // parent's is what keeps approvals answerable and the workspace correct.
         let reply = self.runtime.handle_input(&session_id, args.task).await?;
         Ok(ToolOutput::text(reply))
+    }
+}
+
+impl DelegateTool {
+    /// Hand the sub-agent turn to the background runtime and answer with its id.
+    ///
+    /// A detached delegation is the same delegation — same sub-session, same
+    /// recursion guard, same gate (there is none beyond the sub-agent's own
+    /// tools, which are gated individually). What changes is who waits, and
+    /// therefore what happens to an approval one of its tools asks for: nobody
+    /// is holding this conversation open for it, so it is answered where every
+    /// other parked approval is, by `/approve`.
+    async fn detached(
+        &self,
+        session_id: &str,
+        task: String,
+        ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let (Some(tasks), Some(turn_id)) = (ctx.background(), ctx.turn_id()) else {
+            return Ok(ToolOutput::text(
+                "This runtime cannot detach a sub-agent — nothing here outlives the \
+                 turn. Delegate without `detach` and wait for the answer.",
+            ));
+        };
+        let label = first_line(&task);
+        let spec = TaskSpec {
+            kind: TaskKind::Delegate,
+            label: label.clone(),
+        };
+        let runtime = self.runtime.clone();
+        let sub_session = session_id.to_string();
+        let work = Box::pin(async move {
+            match runtime.handle_input(&sub_session, task).await {
+                Ok(reply) => TaskReport {
+                    outcome: ToolOutcome::Succeeded,
+                    summary: reply.clone(),
+                    full: reply,
+                },
+                Err(error) => TaskReport {
+                    outcome: ToolOutcome::Failed,
+                    summary: format!("The sub-agent failed: {error}"),
+                    full: error.to_string(),
+                },
+            }
+        });
+        match tasks
+            .spawn(&ctx.session.session_id, turn_id, spec, work)
+            .await
+        {
+            Ok(task_id) => Ok(ToolOutput::text(format!(
+                "Delegated `{label}` to a detached sub-agent as task {task_id}. This turn \
+                 does not wait for it: finish what you are doing and answer. You will be \
+                 told its result in this conversation when it finishes — or stop and wait \
+                 for it now with `wait` and `for_task: {task_id}`."
+            ))
+            .with_structured(json!({ "task_id": task_id, "session": session_id }))),
+            Err(error) => Ok(ToolOutput::text(error.to_string())),
+        }
+    }
+}
+
+/// A one-line name for a task written as a paragraph — what the operator sees
+/// in the log and what the eventual wake calls it.
+fn first_line(task: &str) -> String {
+    const CAP: usize = 80;
+    let line = task.lines().find(|l| !l.trim().is_empty()).unwrap_or(task);
+    match line.char_indices().nth(CAP) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line.to_string(),
     }
 }
 

@@ -692,7 +692,9 @@ impl CronJobSweep {
                 );
                 continue;
             }
-            match wiring.dispatch.fire(&registration, cause).await {
+            // No payload: a clock going off brings nothing with it, and the
+            // turn is told which wait ended by the wait itself.
+            match wiring.dispatch.fire(&registration, cause, "").await {
                 Ok(()) => {
                     info!(
                         id = %registration.id,
@@ -1636,6 +1638,7 @@ mod tests {
             &self,
             registration: &WakeupRegistration,
             cause: WakeupCause,
+            _payload: &str,
         ) -> anyhow::Result<()> {
             self.0
                 .lock()
@@ -2735,7 +2738,14 @@ mod tests {
         assert_eq!(steps[0].result, "acted");
         // The audit half: who let it happen, and how long they took.
         assert_eq!(steps[0].approved_by, "human");
-        assert_eq!(steps[0].approval_waited_ms, 5 * 3_600 * 1_000);
+        // Measured against the real clock, so a second may pass between the
+        // wait being back-dated and the answer landing.
+        let waited = steps[0].approval_waited_ms;
+        let five_hours = 5 * 3_600 * 1_000;
+        assert!(
+            (waited - five_hours).abs() < 5_000,
+            "waited {waited}ms, expected ≈ {five_hours}ms"
+        );
         assert!(
             WakeupRepository::list(h.db.as_ref())
                 .await

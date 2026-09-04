@@ -309,7 +309,7 @@ komo-infra     persistence · memory · skills · logs · workday ·
 komo-services  tool_execution · tool_output_store · memory_query ·
                memory_consolidation · memory_enrichment ·
                skill_registry · cron_actions · wiki_indexing ·
-               session_indexing · episode ·
+               session_indexing · episode · background_tasks ·
                diff/patch/search/file_mutation                (→ core, config)
 komo-tools     every tool                      (→ core, infra, mcp, services)
 komo-agent     runtime · gateway · daemon · interaction · system_prompt ·
@@ -372,7 +372,8 @@ call the same functions, which is what keeps validation from forking.
   `Tool::call(Value, &ToolContext)` is the **only** tool entry point; the
   `SESSION` task-local serves the approvers only — tools take `ctx.session`.
 - `komo-tools` — `time`, `shell` (own process group, hardline floor no approval
-  unlocks, nested timeouts), `grep`/`glob` (ripgrep libraries in-process;
+  unlocks, nested timeouts; `background: true` hands the same approved command
+  to `background_tasks` and answers with a task id), `grep`/`glob` (ripgrep libraries in-process;
   policy runs over paths **before** content is read), `read`/`write` +
   `fs_common` (workspace-confined; `write_if_unchanged` guards the approval
   window), `edit` (exact match only, no fuzzy) / `apply_patch` (v2 envelope,
@@ -476,7 +477,33 @@ call the same functions, which is what keeps validation from forking.
   (`Session.origin = delegate`, which is what keeps it out of the session list); inherits the parent's ambient session context (approvals prompt the
   real conversation, cancel propagates); recursion blocked structurally
   (sub-agent tool set has `delegate: None`); each delegation is its own ledger
-  run. The unattended cron runtime gets no `delegate`.
+  run. The unattended cron runtime gets no `delegate`. `detach: true` runs that
+  same sub-agent turn as a background task instead of inside the parent's — same
+  sub-session, same recursion guard, but nobody is holding the conversation open
+  for it, so an approval one of its tools asks for is answered by `/approve` like
+  any other parked one.
+- `domain/background.rs` + `komo-services`' `background_tasks` — work a turn
+  starts and does not wait for (docs/bot-runtime.md §5.9): `shell {background}`,
+  `delegate {detach}`. **Two events and no status table** — `task/spawned` /
+  `task/settled`, and "still running" is `unsettled()` folding the log for a
+  spawn with no settle. That fold is the per-session cap
+  (`MAX_BACKGROUND_TASKS_PER_SESSION = 3`) and the startup check both.
+  `task/settled` carries no `turn_id` and is invisible to the run projection:
+  it may land long after the turn ended, and attributing it to a step would put
+  work inside a closed run. The work runs in a task the **process** owns, not
+  the turn's — the executor aborts a call at its limit and the loop ends the
+  turn, and this was explicitly detached from both. Which decides the restart
+  rule: `reconcile_orphans` (gateway startup, *after*
+  `reregister_suspended_turns`) settles everything still open as
+  **`Uncertain`** and re-runs nothing — the process group died with the process,
+  and "it may or may not have landed" is the same claim a tool call makes when
+  it cannot confirm its own effect, so it has to reach the model. Settling
+  claims (`take`) before it fires, then: a turn still parked on
+  `wait { for_task }` is continued with the result; otherwise the result opens a
+  turn of its own (`continue_turn_with`'s `turn_id: None` branch), carrying no
+  `wakeup/fired` because nothing was suspended. Reached from a tool the way an
+  approval gate is — `ToolContext::with_background`, installed per call by the
+  executor, wired for `Scope::MAIN` only.
 - `domain/policy.rs` + `komo-agent`'s `policy_approver` — permission policy. Ladder,
   strongest first: **tool hardline floor > config deny > saved grant > config
   allow / `default_normal` > ask**. Saved grants (`permissions.json`, written

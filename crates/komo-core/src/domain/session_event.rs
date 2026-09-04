@@ -246,6 +246,19 @@ pub enum SessionEventKind {
     /// life at 08:00" is not a question the log can answer.
     #[serde(rename = "wakeup/fired")]
     WakeupFired(WakeupFiredEvent),
+
+    /// A turn started work that outlives it — a background `shell`, a detached
+    /// `delegate` (docs/bot-runtime.md §5.9).
+    #[serde(rename = "task/spawned")]
+    TaskSpawned(TaskSpawnedEvent),
+    /// That work finished. **This may land long after the turn ended**, which
+    /// is the whole difference between a background task and a tool call: a
+    /// call settles inside the round that made it, and this one settles
+    /// whenever the work does. It names no turn for the same reason — the turn
+    /// that started it may be over, and attributing a step to it would put work
+    /// inside a run that had already closed.
+    #[serde(rename = "task/settled")]
+    TaskSettled(TaskSettledEvent),
 }
 
 /// What a suspended turn is waiting for.
@@ -398,6 +411,61 @@ pub struct WakeupFiredEvent {
     pub cause: WakeupCause,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub payload: String,
+}
+
+/// What kind of work a background task is. Two today, and the executor treats
+/// them the same — the distinction is for the operator reading the log and for
+/// the line the model is handed when the task settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskKind {
+    Shell,
+    Delegate,
+}
+
+impl TaskKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Delegate => "delegate",
+        }
+    }
+}
+
+/// The turn handed work off and kept going.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSpawnedEvent {
+    /// The turn that started it — which may well be over by the time the
+    /// matching `task/settled` arrives.
+    pub turn_id: String,
+    pub task_id: String,
+    pub kind: TaskKind,
+    /// One line naming the work, for the operator and for the wake that
+    /// eventually reports it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+}
+
+/// The work finished, one way or another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSettledEvent {
+    pub task_id: String,
+    /// [`ToolOutcome::Uncertain`] is the same claim it makes on a tool call:
+    /// nobody knows whether the work landed. A background task inherits it
+    /// wholesale on restart — the process group died with the process, and the
+    /// command may have completed first.
+    pub outcome: ToolOutcome,
+    /// Where the full output is kept (the tool-output store's path). Empty when
+    /// there is nothing to keep — an uncertain settle written by the restart
+    /// check has no output to point at.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub result_ref: String,
+    /// What the model is told when this wakes a turn: the outcome in a few
+    /// lines, with `result_ref` for the rest.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    #[serde(default)]
+    pub elapsed_ms: i64,
 }
 
 /// Where a `user/message` came from. A compaction summary enters the surface as
@@ -1026,6 +1094,8 @@ pub const KNOWN_EVENT_TYPES: &[&str] = &[
     "approval/expired",
     "turn/suspended",
     "wakeup/fired",
+    "task/spawned",
+    "task/settled",
 ];
 
 /// The ordered conversation surface, folded from a log.

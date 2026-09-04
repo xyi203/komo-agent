@@ -475,6 +475,11 @@ pub struct ToolContext {
     /// transcript of its tool calls, and the identity is all that stopping
     /// takes.
     call: Option<CallRef>,
+    /// Who holds work that outlives this turn (`domain/background.rs`). `None`
+    /// on a runtime whose turns are all there is — an aux completion, a
+    /// sub-agent, a test — and a tool asked to detach then says so rather than
+    /// pretending to.
+    tasks: Option<Arc<dyn crate::domain::background::BackgroundTasks>>,
 }
 
 /// One call's place in its round: what a wait has to name to be re-dispatched
@@ -597,7 +602,28 @@ impl ToolContext {
             approver,
             approval: None,
             call: None,
+            tasks: None,
         }
+    }
+
+    /// Install who runs work that outlives this turn. Set by the executor, on
+    /// the runtimes that have somewhere for such work to live.
+    pub fn with_background(
+        mut self,
+        tasks: Arc<dyn crate::domain::background::BackgroundTasks>,
+    ) -> Self {
+        self.tasks = Some(tasks);
+        self
+    }
+
+    /// Who runs work that outlives this turn, if anyone does here.
+    pub fn background(&self) -> Option<&Arc<dyn crate::domain::background::BackgroundTasks>> {
+        self.tasks.as_ref()
+    }
+
+    /// The turn this call belongs to — what a spawned task is recorded against.
+    pub fn turn_id(&self) -> Option<&str> {
+        self.run.as_ref().map(|run| run.run_id.as_str())
     }
 
     /// Make this call's approvals durable facts. Installed by the executor,

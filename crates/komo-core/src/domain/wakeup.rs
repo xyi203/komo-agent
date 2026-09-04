@@ -158,10 +158,15 @@ impl WakeupRegistration {
 /// and neither should have to know the other's shape.
 #[async_trait::async_trait]
 pub trait WakeupDispatch: Send + Sync {
+    /// Wake it, carrying whatever the thing that happened brought with it — a
+    /// finished task's result, a webhook's body. Empty for a wake that is only
+    /// a clock going off, and the caller then has nothing to say beyond "it is
+    /// time".
     async fn fire(
         &self,
         registration: &WakeupRegistration,
         cause: WakeupCause,
+        payload: &str,
     ) -> anyhow::Result<()>;
 }
 

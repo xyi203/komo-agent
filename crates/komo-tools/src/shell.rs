@@ -8,8 +8,10 @@ use tokio::io::AsyncReadExt;
 
 use komo_core::domain::{
     approval::{ActionRef, ApprovalRequest, Decision},
+    background::{TaskReport, TaskSpec},
     cancel::Cancelled,
     context::ToolContext,
+    session_event::{TaskKind, ToolOutcome},
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
@@ -122,6 +124,9 @@ struct ShellArgs {
     /// Working directory, relative to the workspace root (default: the root).
     #[serde(default)]
     workdir: Option<String>,
+    /// Hand the command off and return a task id instead of waiting for it.
+    #[serde(default)]
+    background: bool,
 }
 
 /// Default command budget, matching opencode v2's `bash`.
@@ -220,7 +225,10 @@ impl Tool for ShellTool {
         "Run a shell command on the local machine via `sh -c` and return its \
          combined stdout/stderr. Safe (read-only) commands run without a \
          prompt; destructive commands require an explicit dangerous-action \
-         confirmation, and a few catastrophic ones are always refused."
+         confirmation, and a few catastrophic ones are always refused. Pass \
+         `background: true` for long work: the call returns a task id at once, \
+         the turn is free to end, and the result comes back to this \
+         conversation when it lands."
     }
 
     /// The caller may ask for up to [`MAX_TIMEOUT_MS`]; the executor's clock has
@@ -253,6 +261,10 @@ impl Tool for ShellTool {
                 "workdir": {
                     "type": "string",
                     "description": "Directory to run in, relative to the workspace root. Defaults to the root."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run it detached: this call returns a task id immediately and the turn is free to end. You are told the result in this conversation when it lands, or you can stop and wait for it with `wait`. For work measured in minutes — never for something you need in order to answer now."
                 }
             },
             "required": ["command"]
@@ -350,9 +362,62 @@ impl Tool for ShellTool {
                 .min(MAX_TIMEOUT_MS),
         );
 
+        let plan = CommandPlan {
+            command: args.command.clone(),
+            cwd,
+            timeout,
+        };
+
+        if args.background {
+            return spawn_background(plan, ctx).await;
+        }
+
+        match plan.run(Some(ctx)).await {
+            // The turn is already ending, so nothing will read a reply — the
+            // point of returning an error is the ledger, which records this step
+            // with the same wording as the run's own cancellation.
+            Ran::Cancelled => Err(ToolError::Failed(Cancelled.into())),
+            Ran::Broken(error) => Err(ToolError::Failed(anyhow::anyhow!(error))),
+            outcome => Ok(plan.render(&outcome)),
+        }
+    }
+}
+
+/// One command, resolved: everything needed to run it and nothing borrowed from
+/// the turn. That is what lets the *same* value run in the foreground under the
+/// turn's cancellation and, detached, in a task that outlives it.
+struct CommandPlan {
+    command: String,
+    cwd: Option<std::path::PathBuf>,
+    timeout: std::time::Duration,
+}
+
+/// How the command stopped.
+enum Ran {
+    Exited {
+        out: Vec<u8>,
+        err: Vec<u8>,
+        code: Option<i32>,
+    },
+    /// Its own `timeout` elapsed and the process group was killed. Whether the
+    /// command had already done its work is not knowable — which is why a
+    /// background task settles this as `Uncertain` rather than as a failure.
+    TimedOut,
+    /// The user stopped the turn. Foreground only: a detached task is not the
+    /// turn's to cancel.
+    Cancelled,
+    /// Never ran, or could not be awaited.
+    Broken(String),
+}
+
+impl CommandPlan {
+    /// Run it, optionally racing the turn's cancellation. `cancel: None` is the
+    /// background case: work explicitly detached from the turn must not die
+    /// when the turn does.
+    async fn run(&self, cancel: Option<&ToolContext>) -> Ran {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")
-            .arg(&args.command)
+            .arg(&self.command)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -365,12 +430,13 @@ impl Tool for ShellTool {
         // compiler) running with the pipe still open.
         #[cfg(unix)]
         cmd.process_group(0);
-        if let Some(dir) = &cwd {
+        if let Some(dir) = &self.cwd {
             cmd.current_dir(dir);
         }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ToolError::Failed(anyhow::anyhow!("failed to spawn command: {e}")))?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => return Ran::Broken(format!("failed to spawn command: {e}")),
+        };
         let pgid = child.id().map(|id| id as i32);
 
         // Read both streams concurrently, each bounded to MAX_STREAM_BYTES, so a
@@ -404,83 +470,155 @@ impl Tool for ShellTool {
         // budget elapsed, or the user asked to stop the turn. `shell` is the tool
         // that most needs the second one — interrupting a ten-minute build should
         // actually end the build, not just stop waiting for it.
+        let stop = async {
+            match cancel {
+                Some(ctx) => ctx.cancelled().await,
+                // Nothing interrupts a detached task; its own timeout is the
+                // only way it stops early.
+                None => std::future::pending().await,
+            }
+        };
         let outcome = tokio::select! {
-            r = tokio::time::timeout(timeout, run) => r.map_err(|_| Interrupt::Timeout),
-            _ = ctx.cancelled() => Err(Interrupt::Cancelled),
+            r = tokio::time::timeout(self.timeout, run) => r.map_err(|_| Interrupt::Timeout),
+            _ = stop => Err(Interrupt::Cancelled),
         };
 
-        let (out_bytes, err_bytes, status, timed_out) = match outcome {
-            Ok((out, err, status)) => {
-                let status = status.map_err(|e| {
-                    ToolError::Failed(anyhow::anyhow!("failed to await command: {e}"))
-                })?;
-                (out, err, Some(status), false)
-            }
-            // Kill the whole group: `sh` alone would leave its children
-            // running (and holding the pipes) forever.
+        match outcome {
+            Ok((out, err, status)) => match status {
+                Ok(status) => Ran::Exited {
+                    out,
+                    err,
+                    code: status.code(),
+                },
+                Err(e) => Ran::Broken(format!("failed to await command: {e}")),
+            },
+            // Kill the whole group: `sh` alone would leave its children running
+            // (and holding the pipes) forever.
             Err(Interrupt::Timeout) => {
                 kill_group(pgid);
-                (Vec::new(), Vec::new(), None, true)
+                Ran::TimedOut
             }
             Err(Interrupt::Cancelled) => {
                 kill_group(pgid);
-                // The turn is already ending, so nothing will read a reply — the
-                // point of returning an error is the ledger, which records this
-                // step with the same wording as the run's own cancellation.
-                return Err(ToolError::Failed(Cancelled.into()));
+                Ran::Cancelled
             }
-        };
+        }
+    }
 
-        let exit_code = status.as_ref().and_then(|s| s.code());
+    /// The model-facing result of a finished command.
+    fn render(&self, outcome: &Ran) -> ToolOutput {
         let clipped = |raw: &[u8]| (raw.len() as u64) >= MAX_STREAM_BYTES;
-        let truncated = clipped(&out_bytes) || clipped(&err_bytes);
-
-        // `structured` carries the machine-readable outcome (`exit`, `truncated`,
-        // `timeout`) so a UI/ledger reader doesn't have to parse the prose.
-        let structured = json!({
-            "exit": exit_code,
-            "truncated": truncated,
-            "timeout": timed_out,
-        });
-
-        if timed_out {
-            return Ok(ToolOutput::text(format!(
+        match outcome {
+            Ran::TimedOut => ToolOutput::text(format!(
                 "Command timed out after {} ms and was killed (along with any \
                  processes it started). Retry with a larger `timeout` if it \
                  legitimately takes longer — the maximum is {MAX_TIMEOUT_MS} ms.",
-                timeout.as_millis()
+                self.timeout.as_millis()
             ))
-            .with_title(format!("shell (timed out): {}", args.command))
-            .with_structured(structured));
-        }
-
-        let stdout = String::from_utf8_lossy(&out_bytes);
-        let stderr = String::from_utf8_lossy(&err_bytes);
-        let status_text = exit_code
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".to_string());
-
-        let mut result = format!("exit status: {status_text}");
-        if !stdout.trim().is_empty() {
-            result.push_str(&format!("\n--- stdout ---\n{}", stdout.trim_end()));
-            if clipped(&out_bytes) {
-                result.push_str("\n…[stdout truncated at the output limit]");
+            .with_title(format!("shell (timed out): {}", self.command))
+            // `structured` carries the machine-readable outcome (`exit`,
+            // `truncated`, `timeout`) so a UI/ledger reader doesn't have to
+            // parse the prose.
+            .with_structured(json!({ "exit": null, "truncated": false, "timeout": true })),
+            Ran::Exited { out, err, code } => {
+                let stdout = String::from_utf8_lossy(out);
+                let stderr = String::from_utf8_lossy(err);
+                let status_text = code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string());
+                let mut result = format!("exit status: {status_text}");
+                if !stdout.trim().is_empty() {
+                    result.push_str(&format!("\n--- stdout ---\n{}", stdout.trim_end()));
+                    if clipped(out) {
+                        result.push_str("\n…[stdout truncated at the output limit]");
+                    }
+                }
+                if !stderr.trim().is_empty() {
+                    result.push_str(&format!("\n--- stderr ---\n{}", stderr.trim_end()));
+                    if clipped(err) {
+                        result.push_str("\n…[stderr truncated at the output limit]");
+                    }
+                }
+                ToolOutput::text(result)
+                    .with_title(format!("shell: {}", self.command))
+                    .with_structured(json!({
+                        "exit": code,
+                        "truncated": clipped(out) || clipped(err),
+                        "timeout": false,
+                    }))
             }
+            Ran::Cancelled => ToolOutput::text("Command cancelled."),
+            Ran::Broken(error) => ToolOutput::text(format!("error: {error}")),
         }
-        if !stderr.trim().is_empty() {
-            result.push_str(&format!("\n--- stderr ---\n{}", stderr.trim_end()));
-            if clipped(&err_bytes) {
-                result.push_str("\n…[stderr truncated at the output limit]");
-            }
-        }
-        Ok(ToolOutput::text(result)
-            .with_title(format!("shell: {}", args.command))
-            .with_structured(structured))
     }
 }
 
-/// SIGKILL a whole process group. Best-effort: the group is already gone if the
-/// command exited between the timeout firing and this call.
+/// Hand the command to the background runtime and answer with its id.
+///
+/// The approval already happened above: starting a command in the background
+/// and running it in the foreground are two ways of executing the same action,
+/// so they are gated identically. What differs afterwards is only who waits.
+async fn spawn_background(plan: CommandPlan, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+    let (Some(tasks), Some(turn_id)) = (ctx.background(), ctx.turn_id()) else {
+        return Ok(ToolOutput::text(
+            "This runtime cannot run a command in the background — nothing here \
+             outlives the turn. Run it in the foreground instead (drop \
+             `background`), raising `timeout` if it is slow.",
+        ));
+    };
+    let label = plan.command.clone();
+    let spec = TaskSpec {
+        kind: TaskKind::Shell,
+        label: label.clone(),
+    };
+    let work = Box::pin(async move {
+        let outcome = plan.run(None).await;
+        let full = plan.render(&outcome).text;
+        TaskReport {
+            outcome: match &outcome {
+                Ran::Exited { code: Some(0), .. } => ToolOutcome::Succeeded,
+                // Killed at its own deadline: the command may well have done its
+                // work before the clock ran out, and nothing here can tell. The
+                // model has to hear that rather than "it failed".
+                Ran::TimedOut => ToolOutcome::Uncertain,
+                _ => ToolOutcome::Failed,
+            },
+            summary: head_of(&full, BACKGROUND_SUMMARY_BYTES),
+            full,
+        }
+    });
+    match tasks
+        .spawn(&ctx.session.session_id, turn_id, spec, work)
+        .await
+    {
+        Ok(task_id) => Ok(ToolOutput::text(format!(
+            "Started `{label}` in the background as task {task_id}. This turn does not wait \
+             for it: finish what you are doing and answer. You will be told the result in \
+             this conversation when it settles — or stop and wait for it now with \
+             `wait` and `for_task: {task_id}`."
+        ))
+        .with_title(format!("shell (background): {label}"))
+        .with_structured(json!({ "task_id": task_id, "background": true }))),
+        Err(error) => Ok(ToolOutput::text(error.to_string())),
+    }
+}
+
+/// How much of a background command's output rides in the wake that reports it.
+/// The rest stays in the store, named by `result_ref`.
+const BACKGROUND_SUMMARY_BYTES: usize = 2_000;
+
+/// The first `budget` bytes, cut on a char boundary, saying so when it cut.
+fn head_of(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_string();
+    }
+    let mut at = budget;
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    format!("{}\n…[the rest is in the stored output]", &text[..at])
+}
+
 fn kill_group(pgid: Option<i32>) {
     #[cfg(unix)]
     if let Some(pgid) = pgid {

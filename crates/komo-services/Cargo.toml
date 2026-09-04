@@ -22,6 +22,7 @@ chrono = { workspace = true }
 # Content digests for checkpointed files — "changed since the run left it?"
 sha2 = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 tokio = { version = "1.53.1", features = ["full"] }
 # `join_all` — a round's independent tool calls run concurrently.
 futures-util = { workspace = true }
