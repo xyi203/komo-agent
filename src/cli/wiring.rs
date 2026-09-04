@@ -18,6 +18,7 @@ use komo_agent::llm::{PreambleFn, build_llm};
 use komo_agent::reviewer::ReflectiveReviewer;
 use komo_agent::runtime::AgentRuntime;
 use komo_agent::system_prompt::SystemPromptBuilder;
+use komo_agent::unattended::{UnattendedDeny, UnattendedSuspend};
 use komo_core::domain::checkpoint::CheckpointStore;
 use komo_core::domain::embedding::EmbeddingClient;
 use komo_core::domain::skill::SkillOffer;
@@ -689,19 +690,21 @@ pub async fn build(
 
     // ── Cron agent runtime (general cron, agent mode) ────────────────────────
     // Runs `CronAction::Agent` jobs: the SAME full tool set as the main agent
-    // (so a scheduled job can act — shell, git, skills), but with the briefing's
-    // unattended safety model — a `PolicyApprover` over a deny-all inner, so a
-    // `Risk::Normal` action passes only through an explicit `unattended = true`
-    // policy rule. Main model (jobs can be arbitrarily complex), no memory
-    // enricher (sweeps aren't fed the user's memory library), and the run ledger
-    // is shared so every job execution is auditable via `komo run list`.
+    // (so a scheduled job can act — shell, git, skills), under the unattended
+    // safety model — a `PolicyApprover` whose inner **suspends**, so a
+    // `Risk::Normal` action either passes through an `unattended = true` policy
+    // rule or this job's own grants, or stops the turn until the operator
+    // answers in the home chat (docs/bot-runtime.md §5.4). Main model (jobs can
+    // be arbitrarily complex), no memory enricher (sweeps aren't fed the user's
+    // memory library), and the run ledger is shared so every job execution is
+    // auditable via `komo run list`.
     // Deliberately `wrap`, not `wrap_with_store`: saved grants were accumulated
     // interactively and must not leak into an unattended context, where only an
     // explicit `unattended = true` config rule may grant. (The engine enforces
     // this again for a channel-less decision — two floors, on purpose.)
     let cron_approver = komo_agent::policy_approver::PolicyApprover::wrap(
         config.runtime.policy.policy.clone(),
-        Arc::new(UnattendedDeny),
+        Arc::new(UnattendedSuspend),
     );
     // No `delegate`: the sub-agent runtime carries the *interactive* approver, and
     // handing that to an unattended job mixes trust models — a cron turn has no
@@ -743,9 +746,12 @@ pub async fn build(
     // A second, deliberately small agent the BriefingSweep drives: aux model,
     // read-only tool set (the plugins' `Scope::ALL` registrations — no
     // shell/file/task/memory writes), and a policy approver whose inner is
-    // deny-all — there is never a human to prompt, so a `Risk::Normal` action
-    // passes only through an explicit `unattended` policy rule. Safe reads
-    // (web_fetch, skill view) work out of the box.
+    // deny-all — so a `Risk::Normal` action passes only through an explicit
+    // `unattended` policy rule. Safe reads (web_fetch, skill view) work out of
+    // the box. It denies where a routine waits: the briefing degrades to a
+    // tool-less compose the moment its turn fails, so the digest has already
+    // gone out by the time an operator could answer, and the continuation would
+    // have nobody listening for it.
     // Sharing the run ledger (`runs: db`) makes every briefing execution
     // auditable via `komo run list`.
     // No saved grants here either — see the cron approver above.
@@ -800,22 +806,3 @@ pub async fn build(
 /// Round budget for the briefing runtime: enough for "list skills → load one →
 /// fetch its data → compose", never a long-running loop.
 const BRIEFING_MAX_TURNS: usize = 4;
-
-/// Inner approver for the unattended briefing runtime: there is never a human
-/// watching, so anything the policy didn't explicitly grant is denied.
-struct UnattendedDeny;
-
-#[async_trait::async_trait]
-impl Approver for UnattendedDeny {
-    async fn decide(
-        &self,
-        request: &crate::domain::approval::ApprovalRequest,
-    ) -> crate::domain::approval::Decision {
-        tracing::warn!(summary = %request.summary,
-            "briefing: denied (unattended; add an `unattended = true` policy rule to grant)");
-        crate::domain::approval::Decision::deny_because(
-            "这是无人值守的后台任务，没有人能批准这一步。只有配置了 \
-             `unattended = true` 的 [policy] 允许规则才会放行；请改用不需要审批的做法。",
-        )
-    }
-}

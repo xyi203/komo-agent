@@ -103,11 +103,17 @@ pub fn parse_cron_job_status(s: &str) -> CronJobStatus {
 }
 
 /// Outcome of a job's most recent execution.
+///
+/// `Waiting` is neither: an agent job that hit an action its grants don't cover
+/// stopped to ask the operator (docs/bot-runtime.md §5.4). It did not fail —
+/// nothing went wrong and the turn is coming back — and it did not succeed, so
+/// recording either would make "did last night's routine work?" unanswerable.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CronRunStatus {
     Ok,
     Failed,
+    Waiting,
 }
 
 impl CronRunStatus {
@@ -115,15 +121,17 @@ impl CronRunStatus {
         match self {
             Self::Ok => "ok",
             Self::Failed => "failed",
+            Self::Waiting => "waiting",
         }
     }
 }
 
-/// `""` (never ran) → `None`; anything not `ok` parses as failed.
+/// `""` (never ran) → `None`; anything not `ok` / `waiting` parses as failed.
 pub fn parse_cron_run_status(s: &str) -> Option<CronRunStatus> {
     match s {
         "" => None,
         "ok" => Some(CronRunStatus::Ok),
+        "waiting" => Some(CronRunStatus::Waiting),
         _ => Some(CronRunStatus::Failed),
     }
 }
@@ -588,6 +596,11 @@ mod tests {
         assert_eq!(parse_cron_run_status(""), None);
         assert_eq!(parse_cron_run_status("ok"), Some(CronRunStatus::Ok));
         assert_eq!(parse_cron_run_status("failed"), Some(CronRunStatus::Failed));
+        assert_eq!(
+            parse_cron_run_status("waiting"),
+            Some(CronRunStatus::Waiting),
+            "a routine parked on an approval must not read back as a failure"
+        );
         assert_eq!(
             parse_cron_run_status("garbage"),
             Some(CronRunStatus::Failed)

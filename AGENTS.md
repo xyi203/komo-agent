@@ -473,7 +473,14 @@ call the same functions, which is what keeps validation from forking.
   *later* deletion nobody has seen. Unattended contexts (cron/briefing/sweeps) grant only through
   `unattended = true` allow rules **or the running job's own `grants`**
   (`CronJob.grants`, approved in the same prompt that created the job; carried
-  into the turn by `with_job_grants`, scoped to that turn, revoked with the job).
+  into the turn by `with_job_grants`, scoped to that turn, revoked with the job)
+  — everything else escalates to the runtime's own inner approver
+  (`komo-agent`'s `unattended`), and the two answer differently: a **routine**
+  stops (`UnattendedSuspend` → `Decision::Suspend`) and the sweep tells the
+  operator which wait to answer in the home chat, a **briefing** denies
+  (`UnattendedDeny`), because its digest has already gone out by the time
+  anyone could answer. Neither ever lets a `Risk::Dangerous` action through,
+  however long the operator takes.
   Full ladder: **tool hardline floor > config deny > job grant > saved grant >
   config allow / `default_normal` > ask**. **What marks a turn unattended is
   `SessionContext::origin`** (`SessionOrigin::Cron` / `Briefing`, set by the
@@ -814,7 +821,10 @@ call the same functions, which is what keeps validation from forking.
   go through a channel so a batch can be collected before it is interpreted.
 - `cron` (`cron_job_records`, `CronJobSweep`) — two job modes: **command**
   (operator-authored, runs directly, no approver) and **agent** (unattended
-  turn on `cron_runtime`, side effects need `unattended = true` policy rules).
+  turn on `cron_runtime`: a side effect needs an `unattended = true` policy
+  rule or one of the job's own grants, else the turn **suspends** and the
+  operator answers `/approve wk-<id>` in the home chat — `last_status` is then
+  `waiting`, which is neither ran nor failed).
   Chat-created jobs (`tools/cron.rs`) are approval-gated at creation; a
   command job from chat is `Risk::Dangerous`. An agent job declares the actions
   it needs as `grants`, approved in that **same** prompt (which is why a

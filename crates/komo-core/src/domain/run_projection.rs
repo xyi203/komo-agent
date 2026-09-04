@@ -103,6 +103,41 @@ pub fn replay_floor(runs: &[ProjectedRun], run: &ProjectedRun) -> u64 {
     floor
 }
 
+/// The answer an **earlier attempt** at this turn already got for this call.
+///
+/// A call that stopped for an approval is re-dispatched by the continuation,
+/// and the answer was written against the turn that *asked* — so the call whose
+/// entire story is its approval would otherwise be the one call the ledger
+/// cannot say who allowed, or how long the person took (docs/bot-runtime.md §8,
+/// criterion 2: `waited_ms ≈ 5h` on the step that finally ran).
+///
+/// Bounded by the number of runs, so a `resumed_from` cycle cannot loop.
+fn inherited_approval(
+    runs: &[ProjectedRun],
+    at: usize,
+    call_id: &str,
+    approvals: &[(String, String, String, i64)],
+) -> Option<(String, i64)> {
+    let mut current = runs[at].run.resumed_from.clone();
+    for _ in 0..runs.len() {
+        let id = current?;
+        if let Some((.., decided_by, waited)) = approvals
+            .iter()
+            .rev()
+            .find(|(turn, call, ..)| *turn == id && call == call_id)
+        {
+            return Some((decided_by.clone(), *waited));
+        }
+        current = runs
+            .iter()
+            .find(|other| other.run.id == id)?
+            .run
+            .resumed_from
+            .clone();
+    }
+    None
+}
+
 /// Fold one session's events into the runs they record, oldest first.
 ///
 /// Events for a turn that never opened with `turn/started` are ignored rather
@@ -120,6 +155,10 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
     // answer the turn produced, and the ledger has always left `final_output`
     // empty for both.
     let mut replies: Vec<String> = Vec::new();
+    // Every answer to an approval, as `(turn, call, rung, waited_ms)`. Kept
+    // beyond the turn it was recorded against because a call that stopped to
+    // wait is re-dispatched by a *later* attempt (see [`inherited_approval`]).
+    let mut approvals: Vec<(String, String, String, i64)> = Vec::new();
 
     for event in events {
         // The learning watermark. Decided by the sweep after the turn is over,
@@ -166,6 +205,15 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
         let Some(at_index) = runs.iter().position(|p| p.run.id == turn_id) else {
             continue;
         };
+        // An answer an earlier attempt at this turn already collected — read
+        // before the mutable borrow below, and only for the one event that can
+        // use it.
+        let inherited = match &event.kind {
+            SessionEventKind::ToolCallStarted(call) => {
+                inherited_approval(&runs, at_index, &call.call_id, &approvals)
+            }
+            _ => None,
+        };
         let projected = &mut runs[at_index];
 
         match &event.kind {
@@ -201,8 +249,11 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
                         elapsed_ms: 0,
                         structured: serde_json::Value::Null,
                         output_paths: Vec::new(),
-                        approved_by: String::new(),
-                        approval_waited_ms: 0,
+                        approved_by: inherited
+                            .as_ref()
+                            .map(|(by, _)| by.clone())
+                            .unwrap_or_default(),
+                        approval_waited_ms: inherited.map(|(_, waited)| waited).unwrap_or_default(),
                     },
                 });
                 open.push((
@@ -227,6 +278,12 @@ pub fn project_runs(session_id: &str, events: &[SessionEvent]) -> Vec<ProjectedR
                     projected_step.step.approved_by = approval.decided_by.clone();
                     projected_step.step.approval_waited_ms = approval.waited_ms;
                 }
+                approvals.push((
+                    approval.turn_id.clone(),
+                    approval.call_id.clone(),
+                    approval.decided_by.clone(),
+                    approval.waited_ms,
+                ));
             }
             SessionEventKind::ToolCallSettled(call) => {
                 let found = open.iter().position(|(run_id, call_id, ..)| {
@@ -551,6 +608,62 @@ mod tests {
         assert_eq!(steps[1].step.tool_name, "shell");
         assert_eq!(steps[1].step.approved_by, "human");
         assert_eq!(steps[1].step.approval_waited_ms, 4_200);
+    }
+
+    /// The routine case (docs/bot-runtime.md §5.4): the turn stopped for an
+    /// approval at 03:00, the operator answered at 08:00, and the call ran in
+    /// the *continuation*. The answer was recorded against the turn that asked,
+    /// so without following the `resumed_from` chain the one call whose whole
+    /// story is its approval is the one the ledger cannot explain.
+    #[test]
+    fn a_call_re_dispatched_after_a_wait_carries_the_answer_that_licensed_it() {
+        use crate::domain::session_event::ApprovalResolvedEvent;
+
+        let events = vec![
+            started(0, 100, "t1"),
+            asked(1, 100, "t1", "tidy the tree"),
+            call_started(2, 100, "t1", "c1", "shell"),
+            ev(
+                3,
+                100,
+                SessionEventKind::TurnSuspended(crate::domain::session_event::TurnSuspendedEvent {
+                    turn_id: "t1".into(),
+                    wakeup: crate::domain::session_event::Wakeup::Approval {
+                        call_id: "c1".into(),
+                    },
+                    summary: "run shell command: git push".into(),
+                    expires_at: None,
+                }),
+            ),
+            ev(
+                4,
+                18_100,
+                SessionEventKind::ApprovalResolved(ApprovalResolvedEvent {
+                    turn_id: "t1".into(),
+                    call_id: "c1".into(),
+                    call_index: 0,
+                    allowed: true,
+                    decided_by: "human".into(),
+                    reason: String::new(),
+                    waited_ms: 18_000_000,
+                }),
+            ),
+            ev(
+                5,
+                18_100,
+                SessionEventKind::TurnStarted {
+                    turn_id: "t2".into(),
+                    resumed_from: Some("t1".into()),
+                },
+            ),
+            call_started(6, 18_100, "t2", "c1", "shell"),
+            call_settled(7, 18_101, "t2", "c1", ToolOutcome::Succeeded),
+        ];
+
+        let runs = project_runs("s1", &events);
+        let continuation = runs.iter().find(|r| r.run.id == "t2").unwrap();
+        assert_eq!(continuation.steps[0].step.approved_by, "human");
+        assert_eq!(continuation.steps[0].step.approval_waited_ms, 18_000_000);
     }
 
     #[test]

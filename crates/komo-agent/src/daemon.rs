@@ -39,8 +39,9 @@ use komo_core::domain::{
     run::RunStatus,
     run_projection::project_runs,
     session::Session,
+    session_event::SessionEventKind,
     task::{Task, TaskRepository},
-    wakeup::{WakeupDispatch, WakeupRegistration, WakeupRepository},
+    wakeup::{WakeupDispatch, WakeupRegistration, WakeupRepository, is_suspended},
 };
 use komo_services::tool_execution::{with_job_grants, with_session};
 
@@ -600,29 +601,36 @@ impl Maintenance for CronJobSweep {
             }
 
             let started = std::time::Instant::now();
-            let (title, body, ok, session) = self.execute(&job).await;
-            if ok {
-                info!(job = %job.name, kind = job.action.kind(), elapsed_s = started.elapsed().as_secs(), "cron job succeeded");
-                summary.jobs_run += 1;
-            } else {
-                error!(job = %job.name, kind = job.action.kind(), elapsed_s = started.elapsed().as_secs(), outcome = %body, "cron job failed");
+            let outcome = self.execute(&job).await;
+            let elapsed_s = started.elapsed().as_secs();
+            match outcome.status {
+                CronRunStatus::Ok => {
+                    info!(job = %job.name, kind = job.action.kind(), elapsed_s, "cron job succeeded");
+                    summary.jobs_run += 1;
+                }
+                CronRunStatus::Failed => {
+                    error!(job = %job.name, kind = job.action.kind(), elapsed_s, outcome = %outcome.body, "cron job failed")
+                }
+                // Neither ran nor failed: it stopped for an approval and comes
+                // back when the operator answers, so it is not this cycle's
+                // completed work.
+                CronRunStatus::Waiting => {
+                    info!(job = %job.name, kind = job.action.kind(), elapsed_s, "cron job is waiting for an approval")
+                }
             }
-            if let Err(error) = self.notifier.notify(&title, &body).await {
+            if let Err(error) = self.notifier.notify(&outcome.title, &outcome.body).await {
                 warn!(%error, job = %job.name, "failed to deliver cron job outcome");
                 delivery_failures += 1;
             }
             // Record the outcome best-effort (the run itself already happened).
-            // The delivered body lands in `last_output` — success and failure
-            // alike — so what ran stays queryable after the notification is
-            // gone; `last_error` is reserved for schedule/config problems.
-            job.last_status = Some(if ok {
-                CronRunStatus::Ok
-            } else {
-                CronRunStatus::Failed
-            });
+            // The delivered body lands in `last_output` — success, failure and
+            // "waiting for an approval" alike — so what ran stays queryable
+            // after the notification is gone; `last_error` is reserved for
+            // schedule/config problems.
+            job.last_status = Some(outcome.status);
             job.last_error = String::new();
-            job.last_output = body;
-            job.last_run_session = session;
+            job.last_output = outcome.body;
+            job.last_run_session = outcome.session;
             if let Err(error) = self.jobs.update(&job).await {
                 warn!(%error, job = %job.name, "failed to record cron job outcome");
             }
@@ -728,9 +736,8 @@ impl CronJobSweep {
             .is_some_and(|projected| projected.run.status == RunStatus::Suspended)
     }
 
-    /// Dispatch one due job to its action, returning (title, body, success,
-    /// ledger session of an agent run — `None` for command jobs).
-    async fn execute(&self, job: &CronJob) -> (String, String, bool, Option<String>) {
+    /// Dispatch one due job to its action.
+    async fn execute(&self, job: &CronJob) -> JobOutcome {
         match &job.action {
             CronAction::Command {
                 command,
@@ -746,7 +753,15 @@ impl CronJobSweep {
                     Duration::from_secs(*timeout_secs),
                 )
                 .await;
-                (title, body, ok, None)
+                JobOutcome {
+                    title,
+                    body,
+                    status: match ok {
+                        true => CronRunStatus::Ok,
+                        false => CronRunStatus::Failed,
+                    },
+                    session: None,
+                }
             }
             CronAction::Agent {
                 prompt,
@@ -769,17 +784,17 @@ impl CronJobSweep {
         prompt: &str,
         skills: &[String],
         workspace: Option<&str>,
-    ) -> (String, String, bool, Option<String>) {
+    ) -> JobOutcome {
         let name = &job.name;
         let fail_title = format!("Komo job「{name}」failed");
         let Some(handler) = &self.runtime else {
-            return (
-                fail_title,
-                "agent-mode cron jobs need the gateway's cron runtime, which is not wired"
+            return JobOutcome {
+                title: fail_title,
+                body: "agent-mode cron jobs need the gateway's cron runtime, which is not wired"
                     .to_string(),
-                false,
-                None,
-            );
+                status: CronRunStatus::Failed,
+                session: None,
+            };
         };
         // A fresh session per firing. What used to be encoded in the id
         // (`cron:{name}:{ts}`) is now the record's own `origin`, set from this
@@ -817,16 +832,105 @@ impl CronJobSweep {
                 } else {
                     truncate_head(reply, JOB_OUTPUT_CAP)
                 };
-                (format!("Komo job「{name}」"), body, true, Some(session_id))
+                JobOutcome {
+                    title: format!("Komo job「{name}」"),
+                    body,
+                    status: CronRunStatus::Ok,
+                    session: Some(session_id),
+                }
             }
-            Err(e) => (
-                fail_title,
-                format!("agent turn failed: {e}"),
-                false,
-                Some(session_id),
-            ),
+            // The turn stopped for an approval its grants don't cover. Not a
+            // failure: it is parked on a standing wait and continues when the
+            // operator answers — so what goes out is the question, not an
+            // error report.
+            Err(error) if is_suspended(&error) => JobOutcome {
+                title: format!("Komo job「{name}」等待批准"),
+                body: self.approval_notice(name, &session_id).await,
+                status: CronRunStatus::Waiting,
+                session: Some(session_id),
+            },
+            Err(e) => JobOutcome {
+                title: fail_title,
+                body: format!("agent turn failed: {e}"),
+                status: CronRunStatus::Failed,
+                session: Some(session_id),
+            },
         }
     }
+
+    /// What the operator is told when a routine stopped for an approval: what
+    /// it wants to do, and which wait to answer.
+    ///
+    /// Read back out of the two records the suspension left rather than passed
+    /// down from it — the log says what the turn is waiting for, the
+    /// registration says how to name it — because the wait's id does not exist
+    /// until the registration is written, which is after the approver has
+    /// already answered. Sending the prompt from the approver would hand the
+    /// operator an id nothing will answer to.
+    ///
+    /// Only `/approve <id>` and `/deny <id>` are offered: `session` / `always`
+    /// widen a grant, and an unattended turn's actions are approved one at a
+    /// time or not at all.
+    async fn approval_notice(&self, job: &str, session_id: &str) -> String {
+        let Some(wait) = self.pending_wait(session_id).await else {
+            warn!(
+                job,
+                session = session_id,
+                "a routine is waiting for an approval that has no registration to answer; \
+                 it will be re-registered at the next gateway start"
+            );
+            return format!(
+                "routine「{job}」停下等待批准，但没能找到对应的等待登记。\
+                 重启 gateway 后会补上；`komo run list` 可以看到这个 turn。"
+            );
+        };
+        format!(
+            "⚠️ routine「{job}」需要审批：{}\n回复 /approve {} 批准本次 · \
+             /deny {} 拒绝（可写理由：/deny {} 别动生产库）",
+            wait.summary, wait.id, wait.id, wait.id
+        )
+    }
+
+    /// The wait a just-suspended routine turn is parked on: its id (what the
+    /// operator answers with) and its summary (what it wants to do).
+    ///
+    /// The session is this firing's own — a fresh uuid per run — so the
+    /// registration and the `turn/suspended` event that belong to it are
+    /// unambiguous.
+    async fn pending_wait(&self, session_id: &str) -> Option<PendingWait> {
+        let wiring = self.wakeups.as_ref()?;
+        let events = wiring.events.events(session_id).await.ok()?;
+        let (turn_id, summary) = events.iter().rev().find_map(|event| match &event.kind {
+            SessionEventKind::TurnSuspended(suspended) => {
+                Some((suspended.turn_id.clone(), suspended.summary.clone()))
+            }
+            _ => None,
+        })?;
+        let id = wiring
+            .registrations
+            .list()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|r| r.turn_id.as_deref() == Some(turn_id.as_str()))
+            .map(|r| r.id)?;
+        Some(PendingWait { id, summary })
+    }
+}
+
+/// One firing's result, as the sweep delivers and records it.
+struct JobOutcome {
+    title: String,
+    body: String,
+    status: CronRunStatus,
+    /// Ledger session of an agent run; `None` for command jobs.
+    session: Option<String>,
+}
+
+/// The standing wait a suspended routine turn left behind.
+struct PendingWait {
+    id: String,
+    summary: String,
 }
 
 /// Wrap an agent-job prompt with the skill-loading preamble (progressive
@@ -2368,6 +2472,327 @@ mod tests {
         assert_eq!(job.last_status, Some(CronRunStatus::Ok));
         assert_eq!(job.last_output, "本周值班：Alice");
         assert_eq!(job.last_run_session.as_deref(), Some(seen[0].0.as_str()));
+    }
+
+    // ── unattended approval (docs/bot-runtime.md §5.4) ───────────────────────
+
+    /// An approver that must never be consulted: the continuation's answer is
+    /// already in the log, and asking again would be asking the operator to
+    /// approve the same action twice.
+    #[derive(Default)]
+    struct MustNotAsk(Mutex<usize>);
+
+    #[async_trait]
+    impl komo_core::domain::approval::Approver for MustNotAsk {
+        async fn decide(
+            &self,
+            _request: &komo_core::domain::approval::ApprovalRequest,
+        ) -> komo_core::domain::approval::Decision {
+            *self.0.lock().unwrap() += 1;
+            komo_core::domain::approval::Decision::deny()
+        }
+    }
+
+    /// What a turn is running as, read from inside it. The continuation has to
+    /// come back as what it was — the permission engine reads `origin`, and the
+    /// job's grants are what let a routine act at all.
+    #[derive(Default)]
+    struct ContextProbe {
+        seen: Mutex<Option<(SessionOrigin, usize)>>,
+    }
+
+    #[async_trait]
+    impl komo_core::domain::hooks::TurnHook for ContextProbe {
+        fn name(&self) -> &'static str {
+            "context-probe"
+        }
+        async fn turn_started(&self, _session_id: &str) {
+            let origin = komo_services::tool_execution::current_session()
+                .map(|c| c.origin)
+                .unwrap_or_default();
+            let grants = komo_services::tool_execution::current_job_grants().len();
+            *self.seen.lock().unwrap() = Some((origin, grants));
+        }
+    }
+
+    /// The gateway's two halves over one store: the routine runtime the sweep
+    /// drives (it suspends where the policy would have to ask) and the
+    /// dispatcher that brings the turn back when the operator answers — which
+    /// is a *different* runtime in production too, and here carries an approver
+    /// that fails the test if it is consulted.
+    struct RoutineHarness {
+        db: Arc<komo_infra::persistence::db::Db>,
+        dispatcher: Arc<crate::interaction::GatewayDispatcher>,
+        sweep: CronJobSweep,
+        jobs: Arc<FakeCronRepo>,
+        notifier: Arc<FakeNotifier>,
+        asked: Arc<MustNotAsk>,
+        continued_as: Arc<ContextProbe>,
+    }
+
+    async fn routine_harness(name: &str, job: CronJob) -> RoutineHarness {
+        use crate::interaction::{ApprovalState, GatewayDispatcher, TurnWaker, WaitParts};
+        use crate::policy_approver::PolicyApprover;
+        use crate::runtime::tests::{gated_runtime, sqlite_url};
+        use crate::unattended::UnattendedSuspend;
+        use komo_core::domain::policy::Policy;
+        use komo_services::clarify::ClarifyState;
+
+        let db = Arc::new(
+            komo_infra::persistence::db::Db::connect(&sqlite_url(name))
+                .await
+                .unwrap(),
+        );
+        let routine = Arc::new(gated_runtime(
+            db.clone(),
+            PolicyApprover::wrap(Policy::default(), Arc::new(UnattendedSuspend)),
+        ));
+        let asked = Arc::new(MustNotAsk::default());
+        let continued_as = Arc::new(ContextProbe::default());
+        let mut continuing = gated_runtime(db.clone(), asked.clone());
+        continuing.turn_hooks = vec![continued_as.clone()];
+        let dispatcher = Arc::new(
+            GatewayDispatcher::new(
+                Arc::new(continuing),
+                Arc::new(ApprovalState::new()),
+                Arc::new(ClarifyState::new()),
+                db.clone(),
+                db.clone(),
+                db.clone(),
+                None,
+                db.clone(),
+                db.clone(),
+            )
+            .with_waits(WaitParts {
+                runs: db.clone(),
+                events: db.clone(),
+                wakeups: db.clone(),
+            }),
+        );
+        let jobs = Arc::new(FakeCronRepo {
+            jobs: Mutex::new(vec![job]),
+        });
+        let notifier = Arc::new(FakeNotifier::default());
+        let sweep = CronJobSweep {
+            jobs: jobs.clone(),
+            notifier: notifier.clone(),
+            runtime: Some(routine),
+            wakeups: Some(WakeupWiring {
+                registrations: db.clone(),
+                events: db.clone(),
+                dispatch: Arc::new(TurnWaker::new(dispatcher.clone())),
+            }),
+        };
+        RoutineHarness {
+            db,
+            dispatcher,
+            sweep,
+            jobs,
+            notifier,
+            asked,
+            continued_as,
+        }
+    }
+
+    /// An agent job carrying one grant of its own — inert for the gated call
+    /// under test (that request names no resource, so no rule can match it),
+    /// and present to prove the grants survive the wait.
+    fn granted_agent_job(name: &str) -> CronJob {
+        use komo_core::domain::policy::{Category, Effect, Matcher, Rule, RuleSpec};
+        let mut job = agent_job(name, "tidy up", vec![]);
+        job.grants = vec![RuleSpec::from_rule(&Rule {
+            channels: None,
+            category: Category::Shell,
+            matcher: Matcher::Prefix,
+            value: "git".into(),
+            access: None,
+            effect: Effect::Allow,
+            include_dangerous: false,
+            unattended: true,
+        })];
+        job
+    }
+
+    /// The continuation is spawned, so the answer returns before the turn does.
+    async fn continuation_of(
+        db: &Arc<komo_infra::persistence::db::Db>,
+        suspended: &str,
+    ) -> komo_core::domain::run::Run {
+        use komo_core::domain::run::RunRepository;
+        for _ in 0..200 {
+            let found = RunRepository::list(db.as_ref(), 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| {
+                    r.resumed_from.as_deref() == Some(suspended) && r.status != RunStatus::Running
+                });
+            if let Some(run) = found {
+                return run;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the woken turn never finished");
+    }
+
+    /// Five hours pass before anyone looks at the prompt. Only the
+    /// registration's clock is involved: `waited_ms` measures from the moment
+    /// the question was put in front of the operator.
+    async fn age_the_wait(
+        db: &Arc<komo_infra::persistence::db::Db>,
+        wait: &WakeupRegistration,
+        secs: i64,
+    ) {
+        assert!(WakeupRepository::take(db.as_ref(), &wait.id).await.unwrap());
+        let mut aged = wait.clone();
+        aged.created_at -= secs;
+        WakeupRepository::save(db.as_ref(), &aged).await.unwrap();
+    }
+
+    /// The routine path end to end (docs/bot-runtime.md §5.4, and §8's second
+    /// criterion): a job with no grants meets an action the policy does not
+    /// cover, stops rather than failing, tells the operator which wait to
+    /// answer — and when they answer hours later, comes back and does it.
+    #[tokio::test]
+    async fn a_routine_stops_for_an_ungranted_action_and_acts_once_it_is_approved() {
+        use crate::interaction::Answer;
+        use komo_core::domain::run::RunRepository;
+
+        let h = routine_harness("cron-wait-approve", granted_agent_job("nightly")).await;
+        let summary = h.sweep.run().await.unwrap();
+        assert_eq!(
+            summary.jobs_run, 0,
+            "a turn that stopped to ask has not run yet"
+        );
+
+        // The turn is parked, not finished and not broken.
+        let suspended = RunRepository::list(h.db.as_ref(), 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(suspended.status, RunStatus::Suspended);
+        let kinds: Vec<String> =
+            SessionEventRepository::events(h.db.as_ref(), &suspended.session_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|event| {
+                    serde_json::to_value(&event.kind).unwrap()["type"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+        assert!(kinds.iter().any(|k| k == "turn/suspended"), "{kinds:?}");
+
+        // …and something is registered to bring it back.
+        let waits = WakeupRepository::list(h.db.as_ref()).await.unwrap();
+        assert_eq!(waits.len(), 1);
+        let wait = waits[0].clone();
+        assert_eq!(wait.turn_id.as_deref(), Some(suspended.id.as_str()));
+
+        // The operator was handed that wait's id, and what it is for.
+        let job = h.jobs.jobs.lock().unwrap()[0].clone();
+        assert_eq!(job.last_status, Some(CronRunStatus::Waiting));
+        assert_eq!(
+            job.last_run_session.as_deref(),
+            Some(wait.session_id.as_str())
+        );
+        assert!(job.last_output.contains(&wait.id), "{}", job.last_output);
+        assert!(
+            job.last_output.contains("delete the tree"),
+            "the operator is told what it wants to do: {}",
+            job.last_output
+        );
+        let delivered = h.notifier.calls.lock().unwrap()[0].clone();
+        assert!(delivered.0.contains("nightly"), "{}", delivered.0);
+        assert_eq!(delivered.1, job.last_output);
+
+        // Five hours later, in a chat of their own, they allow it.
+        age_the_wait(&h.db, &wait, 5 * 3_600).await;
+        assert!(
+            h.dispatcher
+                .answer_approval("home-chat", Some(&wait.id), Answer::Once)
+                .await,
+            "a routine's wait is answerable from another session by id"
+        );
+
+        let continuation = continuation_of(&h.db, &suspended.id).await;
+        assert_eq!(continuation.status, RunStatus::Done);
+        assert_eq!(*h.asked.0.lock().unwrap(), 0, "nobody was asked twice");
+        // What the turn was is what it comes back as: still unattended (so the
+        // policy engine keeps evaluating it channel-lessly) and still holding
+        // the job's own grants (so it can do the work it was granted).
+        assert_eq!(
+            *h.continued_as.seen.lock().unwrap(),
+            Some((SessionOrigin::Cron, 1))
+        );
+        let steps = RunRepository::steps(h.db.as_ref(), &continuation.id)
+            .await
+            .unwrap();
+        assert_eq!(steps.len(), 1, "the gated call ran exactly once");
+        assert!(steps[0].ok, "{}", steps[0].error);
+        assert_eq!(steps[0].result, "acted");
+        // The audit half: who let it happen, and how long they took.
+        assert_eq!(steps[0].approved_by, "human");
+        assert_eq!(steps[0].approval_waited_ms, 5 * 3_600 * 1_000);
+        assert!(
+            WakeupRepository::list(h.db.as_ref())
+                .await
+                .unwrap()
+                .is_empty(),
+            "an answered wait is retired"
+        );
+    }
+
+    /// The other answer. A refusal is not an error either: the turn comes back,
+    /// the tool is told no, and the routine finishes and reports as usual.
+    #[tokio::test]
+    async fn a_refused_routine_comes_back_and_does_not_act() {
+        use crate::interaction::Answer;
+        use komo_core::domain::run::RunRepository;
+
+        let h = routine_harness("cron-wait-deny", agent_job("nightly", "tidy up", vec![])).await;
+        h.sweep.run().await.unwrap();
+        let suspended = RunRepository::list(h.db.as_ref(), 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let wait = WakeupRepository::list(h.db.as_ref())
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        assert!(
+            h.dispatcher
+                .answer_approval(
+                    "home-chat",
+                    Some(&wait.id),
+                    Answer::Deny(Some("别动生产库".into())),
+                )
+                .await
+        );
+
+        let continuation = continuation_of(&h.db, &suspended.id).await;
+        assert_eq!(continuation.status, RunStatus::Done);
+        assert_eq!(*h.asked.0.lock().unwrap(), 0, "the answer was on record");
+        let steps = RunRepository::steps(h.db.as_ref(), &continuation.id)
+            .await
+            .unwrap();
+        assert_eq!(steps.len(), 1);
+        // A refusal is a terminal, recoverable outcome: it rides back as the
+        // model-facing result rather than as a tool failure — but it has to
+        // say the action did not happen, and why.
+        assert_ne!(steps[0].result, "acted", "the action was not taken");
+        assert!(
+            steps[0].result.contains("别动生产库"),
+            "the model is told why: {}",
+            steps[0].result
+        );
+        assert_eq!(steps[0].approved_by, "human");
     }
 
     #[tokio::test]

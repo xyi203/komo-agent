@@ -25,3 +25,4 @@ pub mod policy_approver;
 pub mod reviewer;
 pub mod runtime;
 pub mod system_prompt;
+pub mod unattended;

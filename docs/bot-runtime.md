@@ -510,8 +510,26 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   `a_noted_prompt_is_visible_until_it_is_answered`、
   `a_dangerous_prompt_narrows_a_widening_answer`（`Risk::Dangerous` 仍只批一次）。
   还没接：TUI approver 仍在进程内等（它本来就守着自己的 turn，不需要跨进程恢复）。
-- **5.4 无人值守审批**：cron turn 的 deny-all 改为挂起 + HomeNotifier。验证：一个没有 grants 的
-  routine 在 home chat 收到提示，`/approve` 后动作执行，`/deny` 后 routine 以 error 结算。
+- **5.4 无人值守审批** —— **已完成**：cron runtime 的内层 approver 换成 `UnattendedSuspend`
+  （`komo-agent` 的 `unattended`）：`Risk::Normal` 答 `Suspend`，`Risk::Dangerous` 仍拒绝——
+  无人值守永不放行危险动作，事后 `/approve` 也不行。提示由 `CronJobSweep` 发而不是 approver 发，
+  因为 `wk-<id>` 要等登记写完才存在：sweep 拿到 `Suspended` 后从日志读 `turn/suspended.summary`、
+  从登记读 id，走已有 notifier 投递「回复 `/approve <id>` / `/deny <id>`」，只给 Once——
+  `session`/`always` 是放宽，无人值守不给。job 的 `last_status` 多一个取值 `waiting`
+  （不是 ok 也不是 failed），`last_run_session` 指向挂起的 turn。briefing 保持 deny：
+  它一失败就降级成无工具 compose，简报已经投出去了，挂起只会留一条没人听的续跑。
+  顺带补的两处：`continue_turn` 从 session 记录读回 `origin`、从登记读回 grants——
+  原来续跑用 detached context，routine 醒来按普通对话评估权限（更宽）且丢掉自己的 grants；
+  `run_projection` 沿 `resumed_from` 链继承 `approval/resolved`，否则答复记在问的那个 turn、
+  动作跑在续跑里，§8 判据 2 的 `waited_ms ≈ 5h` 永远是空的。
+  **遗留**：续跑跑在 dispatcher 的主 runtime 上，不是 cron runtime——工具集更大、经过 memory
+  enricher；权限上 fail-closed（主 runtime 内层是 `ChatApprover`，detached 非交互即拒绝），
+  但不对。要修需要 dispatcher 按 origin 路由 runtime，独立一件事。
+  验证：`a_routine_stops_for_an_ungranted_action_and_acts_once_it_is_approved`（真 sweep →
+  真 runtime → 挂起 → notifier 收到 `wk-` 提示 → 拨快 5h → `answer_approval` → 续跑执行、
+  step `approved_by = human`、`waited_ms = 18_000_000`、登记退休、approver 没再被问）、
+  `a_refused_routine_comes_back_and_does_not_act`、`a_routine_never_waits_for_a_dangerous_one`、
+  `a_call_re_dispatched_after_a_wait_carries_the_answer_that_licensed_it`。
 - **5.5 `awaiting` 投影** —— **已完成**：`Awaiting {turn_id, kind, since, summary, expires_at}`
   从日志 fold（`komo-core` 的 `domain::awaiting`），`turn/suspended` 置位，`wakeup/fired`、
   接手它的 `turn/started{resumed_from}`、以及那个 turn 的终止事件三者任一清除。fold 带

@@ -20,7 +20,9 @@
 //! the task-local in `services::tool_execution`.
 
 use komo_services::clarify::ClarifyState;
-use komo_services::tool_execution::{SessionContext, SessionOrigin, current_session, with_session};
+use komo_services::tool_execution::{
+    SessionContext, SessionOrigin, current_session, with_job_grants, with_session,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +40,7 @@ use komo_core::domain::{
     home::HomeRepository,
     inbox::{InboundOrigin, InboxClaim, InboxRepository},
     pairing::{ApproveOutcome, PairingRepository, PairingStatus},
+    policy::{Rule, RuleSpec},
     repository::{SessionEventRepository, SessionRepository},
     run::RunRepository,
     session::{ChannelPeer, Session},
@@ -885,11 +888,28 @@ impl GatewayDispatcher {
             warn!(%error, turn = %turn_id, "failed to retire a woken turn's other waits");
         }
 
+        // What the turn was is what it comes back as. A routine that stopped to
+        // ask is still a routine: the permission engine reads `origin` to know
+        // nobody is watching, and the job's grants are what let it act at all —
+        // both would be gone if the continuation ran as a plain detached turn,
+        // which is a *widening* (`default_normal` would apply) as well as a
+        // routine that comes back unable to do the work it was granted.
+        let origin = self.session_origin(&session_id).await;
+        let grants: Vec<Rule> = registration
+            .grants
+            .iter()
+            .filter_map(RuleSpec::to_rule)
+            .collect();
+
         let dispatcher = self.clone();
         tokio::spawn(async move {
             let claim = dispatcher.claim_session(&session_id).await;
-            let ctx = SessionContext::detached(&session_id);
-            let outcome = with_session(ctx, dispatcher.handler.resume_interrupted(&run)).await;
+            let ctx = SessionContext::detached(&session_id).with_origin(origin);
+            let outcome = with_job_grants(
+                grants,
+                with_session(ctx, dispatcher.handler.resume_interrupted(&run)),
+            )
+            .await;
             claim.release();
             match outcome {
                 Ok(Some(_)) => {
@@ -904,6 +924,22 @@ impl GatewayDispatcher {
             }
         });
         Ok(())
+    }
+
+    /// What is driving the session — the record is the authority, since the
+    /// context the turn originally ran under died with the process that held
+    /// it. A session we cannot read is treated as an ordinary conversation:
+    /// that is the *narrower* answer, since an unattended turn's grants only
+    /// apply where the engine sees `origin` say so.
+    async fn session_origin(&self, session_id: &str) -> SessionOrigin {
+        match self.sessions.find_windowed(session_id, 1).await {
+            Ok(Some(session)) => session.origin,
+            Ok(None) => SessionOrigin::default(),
+            Err(error) => {
+                warn!(%error, session = session_id, "could not read what drives this session");
+                SessionOrigin::default()
+            }
+        }
     }
 
     /// A plain message while this session has an approval parked on it.

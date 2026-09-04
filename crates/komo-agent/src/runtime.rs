@@ -1109,7 +1109,7 @@ fn stop_reply(stopped: &str, current: &str, narration: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     /// Append one message as an event and make it durable — what a turn does,
     /// condensed for a fixture that only cares that the message is there.
@@ -1348,7 +1348,7 @@ mod tests {
     /// The whole directory, not just the db file: a home now holds transcripts
     /// beside `state.db`, and two tests sharing a directory would read each
     /// other's conversations.
-    fn sqlite_url(name: &str) -> String {
+    pub(crate) fn sqlite_url(name: &str) -> String {
         let home = std::env::temp_dir().join(format!("komo-test-{name}"));
         std::fs::remove_dir_all(&home).ok();
         std::fs::create_dir_all(&home).expect("test home");
@@ -1796,7 +1796,7 @@ mod tests {
         }
     }
 
-    fn gated_runtime(
+    pub(crate) fn gated_runtime(
         db: Arc<Db>,
         approver: Arc<dyn komo_core::domain::approval::Approver>,
     ) -> AgentRuntime {
