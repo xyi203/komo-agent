@@ -72,6 +72,7 @@ use crate::{
         memory::{MemoryStatus, parse_memory_status},
         pairing::ApproveOutcome,
         session::{DEFAULT_WORKSPACE, Session},
+        wakeup::{SUSPENDED_REPLY, is_suspended},
     },
     services::operator_control::{
         MemoryTransitionAction, ResumeOutcome,
@@ -685,6 +686,12 @@ async fn chat_completions(
                 claim.release();
                 match reply {
                     Err(error) if is_cancelled(&error) => CANCELLED_REPLY.to_string(),
+                    // The turn stopped for an approval and gave up its slot.
+                    // Not an error: the prompt is with whoever can answer it,
+                    // and the turn continues once they do — its reply lands in
+                    // the transcript, which is where this caller reads it from
+                    // anyway.
+                    Err(error) if is_suspended(&error) => SUSPENDED_REPLY.to_string(),
                     other => other?,
                 }
             }
@@ -992,6 +999,7 @@ fn stream_turn(
             Ok(text) => text,
             // A cancel is the caller's own doing, not a failure to report as one.
             Err(error) if is_cancelled(&error) => CANCELLED_REPLY.to_string(),
+            Err(error) if is_suspended(&error) => SUSPENDED_REPLY.to_string(),
             Err(error) => format!("请求失败：{error:#}"),
         };
         let _ = tx.send(SseMsg::Final(final_msg));
@@ -1748,7 +1756,13 @@ async fn resolve_approval(
             body.decision
         )
     })?;
-    let resolved = state.approvals.resolve(&session, decision);
+    // One entry for both surfaces: the modal's answer does exactly what a chat
+    // `/approve` does — clear the prompt *and* write the durable resolution the
+    // suspended turn is parked on.
+    let resolved = state
+        .dispatcher
+        .answer_approval(&session, None, decision)
+        .await;
     Ok(Json(json!({ "resolved": resolved })))
 }
 

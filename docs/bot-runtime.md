@@ -491,8 +491,25 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   验证：`an_approval_that_expired_comes_back_as_a_refusal`（续跑收到「没等到答案」、
   调用没执行）、`an_expired_wait_records_the_expiry_before_continuing`、
   `an_approval_command_can_name_the_wait_it_answers`。
-  还没接：`ChatApprover` / TUI approver 仍在等 oneshot（还没有人会答 `Suspend`），
-  以及挂起期间普通消息算放弃（moved-on）。`Risk::Dangerous` 仍 `Once`（策略梯子没动）。
+  **`ChatApprover` 已翻转**：提示发出去之后返回 `Suspend`，不再等 oneshot，
+  `APPROVAL_TIMEOUT` 那 5 分钟随之删除——「多久没人答」现在是**等待自己的寿命**
+  （`default_expiry_secs`，一天），不是某个进程坐在那里等的超时。
+  `ApprovalState` 的 `pending` 退化成**提示缓存**（GUI 的审批弹窗轮询它），
+  重启会丢——本来整个审批都会丢——而答案本身是 durable 的。
+  `/approve session` 的 scope key 从当初的 `approval/requested` 读回来记住，
+  因为内存里那份提示在 turn 挂起时就没了。
+  **moved-on**：挂起期间同 session 的普通消息即放弃这次审批——消息以 `Injected`
+  追加到**那个挂起的 turn**（surface fold 把它并进那条用户消息，交替不破、续跑原地重放），
+  审批以「用户改说了这个」结算为拒绝，然后续跑。不是「拒绝 + 另起一个 turn」：
+  那样模型会在不知道自己请求的动作已被放弃的情况下回答新消息，用户也会看到两个 turn。
+  GUI 的审批弹窗和聊天的 `/approve` 现在走同一个入口
+  （`GatewayDispatcher::answer_approval`），两半答案不会各走各的。
+  api 的同步与流式两条路都认 `Suspended`：返回「等待批准」而不是 500——turn 没结束，
+  答复到了会继续，回复落在 transcript 里，而调用方本来就是从那里读。
+  验证：`saying_something_else_takes_the_place_of_a_pending_approval`、
+  `a_noted_prompt_is_visible_until_it_is_answered`、
+  `a_dangerous_prompt_narrows_a_widening_answer`（`Risk::Dangerous` 仍只批一次）。
+  还没接：TUI approver 仍在进程内等（它本来就守着自己的 turn，不需要跨进程恢复）。
 - **5.4 无人值守审批**：cron turn 的 deny-all 改为挂起 + HomeNotifier。验证：一个没有 grants 的
   routine 在 home chat 收到提示，`/approve` 后动作执行，`/deny` 后 routine 以 error 结算。
 - **5.5 `awaiting` 投影**：session 列表与 TUI 显示。验证：挂起/恢复/过期三态各一测。

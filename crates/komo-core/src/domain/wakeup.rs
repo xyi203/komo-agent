@@ -42,6 +42,11 @@ pub fn default_expiry_secs(wakeup: &Wakeup) -> Option<i64> {
     }
 }
 
+/// What a caller holding a connection is told when the turn it asked for
+/// stopped to wait. The turn is not over — it continues when the answer
+/// arrives, and its reply lands in the transcript.
+pub const SUSPENDED_REPLY: &str = "（已请求批准，等待答复后继续）";
+
 /// The error a suspended turn stops with, so every layer tells a wait apart
 /// from a failure by downcasting — the same shape as
 /// [`Cancelled`](crate::domain::cancel::Cancelled).

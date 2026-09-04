@@ -762,8 +762,15 @@ call the same functions, which is what keeps validation from forking.
   platform message id use `InboundOrigin::local()`, which is never a duplicate.
   Chat commands: `/new` (rotate
   session, clear todos + approval state), `/approve [session|always]`,
-  `/deny`, `/sethome`, `/wechat login`. `ChatApprover` suspends the turn on a
-  oneshot (5-min timeout); no session in context ⇒ deny. `HomeNotifier`
+  `/deny`, `/sethome`, `/wechat login`. `ChatApprover` sends the prompt and
+  answers `Decision::Suspend` — the turn gives up its slot and comes back when
+  `/approve` (or the GUI modal, through the same
+  `GatewayDispatcher::answer_approval`) writes the answer into the log, in this
+  process or the next one. How long an unanswered approval may stand is the
+  *wait's* own lifetime (a day), not a timeout somebody sits through. A plain
+  message while an approval is parked **replaces** it: the message joins the
+  suspended turn as an interjection, the approval resolves as refused citing it,
+  and the turn continues — one turn, not two. No session in context ⇒ deny. `HomeNotifier`
   delivers all proactive output (sethome override > config `home_chat`,
   feishu first > macOS notification).
 - `infra/messaging/` — channels: feishu (ws long connection on a dedicated

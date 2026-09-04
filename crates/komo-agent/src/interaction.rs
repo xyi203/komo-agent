@@ -25,11 +25,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use tokio::sync::{Notify, oneshot, watch};
+use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
 
 use komo_core::domain::{
@@ -43,14 +42,17 @@ use komo_core::domain::{
     run::RunRepository,
     session::{ChannelPeer, Session},
     session_event::{
-        ApprovalResolvedEvent, SessionEventKind, Wakeup, WakeupCause, WakeupFiredEvent,
+        ApprovalResolvedEvent, MessageSource, SessionEventKind, SurfacePlacement, UserMessageEvent,
+        Wakeup, WakeupCause, WakeupFiredEvent,
     },
     todo::SessionTodoRepository,
     wakeup::{WAIT_ID_PREFIX, WakeupDispatch, WakeupRegistration, WakeupRepository},
 };
 
-/// How long an approval prompt waits for a reply before auto-denying.
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+// How long an approval may go unanswered is the *wait's* lifetime now
+// (`domain::wakeup::default_expiry_secs` — a day), not a timeout this process
+// sits through: the turn gives up its slot and the answer may arrive after a
+// restart.
 
 /// The user's answer to an approval prompt.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -241,7 +243,7 @@ impl CancelSignal for WatchCancel {
 /// between [`ChatApprover`] (registers/awaits) and [`GatewayDispatcher`]
 /// (resolves on `/approve`, clears on `/new`).
 pub struct ApprovalState {
-    pending: Mutex<HashMap<String, (oneshot::Sender<Answer>, PendingApproval)>>,
+    pending: Mutex<HashMap<String, PendingApproval>>,
     approved: Mutex<HashMap<String, HashSet<String>>>,
     /// Per-session serialization gate. A round's tool calls now run
     /// concurrently (`AgentRuntime::run_agent_loop`), so two side-effecting
@@ -251,7 +253,6 @@ pub struct ApprovalState {
     /// it). Per session, not global, so a slow approver in one chat never blocks
     /// another chat's prompt.
     gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    timeout: Duration,
 }
 
 impl ApprovalState {
@@ -260,7 +261,6 @@ impl ApprovalState {
             pending: Mutex::new(HashMap::new()),
             approved: Mutex::new(HashMap::new()),
             gates: Mutex::new(HashMap::new()),
-            timeout: APPROVAL_TIMEOUT,
         }
     }
 
@@ -276,17 +276,17 @@ impl ApprovalState {
             .clone()
     }
 
-    /// Register a pending approval for `session`, returning the receiver the
-    /// approver awaits. Replaces any prior pending approval (its sender drops,
-    /// which the old waiter reads as a denial). `info` is the structured prompt
-    /// stored for the interactions poll.
-    fn register(&self, session: &str, info: PendingApproval) -> oneshot::Receiver<Answer> {
-        let (tx, rx) = oneshot::channel();
+    /// Note what `session` is being asked, for the GUI's approval modal.
+    ///
+    /// A cache of the prompt, not the wait itself: the wait is
+    /// `turn/suspended` plus its registration, and this is lost on a restart
+    /// while those are not. Replaces any prior prompt for the session — the
+    /// newest question is the one on screen.
+    fn note_pending(&self, session: &str, info: PendingApproval) {
         self.pending
             .lock()
             .unwrap()
-            .insert(session.to_string(), (tx, info));
-        rx
+            .insert(session.to_string(), info);
     }
 
     /// Deliver `decision` to the approver waiting on `session`. Returns whether
@@ -306,28 +306,18 @@ impl ApprovalState {
     /// through, rather than at each grant-recording site — one of those is easy
     /// to add and forget.
     pub fn resolve_scoped(&self, session: &str, decision: Answer) -> Option<Answer> {
-        let (tx, info) = self.pending.lock().unwrap().remove(session)?;
-        let narrowed = if info.risk == "dangerous" {
-            match decision {
-                Answer::Session | Answer::Always => Answer::Once,
-                other => other,
-            }
-        } else {
-            decision
-        };
-        tx.send(narrowed.clone()).ok()?;
-        Some(narrowed)
+        let info = self.pending.lock().unwrap().remove(session)?;
+        Some(match info.risk == "dangerous" {
+            true => narrow_unknown(decision),
+            false => decision,
+        })
     }
 
     /// The structured description of the approval pending for `session`, if any.
     /// Backs the HTTP `GET /api/interactions/{session}` poll the GUI uses to
     /// render an approval modal (chat channels instead see it via the sink).
     pub fn pending_info(&self, session: &str) -> Option<PendingApproval> {
-        self.pending
-            .lock()
-            .unwrap()
-            .get(session)
-            .map(|(_, info)| info.clone())
+        self.pending.lock().unwrap().get(session).cloned()
     }
 
     /// Drop any pending approval for `session` without resolving it (the waiter
@@ -461,36 +451,18 @@ impl ChatApprover {
             return Decision::deny();
         }
 
-        let rx = self
-            .state
-            .register(&ctx.session_id, PendingApproval::from_request(request));
-        match tokio::time::timeout(self.state.timeout, rx).await {
-            Ok(Ok(Answer::Once)) => Decision::Allow,
-            Ok(Ok(Answer::Session)) => {
-                if let Some(key) = &request.scope_key {
-                    self.state.remember(&ctx.session_id, key);
-                }
-                Decision::Allow
-            }
-            Ok(Ok(Answer::Always)) => {
-                // Cache for the session too: the saved rule is narrow, so a
-                // near-miss later in this conversation shouldn't re-prompt after
-                // the user already said "always". `PolicyApprover` is what turns
-                // this into a persisted grant.
-                if let Some(key) = &request.scope_key {
-                    self.state.remember(&ctx.session_id, key);
-                }
-                Decision::AllowAlways
-            }
-            Ok(Ok(Answer::Deny(feedback))) => Decision::Deny { feedback },
-            // The sender was dropped (superseded / cleared).
-            Ok(Err(_)) => Decision::deny(),
-            Err(_) => {
-                self.state.forget_pending(&ctx.session_id);
-                let _ = ctx.sink.send("审批超时，已自动拒绝。").await;
-                Decision::deny_because("审批超时（5 分钟内无人应答），已自动拒绝")
-            }
-        }
+        // The prompt is out; the answer is not this process's to wait for. The
+        // turn stops here and gives up its session slot — `/approve` (or the
+        // GUI's modal) writes the answer into the log, and the turn is
+        // continued then, in this process or the next one.
+        //
+        // The pending info still goes into memory: it is what the GUI's
+        // approval modal polls. It is a *cache* — a restart loses it, exactly
+        // as it lost the whole approval before — while the answer itself is
+        // durable.
+        self.state
+            .note_pending(&ctx.session_id, PendingApproval::from_request(request));
+        Decision::Suspend
     }
 }
 
@@ -934,6 +906,75 @@ impl GatewayDispatcher {
         Ok(())
     }
 
+    /// A plain message while this session has an approval parked on it.
+    ///
+    /// Answers whether it was taken as an answer. The message is appended to
+    /// the **suspended turn** as an interjection — the surface fold merges it
+    /// into that turn's user message, so the transcript still alternates and
+    /// the continuation replays it in place — and the approval is refused,
+    /// citing what was said.
+    ///
+    /// Not "deny and start a new turn": the model would then answer the new
+    /// message without knowing the action it asked about was dropped, and the
+    /// user would see two turns for one exchange.
+    async fn moved_on(self: &Arc<Self>, session_id: &str, input: &str) -> bool {
+        let Some(waits) = self.waits.clone() else {
+            return false;
+        };
+        let Some(registration) = self.pending_wait(&waits, session_id, None).await else {
+            return false;
+        };
+        let Some(turn_id) = registration.turn_id.clone() else {
+            return false;
+        };
+
+        if let Err(error) = waits
+            .events
+            .append(
+                session_id,
+                vec![SessionEventKind::UserMessage(UserMessageEvent {
+                    turn_id: turn_id.clone(),
+                    content: input.to_string(),
+                    source: MessageSource::Injected,
+                    surface: SurfacePlacement::append(),
+                })],
+            )
+            .await
+        {
+            warn!(%error, "failed to record what the user said instead; leaving the wait alone");
+            return false;
+        }
+
+        let refusal = Answer::Deny(Some(format!(
+            "the user said this instead of answering: {input}"
+        )));
+        self.approvals.resolve(session_id, refusal.clone());
+        matches!(
+            self.answer_suspended(session_id, None, &refusal).await,
+            Answered::Here | Answered::Elsewhere(_)
+        )
+    }
+
+    /// Answer whatever `session` (or the wait named by `id`) is waiting on.
+    ///
+    /// The single entry both surfaces use — a chat `/approve` and the GUI's
+    /// approval modal — so the two halves of an answer never drift apart: the
+    /// in-memory prompt (what the modal polls, and what knows the action's
+    /// risk) and the durable resolution a suspended turn is parked on.
+    ///
+    /// Answers whether anything was actually waiting.
+    pub async fn answer_approval(
+        self: &Arc<Self>,
+        session_id: &str,
+        id: Option<&str>,
+        answer: Answer,
+    ) -> bool {
+        let granted = self.approvals.resolve_scoped(session_id, answer.clone());
+        let narrowed = granted.clone().unwrap_or_else(|| narrow_unknown(answer));
+        let woken = self.answer_suspended(session_id, id, &narrowed).await;
+        granted.is_some() || woken != Answered::Nothing
+    }
+
     /// Write the answer to a **suspended** turn's approval, and bring the turn
     /// back.
     ///
@@ -1003,6 +1044,18 @@ impl GatewayDispatcher {
                 return Answered::Nothing;
             }
         }
+        // "For this session" widens the grant to later calls of the same kind,
+        // and the key that defines "same kind" is the one the gate recorded
+        // when it asked — the in-memory prompt that used to carry it is gone
+        // once the turn suspends.
+        if matches!(answer, Answer::Session | Answer::Always)
+            && let Some(key) = self
+                .requested_scope_key(&waits, &registration.session_id, &turn_id, &call_id)
+                .await
+        {
+            self.approvals.remember(&registration.session_id, &key);
+        }
+
         let cause = match allowed {
             true => WakeupCause::Approve,
             false => WakeupCause::Deny,
@@ -1035,6 +1088,27 @@ impl GatewayDispatcher {
             Some(id) => approvals.filter(|r| r.id.starts_with(id)).next(),
             None => approvals.filter(|r| r.session_id == session_id).next(),
         }
+    }
+
+    /// The scope key the gate recorded when it asked, if it had one.
+    async fn requested_scope_key(
+        &self,
+        waits: &WaitParts,
+        session_id: &str,
+        turn_id: &str,
+        call_id: &str,
+    ) -> Option<String> {
+        let events = waits.events.events(session_id).await.ok()?;
+        events.iter().rev().find_map(|event| match &event.kind {
+            SessionEventKind::ApprovalRequested(requested)
+                if requested.turn_id == turn_id
+                    && requested.call_id == call_id
+                    && !requested.scope_key.is_empty() =>
+            {
+                Some(requested.scope_key.clone())
+            }
+            _ => None,
+        })
     }
 
     /// The `call_index` the gate recorded when it asked. Read back rather than
@@ -1252,6 +1326,15 @@ impl GatewayDispatcher {
                 // etc. never reach here), and a second message while the turn
                 // keeps running queues as usual via `spawn_turn`.
                 if self.clarify.resolve(session_id, &input) {
+                    return;
+                }
+                // Same rule for an approval this session is parked on: the user
+                // said something else, and a pending wait is **replaced** by the
+                // next thing they say rather than kept beside it. The message
+                // joins the suspended turn, the approval resolves as refused,
+                // and the turn continues — so the model sees both the refusal
+                // and what was actually said, in one turn instead of two.
+                if self.moved_on(session_id, &input).await {
                     return;
                 }
                 self.spawn_turn(session_id, input, sink)
@@ -1624,6 +1707,7 @@ impl Drop for TurnGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn classify_matches_commands_case_insensitively() {
@@ -1721,28 +1805,50 @@ mod tests {
         }
     }
 
+    /// The prompt cache the GUI's modal polls: what is being asked, until it
+    /// is answered.
     #[tokio::test]
-    async fn register_then_resolve_delivers_the_decision() {
+    async fn a_noted_prompt_is_visible_until_it_is_answered() {
         let state = ApprovalState::new();
-        let rx = state.register("s1", sample_pending());
-        // The structured prompt is visible to the interactions poll while pending.
+        state.note_pending("s1", sample_pending());
         assert_eq!(
             state.pending_info("s1").map(|p| p.summary),
             Some("run shell command: ls".to_string())
         );
-        assert!(state.resolve("s1", Answer::Session));
-        assert_eq!(rx.await.unwrap(), Answer::Session);
-        // Cleared once resolved.
+        assert_eq!(
+            state.resolve_scoped("s1", Answer::Session),
+            Some(Answer::Session)
+        );
         assert!(state.pending_info("s1").is_none());
+        // And answering twice reports the second time as nothing pending.
+        assert!(!state.resolve("s1", Answer::Once));
+    }
+
+    /// A dangerous action is approved for the one call it was asked about,
+    /// whatever the user typed: widening pre-approves a *later* deletion nobody
+    /// has seen.
+    #[tokio::test]
+    async fn a_dangerous_prompt_narrows_a_widening_answer() {
+        let state = ApprovalState::new();
+        state.note_pending(
+            "s1",
+            PendingApproval {
+                risk: "dangerous".to_string(),
+                ..sample_pending()
+            },
+        );
+        assert_eq!(
+            state.resolve_scoped("s1", Answer::Always),
+            Some(Answer::Once)
+        );
     }
 
     #[tokio::test]
-    async fn clear_cancels_a_pending_wait() {
+    async fn clearing_drops_the_pending_prompt() {
         let state = ApprovalState::new();
-        let rx = state.register("s1", sample_pending());
+        state.note_pending("s1", sample_pending());
         state.clear("s1");
-        // Sender dropped → receiver errors → treated as denial.
-        assert!(rx.await.is_err());
+        assert!(state.pending_info("s1").is_none());
     }
 
     #[tokio::test]
@@ -2244,6 +2350,124 @@ mod tests {
         }
     }
 
+    /// A pending wait is **replaced** by the next thing the user says, not kept
+    /// beside it. The message joins the suspended turn, the approval is
+    /// refused citing it, and no second turn starts — the model answers both in
+    /// one turn.
+    #[tokio::test]
+    async fn saying_something_else_takes_the_place_of_a_pending_approval() {
+        use komo_core::domain::run::Run;
+
+        let home = std::env::temp_dir().join("komo-moved-on");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        let db = Arc::new(
+            komo_infra::persistence::db::Db::connect(&format!(
+                "turso:{}",
+                home.join("komo.db").display()
+            ))
+            .await
+            .unwrap(),
+        );
+
+        let mut run = Run::start("s1", "delete the tree");
+        run.status = komo_core::domain::run::RunStatus::Suspended;
+        komo_core::domain::run_projection::RunProjectionStore::commit(
+            db.as_ref(),
+            "s1",
+            &[komo_core::domain::run_projection::ProjectedRun {
+                run: run.clone(),
+                steps: Vec::new(),
+                start_seq: 0,
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+        WakeupRepository::save(
+            db.as_ref(),
+            &WakeupRegistration::new(
+                "s1",
+                Wakeup::Approval {
+                    call_id: "c1".into(),
+                },
+                1_000,
+            )
+            .continuing(&run.id),
+        )
+        .await
+        .unwrap();
+
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let dispatcher = Arc::new(
+            GatewayDispatcher::new(
+                Arc::new(GateHandler {
+                    entered: entered_tx,
+                    permits: Arc::new(Semaphore::new(1)),
+                }),
+                Arc::new(ApprovalState::new()),
+                Arc::new(ClarifyState::new()),
+                Arc::new(MemorySessions::default()),
+                Arc::new(UnusedHome),
+                Arc::new(UnusedTodos),
+                None,
+                Arc::new(UnusedPairings),
+                Arc::new(AlwaysFreshInbox),
+            )
+            .with_waits(WaitParts {
+                runs: db.clone(),
+                events: db.clone(),
+                wakeups: db.clone(),
+            }),
+        );
+        assert!(
+            dispatcher.moved_on("s1", "算了，先别删").await,
+            "the message answers the pending approval"
+        );
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "and no second turn is started for it"
+        );
+
+        let events = SessionEventRepository::events(db.as_ref(), "s1")
+            .await
+            .unwrap();
+        let said = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::UserMessage(m) => Some(m),
+                _ => None,
+            })
+            .expect("what the user said is on the record");
+        assert_eq!(said.turn_id, run.id, "it belongs to the suspended turn");
+        assert_eq!(
+            said.source,
+            MessageSource::Injected,
+            "as an interjection, so the surface still alternates"
+        );
+
+        let resolved = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ApprovalResolved(resolved) => Some(resolved),
+                _ => None,
+            })
+            .expect("the approval is answered, not left hanging");
+        assert!(!resolved.allowed);
+        assert!(
+            resolved.reason.contains("算了，先别删"),
+            "and the refusal cites what was said: {}",
+            resolved.reason
+        );
+        assert!(
+            WakeupRepository::list(db.as_ref())
+                .await
+                .unwrap()
+                .is_empty(),
+            "the wait is retired with it"
+        );
+    }
+
     /// A wait that ran out is written down as such *before* the turn comes
     /// back, so the gate reads it as a refusal instead of asking again.
     #[tokio::test]
@@ -2515,20 +2739,15 @@ mod tests {
             detail: None,
             risk: "dangerous".to_string(),
         };
-        let rx = state.register("s1", dangerous);
+        state.note_pending("s1", dangerous);
         assert_eq!(
             state.resolve_scoped("s1", Answer::Session),
             Some(Answer::Once),
             "a session-wide grant must narrow to this one call"
         );
-        assert_eq!(
-            rx.await.unwrap(),
-            Answer::Once,
-            "the waiter sees the narrowing"
-        );
 
         // `always` would have written a persisted rule; it narrows the same way.
-        let rx = state.register(
+        state.note_pending(
             "s2",
             PendingApproval {
                 summary: "drop the table".to_string(),
@@ -2540,10 +2759,9 @@ mod tests {
             state.resolve_scoped("s2", Answer::Always),
             Some(Answer::Once)
         );
-        assert_eq!(rx.await.unwrap(), Answer::Once);
 
         // A normal action is untouched — that is what the scopes are for.
-        let rx = state.register(
+        state.note_pending(
             "s3",
             PendingApproval {
                 summary: "write a file".to_string(),
@@ -2555,7 +2773,6 @@ mod tests {
             state.resolve_scoped("s3", Answer::Session),
             Some(Answer::Session)
         );
-        assert_eq!(rx.await.unwrap(), Answer::Session);
     }
 
     /// Chat platforms deliver at-least-once: Telegram redelivers a whole batch
