@@ -37,10 +37,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use komo_agent::daemon::{RoutineEventSource, Schedule};
-use komo_agent::gateway::{Channel, MaintenanceService};
-use komo_agent::learning_coordinator::LearningCoordinator;
-use komo_agent::runtime::AgentRuntime;
+use komo_bot::daemon::{RoutineEventSource, Schedule};
+use komo_bot::gateway::{Channel, MaintenanceService};
+use komo_bot::learning_coordinator::LearningCoordinator;
+use komo_bot::runtime::AgentRuntime;
 use komo_config::ConfigSnapshot;
 use komo_core::domain::catalog::ToolCatalog;
 use komo_core::domain::hooks::{StepHook, ToolHook, TurnHook};

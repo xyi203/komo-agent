@@ -14,7 +14,7 @@ use komo_core::domain::{
 /// (`max_tool_result_bytes`) — so this bound exists to stop a 5 MB page from
 /// being pulled into memory and parsed, not to size the model's view.
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
-const USER_AGENT: &str = "komo-agent/0.1";
+const USER_AGENT: &str = "komo-bot/0.1";
 
 /// Per-request timeout for the fetch client. `reqwest`'s default client sets no
 /// timeout at all, so a server that accepts the connection then never responds

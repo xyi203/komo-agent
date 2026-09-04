@@ -32,9 +32,9 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
-use komo_agent::daemon::RoutineEventSource;
-use komo_agent::gateway::Channel;
-use komo_agent::interaction::GatewayDispatcher;
+use komo_bot::daemon::RoutineEventSource;
+use komo_bot::gateway::Channel;
+use komo_bot::interaction::GatewayDispatcher;
 use komo_core::domain::cron::{CronJobStatus, Trigger};
 
 /// How long the watcher waits for quiet before it calls a burst one event.

@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use komo_agent::daemon::{
+use komo_bot::daemon::{
     BriefingSweep, DreamSweep, Maintenance, MemoryMonitorSweep, ReminderSweep, ReviewSweep,
     Schedule, TaskSweep, WorkdayGated,
 };
-use komo_agent::gateway::MaintenanceService;
+use komo_bot::gateway::MaintenanceService;
 use komo_infra::workday::HolidayCalendar;
 
 use super::{Plugin, SweepCx, SweepRegistry};
@@ -152,7 +152,7 @@ impl Plugin for BriefingPlugin {
             let catch_up = sweep.clone();
             tokio::spawn(async move {
                 let handled = marks.last_handled().await.unwrap_or_default();
-                if komo_agent::daemon::briefing_catchup_due(
+                if komo_bot::daemon::briefing_catchup_due(
                     &expr,
                     handled.as_deref(),
                     chrono::Local::now(),
@@ -183,7 +183,7 @@ impl Plugin for BriefingPlugin {
 ///
 /// It is the *clock* half only: the event-triggered routines (§5.12–5.14) fire
 /// from their own ingresses, through the same shared
-/// [`RoutineEventSource`](komo_agent::daemon::RoutineEventSource) the host
+/// [`RoutineEventSource`](komo_bot::daemon::RoutineEventSource) the host
 /// built and handed here.
 pub struct CronJobsPlugin;
 

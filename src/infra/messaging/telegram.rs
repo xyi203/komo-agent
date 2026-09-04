@@ -18,9 +18,9 @@
 //! (DMs always bypass), and an optional `home_chat` that receives
 //! proactive output (reminders) via the shared `HomeNotifier`.
 
-use komo_agent::gateway::Channel;
-use komo_agent::interaction::GatewayDispatcher;
-use komo_agent::pairing::{PairingGuard, Principal};
+use komo_bot::gateway::Channel;
+use komo_bot::interaction::GatewayDispatcher;
+use komo_bot::pairing::{PairingGuard, Principal};
 use komo_core::domain::inbox::InboundOrigin;
 use komo_core::domain::session::{ChannelPeer, InboundPeer};
 use std::{sync::Arc, time::Duration};

@@ -5,13 +5,13 @@ import { decodeFolderPath, workspaceLabel, workspacePath } from "./workspace";
 
 const catalog: WorkspaceInfo[] = [{ id: "__default__", name: ".komo", path: "/Users/x/.komo" }];
 
-// base64url of "/Users/xyi/01-code/komo-agent" — the shape the composer's
+// base64url of "/Users/xyi/01-code/komo-bot" — the shape the composer's
 // `encodeFolder` produces and the gateway stores on a session.
-const AGENT = "folder:L1VzZXJzL3h5aS8wMS1jb2RlL2tvbW8tYWdlbnQ";
+const AGENT = "folder:L1VzZXJzL3h5aS8wMS1jb2RlL2tvbW8tYm90";
 
 describe("decodeFolderPath", () => {
   it("decodes a base64url folder id back to its path", () => {
-    expect(decodeFolderPath(AGENT)).toBe("/Users/xyi/01-code/komo-agent");
+    expect(decodeFolderPath(AGENT)).toBe("/Users/xyi/01-code/komo-bot");
   });
 
   it("decodes non-ASCII paths", () => {
@@ -43,7 +43,7 @@ describe("workspaceLabel", () => {
   });
 
   it("names an unlisted folder by its last path segment", () => {
-    expect(workspaceLabel(AGENT, [])).toBe("komo-agent");
+    expect(workspaceLabel(AGENT, [])).toBe("komo-bot");
   });
 
   it("falls back to the id only when nothing else is knowable", () => {
@@ -57,7 +57,7 @@ describe("workspacePath", () => {
   });
 
   it("recovers the path of an unlisted folder from its id", () => {
-    expect(workspacePath(AGENT, [])).toBe("/Users/xyi/01-code/komo-agent");
+    expect(workspacePath(AGENT, [])).toBe("/Users/xyi/01-code/komo-bot");
   });
 
   it("is null for a catalog id this client has not loaded", () => {

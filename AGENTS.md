@@ -349,7 +349,7 @@ komo-services  tool_execution · tool_output_store · memory_query ·
                session_indexing · episode · background_tasks ·
                diff/patch/search/file_mutation                (→ core, config)
 komo-tools     every tool                      (→ core, infra, mcp, services)
-komo-agent     runtime · gateway · daemon · interaction · system_prompt ·
+komo-bot     runtime · gateway · daemon · interaction · system_prompt ·
                policy_approver · reviewer · llm · delegate
                                             (→ core, config, provider, infra, services)
 komo (bin)     cli · tui · `infra/messaging` (channels) · `infra/gateway_client` ·
@@ -370,7 +370,7 @@ call the same functions, which is what keeps validation from forking.
 
 - `domain/` — pure traits + value types, no I/O, no external crates
   (`Tool`, `LlmClient`/`TurnDriver`, repositories, policy engine, pairing).
-- `komo-agent`'s `runtime` — session lifecycle + the tool loop; loads only a recent
+- `komo-bot`'s `runtime` — session lifecycle + the tool loop; loads only a recent
   transcript window per turn (`find_windowed`); wraps each turn in a ledger
   `Run` (all ledger writes best-effort, never fail the turn).
 - `crates/komo-provider` — komo's own provider layer, its own crate because it
@@ -384,7 +384,7 @@ call the same functions, which is what keeps validation from forking.
   `Retry-After` beats any local backoff. Every request streams; a stream that
   ends without its terminal frame is a retryable failure, never a short answer.
   A new provider is a base URL + auth mode, not new code.
-- `komo-agent`'s `llm` — `ProviderLlm` over that layer; `assemble` builds the tiered
+- `komo-bot`'s `llm` — `ProviderLlm` over that layer; `assemble` builds the tiered
   system prompt once per turn (stable tier incl. `~/.komo/USER.md` and the
   machine-wide instruction file, then memory
   prefix from `MemoryEnricher` — main agent only). `RoutingLlm` = cross-provider
@@ -448,7 +448,7 @@ call the same functions, which is what keeps validation from forking.
   matches"** — an empty answer reads as *the conversation never happened*, which
   is the one wrong thing this can say. Without `[memory] embedding_model` there
   is no index and `search` is the single-session scan it always was.
-- `komo-agent`'s `reviewer` + `learning_coordinator`, `komo-core`'s
+- `komo-bot`'s `reviewer` + `learning_coordinator`, `komo-core`'s
   `domain::episode`, `komo-services`' `episode` — the post-run extraction pass
   (docs/episode-learning-framework.md). Its unit is an **episode**: one finished
   `Run` plus its `RunStep`s, assembled on demand (`episode::assemble`) and never
@@ -495,7 +495,7 @@ call the same functions, which is what keeps validation from forking.
   work, so learning from both counts one occasion twice. The guard lives in
   `LearningCoordinator` (`learning_exemption`, which also names the reason the
   watermark event records), covering both triggers.
-- `komo-agent`'s `compaction` — the oldest messages of a long conversation,
+- `komo-bot`'s `compaction` — the oldest messages of a long conversation,
   replaced by a summary of them. The trigger *is* the history window: a surface
   longer than `max_history_messages` is one whose oldest nodes the model has
   already stopped seeing, and compaction turns that silent loss into a note to
@@ -515,7 +515,7 @@ call the same functions, which is what keeps validation from forking.
   improves on rather than depends on. Wired per `CapabilityProfile`
   (`compacts`) — conversations only; a sweep or a delegation never outlives its
   window.
-- `komo-agent`'s `delegate` — sub-agent as a real agent turn on its own session
+- `komo-bot`'s `delegate` — sub-agent as a real agent turn on its own session
   (`Session.origin = delegate`, which is what keeps it out of the session list); inherits the parent's ambient session context (approvals prompt the
   real conversation, cancel propagates); recursion blocked structurally
   (sub-agent tool set has `delegate: None`); each delegation is its own ledger
@@ -551,7 +551,7 @@ call the same functions, which is what keeps validation from forking.
   `wakeup/fired` because nothing was suspended. Reached from a tool the way an
   approval gate is — `ToolContext::with_background`, installed per call by the
   executor, wired for `Scope::MAIN` only.
-- `domain/policy.rs` + `komo-agent`'s `policy_approver` — permission policy. Ladder,
+- `domain/policy.rs` + `komo-bot`'s `policy_approver` — permission policy. Ladder,
   strongest first: **tool hardline floor > config deny > saved grant > config
   allow / `default_normal` > ask**. Saved grants (`permissions.json`, written
   only by `PolicyApprover`) are never read unattended. **A `Risk::Dangerous`
@@ -564,7 +564,7 @@ call the same functions, which is what keeps validation from forking.
   (`CronJob.grants`, approved in the same prompt that created the job; carried
   into the turn by `with_job_grants`, scoped to that turn, revoked with the job)
   — everything else escalates to the runtime's own inner approver
-  (`komo-agent`'s `unattended`), and the two answer differently: a **routine**
+  (`komo-bot`'s `unattended`), and the two answer differently: a **routine**
   stops (`UnattendedSuspend` → `Decision::Suspend`) and the sweep tells the
   operator which wait to answer in the home chat, a **briefing** denies
   (`UnattendedDeny`), because its digest has already gone out by the time
@@ -586,7 +586,7 @@ call the same functions, which is what keeps validation from forking.
   through?" is asked long after the fact, and every rung produces the same
   `true`. The trait's default answers `approver`, so an implementation that does
   not know its rung never claims one.
-- `komo-agent`'s `auto_reviewer` — the `[policy] mode = "auto"` rung, sitting
+- `komo-bot`'s `auto_reviewer` — the `[policy] mode = "auto"` rung, sitting
   between the engine's `Ask` and the human (attended runtimes only; `mode =
   "ask"` is the default and omits the decorator entirely). An aux-model reviewer
   judges whether the action is plainly authorized by the operator's own latest
@@ -819,7 +819,7 @@ call the same functions, which is what keeps validation from forking.
   also where a skill that was loaded but never actually followed lands, since
   the ledger cannot see adoption. Failing turns are named individually, not
   summed into a count nobody reads.
-- `komo-agent`'s `daemon` — `Maintenance` sweeps under `supervise` (circuit breaker
+- `komo-bot`'s `daemon` — `Maintenance` sweeps under `supervise` (circuit breaker
   after 5 failures). Sweep cron expressions are matched against **local time**
   via the same `next_occurrence_local` cron jobs use — never `Utc::now()`
   straight into croner, which silently shifts every schedule by the UTC offset.
@@ -850,7 +850,7 @@ call the same functions, which is what keeps validation from forking.
   evidence, skill proposals lapse by age — previewed together by `komo dream`).
   `WorkdayGated` decorator gates a sweep to Chinese working days
   (`komo-infra`'s `workday`, cached per-year).
-- `komo-agent`'s `daemon::RoutineEventSource` — the **other** ingress for the
+- `komo-bot`'s `daemon::RoutineEventSource` — the **other** ingress for the
   same routines (docs/bot-runtime.md §5.12–5.14): `on_event(&ExternalEvent)`,
   where the event is an inbound webhook, a feishu message or reaction, or a
   debounced batch of changed files. It does two things — start every routine
@@ -871,7 +871,7 @@ call the same functions, which is what keeps validation from forking.
   thing a `Channel` is handed — `attach_routines` is late-bound for the same
   reason `TriggerMatcher`'s dispatch is (the source needs the waker, the waker
   needs the dispatcher).
-- `komo-agent`'s `gateway` + `interaction` — gateway hosts channels +
+- `komo-bot`'s `gateway` + `interaction` — gateway hosts channels +
   sweeps. `GatewayDispatcher` owns turns (spawned per turn so `/approve` can
   arrive mid-turn; one turn per session). **`handle` is the only entry a channel
   may use**: it claims the message in the durable inbox (`domain/inbox.rs`,
@@ -1073,14 +1073,14 @@ call the same functions, which is what keeps validation from forking.
 - **Add an MCP server**: config only — an `[mcp.servers.<name>]` table with a
   `tools` allowlist. No code; that is the point of `komo-mcp` being generic.
 - **Swap LLM provider**: implement `LlmClient` (`domain/llm.rs`), construct in
-  `komo-agent`'s `llm::build_llm`.
+  `komo-bot`'s `llm::build_llm`.
 - **Swap persistence**: implement the repository traits; `agent/`/`domain/`
   need no changes.
 - **Add a provider**: an entry in `Provider` plus its base URL / auth / wire in
   `infra/llm.rs` (`wire_for`, `endpoint_url`, `build_provider_llm`). A new *wire
   format* — only if it speaks neither Responses nor Messages — is a module in
   `crates/komo-provider` and a `Wire` variant.
-- **Agent-loop control**: add round-level control points in `komo-agent`'s `run_agent_loop`;
+- **Agent-loop control**: add round-level control points in `komo-bot`'s `run_agent_loop`;
   extend `TurnDriver`/`Step`. `komo-tools`' `wait.rs` / `ask_user.rs` are the
   sentinel-tool reference: a tool stops its turn with
   `ToolContext::wait_for(wakeup, …)` and reads `ctx.resumed_wait()` on the way

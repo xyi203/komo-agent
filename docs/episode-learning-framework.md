@@ -12,7 +12,7 @@
 >   而非结构体：第一版只有一个纯读取操作，没有需要持有的状态）。
 > - `OutcomeEvaluator` 同样没有独立模块，实现为 `OutcomeAssessment::deterministic`
 >   —— 它是 `EpisodeView` 上的纯函数，放在类型旁边比新开一个只含单个函数的模块更直接。
-> - `komo-agent` `learning_coordinator.rs` — `LearningCoordinator`（替换
+> - `komo-bot` `learning_coordinator.rs` — `LearningCoordinator`（替换
 >   `ReviewCoordinator`，旧的 session cadence 路径连同 `reviewed_through` /
 >   `review_candidates` / `mark_reviewed` / `count_user_turns` 一并删除，不做并存兼容层）。
 > - watermark 落在 `Run.learned`（state.db 追加列，`DEFAULT true` 只回填历史行，
@@ -85,7 +85,7 @@ Learning Extractor
   - 一次 user turn 对应一个 `Run`；
   - 每次工具调用对应一个 `RunStep`；
   - step 保存经过脱敏和截断的 args、result、error、structured output、耗时及 uncertain 状态。
-- `crates/komo-agent/src/reviewer.rs`
+- `crates/komo-bot/src/reviewer.rs`
   - 从 transcript 中提取 Memory observation、Skill proposal 和 Commitment；
   - 修改已有 Skill 前读取真实 Skill body，避免盲写覆盖。
 - `crates/komo-services/src/memory_consolidation.rs`
@@ -425,7 +425,7 @@ Golden cases 覆盖情况：第 11 节的 1、4、11、12 已有对应测试；2
 
 ### Phase 2：接收延迟反馈 ✅ 已实现
 
-实现（`komo-agent` `feedback.rs` + `LearningCoordinator::absorb_feedback`；
+实现（`komo-bot` `feedback.rs` + `LearningCoordinator::absorb_feedback`；
 `OutcomeAssessment` 落在 `Run.outcome` 追加列）：
 
 - 识别后续用户消息对上一相关 run 的明确确认或否定；

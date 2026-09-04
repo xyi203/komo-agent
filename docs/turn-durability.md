@@ -554,7 +554,7 @@ state.db；后台 learning sweep 再通过 projection watermark 补处理漏项�
 #### 3.2 `surfaceOp` + compaction
 
 **已完成**。`surfaceOp` + 严格 replacement 验证是第一批就有的（tool settle 从来
-不进 surface）；这次补上的是产生方：`komo-agent::compaction::Compactor`。
+不进 surface）；这次补上的是产生方：`komo-bot::compaction::Compactor`。
 
 - **触发就是那个窗口**：surface 节点数超过 `max_history_messages`，说明最老的那些
   消息模型已经看不见了——原来是静默丢失，现在换成一条摘要。窗口为 0（不截断）

@@ -3446,7 +3446,7 @@ dependencies = [
  "http",
  "ignore",
  "image",
- "komo-agent",
+ "komo-bot",
  "komo-config",
  "komo-core",
  "komo-infra",
@@ -3489,7 +3489,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "komo-agent"
+name = "komo-bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",

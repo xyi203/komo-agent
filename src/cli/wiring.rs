@@ -11,14 +11,14 @@
 //! see it, and this module materializes the four executors from that one
 //! registry — so a runtime's tool set can never drift from the roster.
 
-use komo_agent::compaction::Compactor;
-use komo_agent::delegate::DelegateTool;
-use komo_agent::learning_coordinator::LearningCoordinator;
-use komo_agent::llm::{PreambleFn, TurnInjections, build_llm};
-use komo_agent::reviewer::ReflectiveReviewer;
-use komo_agent::runtime::AgentRuntime;
-use komo_agent::system_prompt::SystemPromptBuilder;
-use komo_agent::unattended::{UnattendedDeny, UnattendedSuspend};
+use komo_bot::compaction::Compactor;
+use komo_bot::delegate::DelegateTool;
+use komo_bot::learning_coordinator::LearningCoordinator;
+use komo_bot::llm::{PreambleFn, TurnInjections, build_llm};
+use komo_bot::reviewer::ReflectiveReviewer;
+use komo_bot::runtime::AgentRuntime;
+use komo_bot::system_prompt::SystemPromptBuilder;
+use komo_bot::unattended::{UnattendedDeny, UnattendedSuspend};
 use komo_core::domain::checkpoint::CheckpointStore;
 use komo_core::domain::embedding::EmbeddingClient;
 use komo_core::domain::skill::SkillOffer;
@@ -324,11 +324,7 @@ pub async fn build(
     let approver = match config.runtime.policy.mode {
         komo_core::domain::policy::PolicyMode::Auto => {
             tracing::info!("permission policy: auto mode (aux reviewer may auto-allow prompts)");
-            komo_agent::auto_reviewer::AutoReviewApprover::wrap(
-                aux_llm.clone(),
-                db.clone(),
-                approver,
-            )
+            komo_bot::auto_reviewer::AutoReviewApprover::wrap(aux_llm.clone(), db.clone(), approver)
         }
         komo_core::domain::policy::PolicyMode::Ask => approver,
     };
@@ -337,7 +333,7 @@ pub async fn build(
     // auto-allows / hard-denies per `[policy]` rules and only escalates when it
     // says "ask". With no `[policy]` table this is the empty policy — identical
     // to the bare interactive approver.
-    let approver = komo_agent::policy_approver::PolicyApprover::wrap_with_store(
+    let approver = komo_bot::policy_approver::PolicyApprover::wrap_with_store(
         interactive_policy,
         approver,
         permissions.clone(),
@@ -731,7 +727,7 @@ pub async fn build(
     // interactively and must not leak into an unattended context, where only an
     // explicit `unattended = true` config rule may grant. (The engine enforces
     // this again for a channel-less decision — two floors, on purpose.)
-    let cron_approver = komo_agent::policy_approver::PolicyApprover::wrap(
+    let cron_approver = komo_bot::policy_approver::PolicyApprover::wrap(
         config.runtime.policy.policy.clone(),
         Arc::new(UnattendedSuspend),
     );
@@ -790,7 +786,7 @@ pub async fn build(
     // Sharing the run ledger (`runs: db`) makes every briefing execution
     // auditable via `komo run list`.
     // No saved grants here either — see the cron approver above.
-    let briefing_approver = komo_agent::policy_approver::PolicyApprover::wrap(
+    let briefing_approver = komo_bot::policy_approver::PolicyApprover::wrap(
         config.runtime.policy.policy.clone(),
         Arc::new(UnattendedDeny),
     );

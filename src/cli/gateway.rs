@@ -1,8 +1,6 @@
-use komo_agent::daemon::{RoutineEventSource, Schedule, WakeupWiring};
-use komo_agent::gateway::Gateway;
-use komo_agent::interaction::{
-    ApprovalState, ChatApprover, GatewayDispatcher, TurnWaker, WaitParts,
-};
+use komo_bot::daemon::{RoutineEventSource, Schedule, WakeupWiring};
+use komo_bot::gateway::Gateway;
+use komo_bot::interaction::{ApprovalState, ChatApprover, GatewayDispatcher, TurnWaker, WaitParts};
 use komo_infra::persistence::db::Db;
 use komo_services::triggers::TriggerMatcher;
 use std::sync::Arc;
@@ -79,10 +77,10 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // reconciliation above — a repair that fails must not block startup.
     let events: Arc<dyn SessionEventRepository> = db.clone();
     let wakeups: Arc<dyn WakeupRepository> = db.clone();
-    match komo_agent::daemon::reregister_suspended_turns(
+    match komo_bot::daemon::reregister_suspended_turns(
         &events,
         &wakeups,
-        komo_agent::daemon::SUSPEND_RECHECK_SESSIONS,
+        komo_bot::daemon::SUSPEND_RECHECK_SESSIONS,
         now,
     )
     .await

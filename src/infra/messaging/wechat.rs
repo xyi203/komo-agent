@@ -28,9 +28,9 @@
 //! ordinary WeChat groups, so there is no group/mention gate — the
 //! `PairingGuard` is the only admission control.
 
-use komo_agent::gateway::Channel;
-use komo_agent::interaction::GatewayDispatcher;
-use komo_agent::pairing::{PairingGuard, Principal};
+use komo_bot::gateway::Channel;
+use komo_bot::interaction::GatewayDispatcher;
+use komo_bot::pairing::{PairingGuard, Principal};
 use komo_core::domain::inbox::InboundOrigin;
 use komo_core::domain::session::{ChannelPeer, InboundPeer};
 use std::path::PathBuf;

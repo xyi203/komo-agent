@@ -23,7 +23,7 @@ komo-mcp = { path = "crates/komo-mcp" }
 # The out-of-process Python plugin host (`~/.komo/plugins/*.py`).
 komo-pyhost = { path = "crates/komo-pyhost" }
 # The agent: tool loop, gateway, sweeps, and the provider client it drives.
-komo-agent = { path = "crates/komo-agent" }
+komo-bot = { path = "crates/komo-bot" }
 # Note-vault vector search. Its own crate so its ~130 vector dependencies stay
 # off every other crate's compile path — only this wiring layer sees them.
 komo-wiki = { path = "crates/komo-wiki" }
@@ -148,7 +148,7 @@ members = [
     "crates/komo-infra",
     "crates/komo-services",
     "crates/komo-tools",
-    "crates/komo-agent",
+    "crates/komo-bot",
     "crates/komo-wiki",
 ]
 resolver = "3"

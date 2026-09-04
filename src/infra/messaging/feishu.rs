@@ -18,9 +18,9 @@
 //! gate matches the bot's *own* open_id, resolved once at startup: a group
 //! message that @s somebody else is not addressed to the agent.
 
-use komo_agent::gateway::Channel;
-use komo_agent::interaction::GatewayDispatcher;
-use komo_agent::pairing::{PairingGuard, Principal};
+use komo_bot::gateway::Channel;
+use komo_bot::interaction::GatewayDispatcher;
+use komo_bot::pairing::{PairingGuard, Principal};
 use komo_core::domain::inbox::InboundOrigin;
 use komo_core::domain::session::{ChannelPeer, InboundPeer};
 use komo_core::domain::trigger::{ExternalEvent, FeishuEvent};

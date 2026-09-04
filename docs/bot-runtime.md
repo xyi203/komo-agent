@@ -35,7 +35,7 @@ routines，可以被消息、定时器和外部事件唤醒，持续执行跨小
 
 | 能力 | 现状 | 缺口 |
 |---|---|---|
-| 审批等待 | 内存 `oneshot`，`APPROVAL_TIMEOUT = 300s`，超时即拒绝（`komo-agent/src/interaction.rs`）；`approval/requested`/`resolved` 已是 durable 事件（turn-durability 1.5） | 等待不跨进程；没有 `expired` 结局；无人值守 turn 根本到不了人 |
+| 审批等待 | 内存 `oneshot`，`APPROVAL_TIMEOUT = 300s`，超时即拒绝（`komo-bot/src/interaction.rs`）；`approval/requested`/`resolved` 已是 durable 事件（turn-durability 1.5） | 等待不跨进程；没有 `expired` 结局；无人值守 turn 根本到不了人 |
 | 提问等待 | `ask_user` + `ClarifyState`，`CLARIFY_TIMEOUT = 600s`，每 turn 2 次；下一条用户消息即答案，新问题取代旧问题（`komo-services/src/clarify.rs`） | 同上：内存态，不跨进程；问题本身不是事件 |
 | 定时唤醒 | `CronJob.next_run_at` + `CronJobSweep`（claim-before-run、晚到裁决、`@at` 一次性） | 只能**开始新 turn**，不能**继续挂起的 turn**；trigger 只有 cron 表达式 |
 | 事件唤醒 | 无 | 全部 |
@@ -538,7 +538,7 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   TUI 本地模式（无 gateway）的 `ask_user` / `wait` 续跑由 TUI 自己驱动（5.8 接上，
   `tui/mod.rs`），日志那一半共用 `interaction::record_wake`。
 - **5.4 无人值守审批** —— **已完成**：cron runtime 的内层 approver 换成 `UnattendedSuspend`
-  （`komo-agent` 的 `unattended`）：`Risk::Normal` 答 `Suspend`，`Risk::Dangerous` 仍拒绝——
+  （`komo-bot` 的 `unattended`）：`Risk::Normal` 答 `Suspend`，`Risk::Dangerous` 仍拒绝——
   无人值守永不放行危险动作，事后 `/approve` 也不行。提示由 `CronJobSweep` 发而不是 approver 发，
   因为 `wk-<id>` 要等登记写完才存在：sweep 拿到 `Suspended` 后从日志读 `turn/suspended.summary`、
   从登记读 id，走已有 notifier 投递「回复 `/approve <id>` / `/deny <id>`」，只给 Once——
@@ -786,7 +786,7 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   （两个成员同一槽位 → 一条 run，`event` 说出是哪个）、`a_slot_two_members_share_is_owned_by_one_of_them`、
   `event_triggers_have_no_occurrence`、`history_keeps_the_newest_runs_only`。
 **5.12–5.14 共用的那条路** —— **已完成**：三个入口汇到一个
-`RoutineEventSource::on_event(&ExternalEvent)`（`komo-agent` 的 `daemon.rs`，与
+`RoutineEventSource::on_event(&ExternalEvent)`（`komo-bot` 的 `daemon.rs`，与
 `CronJobSweep` 并列——后者现在只持有 `Arc<RoutineEventSource>`，是它的**时钟入口**）。
 `on_event` 做两件事：
 
@@ -903,7 +903,7 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   artifacts 弄丢。confinement 一点没放松：词法归一（`normalize_lexically`）+ 前缀检查照走，
   `artifacts/../x` 依旧被拒。
 
-  **模型怎么知道**：`TurnInjections`（`komo-agent` 的 `llm.rs`）——按 runtime 授予的「往这一轮
+  **模型怎么知道**：`TurnInjections`（`komo-bot` 的 `llm.rs`）——按 runtime 授予的「往这一轮
   用户消息尾部加什么」，和 recall 记忆同一个位置、同一个理由。缓存前缀是 tools → system →
   messages，而 artifacts 路径带 session id，放进 system prompt 会让每条会话都有一份自己的冷前缀；
   挂在用户消息尾部则是「新字节本来就在那儿」，对缓存零成本（D6 第 2 条）。主 agent 和 cron

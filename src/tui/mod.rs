@@ -35,8 +35,8 @@ mod markdown;
 mod paste;
 mod ui;
 
-use komo_agent::interaction::{CancelState, CancelTicket, WaitParts, is_user_reply, record_wake};
-use komo_agent::runtime::AgentRuntime;
+use komo_bot::interaction::{CancelState, CancelTicket, WaitParts, is_user_reply, record_wake};
+use komo_bot::runtime::AgentRuntime;
 use komo_core::domain::awaiting::Awaiting;
 use komo_core::domain::cancel::{CANCELLED_REPLY, is_cancelled};
 use komo_core::domain::session_event::WakeupCause;
