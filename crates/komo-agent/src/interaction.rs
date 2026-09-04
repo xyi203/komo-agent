@@ -38,6 +38,7 @@ use komo_core::domain::{
     gateway::{InterjectSource, MessageHandler, ReplySink, WeChatLogin},
     home::HomeRepository,
     inbox::{InboundOrigin, InboxClaim, InboxRepository},
+    notify::Notifier,
     pairing::{ApproveOutcome, PairingRepository, PairingStatus},
     policy::{Rule, RuleSpec},
     repository::{SessionEventRepository, SessionRepository},
@@ -48,7 +49,7 @@ use komo_core::domain::{
         Wakeup, WakeupCause, WakeupFiredEvent,
     },
     todo::SessionTodoRepository,
-    wakeup::{WAIT_ID_PREFIX, WakeupDispatch, WakeupRegistration, WakeupRepository},
+    wakeup::{WAIT_ID_PREFIX, WakeupDispatch, WakeupRegistration, WakeupRepository, is_suspended},
 };
 
 // How long an approval may go unanswered is the *wait's* lifetime now
@@ -668,6 +669,13 @@ pub struct WaitParts {
 
 pub struct GatewayDispatcher {
     handler: Arc<dyn MessageHandler>,
+    /// The runtimes a woken turn may come back on, by what drives its session.
+    /// [`handler`](Self::handler) is the conversation's and is not in here; a
+    /// missing entry falls back to it. See [`handler_for`](Self::handler_for).
+    by_origin: HashMap<SessionOrigin, Arc<dyn MessageHandler>>,
+    /// Where an unattended turn's second question goes. `None` = nowhere, which
+    /// is every fixture and the local surfaces.
+    notifier: Option<Arc<dyn Notifier>>,
     /// `None` = this dispatcher cannot continue suspended turns (the test
     /// fixtures, which have no store behind them).
     waits: Option<WaitParts>,
@@ -839,6 +847,8 @@ impl GatewayDispatcher {
     ) -> Self {
         Self {
             handler,
+            by_origin: HashMap::new(),
+            notifier: None,
             approvals,
             sessions,
             home,
@@ -849,6 +859,53 @@ impl GatewayDispatcher {
             waits: None,
             inflight: Mutex::new(HashMap::new()),
             idle: Notify::new(),
+        }
+    }
+
+    /// Declare the runtime turns on `origin`'s sessions run on.
+    ///
+    /// A builder rather than a constructor argument because the fixtures have
+    /// exactly one runtime and the gateway has three, and a signature that made
+    /// every caller name all of them would be nine `None`s in the tests.
+    pub fn with_runtime(mut self, origin: SessionOrigin, handler: Arc<dyn MessageHandler>) -> Self {
+        self.by_origin.insert(origin, handler);
+        self
+    }
+
+    /// Where to tell the operator that an unattended turn stopped again.
+    pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
+        self.notifier = Some(notifier);
+        self
+    }
+
+    /// Which runtime brings a turn on this session back — the one it ran on,
+    /// not whichever is nearest.
+    ///
+    /// What a turn was is what it comes back as. A routine's continuation on
+    /// the conversation's runtime gets a wider tool set, the user's memory
+    /// library injected, and an approver that answers on behalf of a human who
+    /// is not there — so a second ungranted action comes back *refused* instead
+    /// of stopping to ask, which is the opposite of what an unattended turn is
+    /// supposed to do (docs/bot-runtime.md §4.2).
+    ///
+    /// `None` = do not continue at all. That is [`SessionOrigin::Delegate`]: a
+    /// delegation is the parent turn's own work done on a scratch session, and
+    /// the `delegate` call that would have read its answer is long gone — so a
+    /// continuation would spend a model round producing a reply with no reader.
+    fn handler_for(&self, origin: SessionOrigin) -> Option<Arc<dyn MessageHandler>> {
+        match origin {
+            SessionOrigin::Delegate => None,
+            SessionOrigin::User => Some(self.handler.clone()),
+            SessionOrigin::Cron | SessionOrigin::Briefing => match self.by_origin.get(&origin) {
+                Some(handler) => Some(handler.clone()),
+                None => {
+                    warn!(
+                        origin = origin.as_str(),
+                        "no runtime registered for this origin; using the conversation's"
+                    );
+                    Some(self.handler.clone())
+                }
+            },
         }
     }
 
@@ -977,15 +1034,24 @@ impl GatewayDispatcher {
             anyhow::bail!("no run `{turn_id}` to continue");
         };
         let session_id = registration.session_id.clone();
+        // What the turn was is what it comes back as. A routine that stopped to
+        // ask is still a routine: it comes back on the routine runtime, the
+        // permission engine reads `origin` to know nobody is watching, and the
+        // job's grants are what let it act at all — all three would be gone if
+        // the continuation ran as a plain detached turn on the conversation's
+        // runtime, which is a *widening* (`default_normal` would apply) as well
+        // as a routine that comes back unable to do the work it was granted.
+        let origin = self.session_origin(&session_id).await;
+        let Some(handler) = self.handler_for(origin) else {
+            warn!(
+                turn = %turn_id,
+                origin = origin.as_str(),
+                "nothing continues a turn on this kind of session; dropping the wake"
+            );
+            return Ok(());
+        };
         record_wake(&waits, registration, &turn_id, cause, payload).await?;
 
-        // What the turn was is what it comes back as. A routine that stopped to
-        // ask is still a routine: the permission engine reads `origin` to know
-        // nobody is watching, and the job's grants are what let it act at all —
-        // both would be gone if the continuation ran as a plain detached turn,
-        // which is a *widening* (`default_normal` would apply) as well as a
-        // routine that comes back unable to do the work it was granted.
-        let origin = self.session_origin(&session_id).await;
         let grants: Vec<Rule> = registration
             .grants
             .iter()
@@ -996,11 +1062,8 @@ impl GatewayDispatcher {
         tokio::spawn(async move {
             let claim = dispatcher.claim_session(&session_id).await;
             let ctx = SessionContext::detached(&session_id).with_origin(origin);
-            let outcome = with_job_grants(
-                grants,
-                with_session(ctx, dispatcher.handler.resume_interrupted(&run)),
-            )
-            .await;
+            let outcome =
+                with_job_grants(grants, with_session(ctx, handler.resume_interrupted(&run))).await;
             claim.release();
             match outcome {
                 Ok(Some(reply)) => {
@@ -1016,6 +1079,12 @@ impl GatewayDispatcher {
                 // not something to retry: the wait is gone and the turn is
                 // whatever the log says it is.
                 Ok(None) => warn!(turn = %run.id, "a woken turn was not continuable"),
+                // It stopped again rather than failing: the routine met a second
+                // action nobody has granted. Its new wait needs an operator, and
+                // there is no sweep behind this turn to find one.
+                Err(error) if is_suspended(&error) => {
+                    dispatcher.announce_new_wait(origin, &session_id).await
+                }
                 Err(error) => warn!(%error, turn = %run.id, "a woken turn failed"),
             }
         });
@@ -1045,6 +1114,14 @@ impl GatewayDispatcher {
             return Ok(());
         }
         let origin = self.session_origin(session_id).await;
+        let Some(handler) = self.handler_for(origin) else {
+            warn!(
+                session = %session_id,
+                origin = origin.as_str(),
+                "nothing opens a turn on this kind of session; dropping the wake"
+            );
+            return Ok(());
+        };
         let dispatcher = self.clone();
         let session = session_id.to_string();
         let input = payload.to_string();
@@ -1054,7 +1131,7 @@ impl GatewayDispatcher {
             // running beside it.
             let claim = dispatcher.claim_session(&session).await;
             let ctx = SessionContext::detached(&session).with_origin(origin);
-            let outcome = with_session(ctx, dispatcher.handler.handle(&session, input)).await;
+            let outcome = with_session(ctx, handler.handle(&session, input)).await;
             claim.release();
             match outcome {
                 Ok(reply) => {
@@ -1069,10 +1146,69 @@ impl GatewayDispatcher {
                     }
                     info!(session = %session, "opened a turn with what a wake carried")
                 }
+                Err(error) if is_suspended(&error) => {
+                    dispatcher.announce_new_wait(origin, &session).await
+                }
                 Err(error) => warn!(%error, session = %session, "a woken turn failed"),
             }
         });
         Ok(())
+    }
+
+    /// Tell the operator about the wait a *woken* unattended turn left behind.
+    ///
+    /// The sweep that starts a routine says what its turn stopped for; a turn
+    /// that stops a second time has no sweep behind it, so a wait whose id
+    /// nobody was given is a routine parked until it expires. Read back out of
+    /// the two records the suspension left — the log says what it wants, the
+    /// registration says how to name it — because the id does not exist until
+    /// after the approver has already answered.
+    ///
+    /// Only `/approve <id>` is offered: `session` / `always` widen a grant, and
+    /// an unattended turn's actions are approved one at a time or not at all.
+    async fn announce_new_wait(&self, origin: SessionOrigin, session_id: &str) {
+        // An attended turn's prompt went to the conversation as it was asked.
+        if !origin.is_unattended() {
+            return;
+        }
+        let (Some(notifier), Some(waits)) = (self.notifier.as_ref(), self.waits.as_ref()) else {
+            warn!(session = %session_id, "a woken turn stopped again and nobody can be told");
+            return;
+        };
+        let summary = match waits.events.events(session_id).await {
+            Ok(events) => events.iter().rev().find_map(|event| match &event.kind {
+                SessionEventKind::TurnSuspended(suspended) => Some(suspended.summary.clone()),
+                _ => None,
+            }),
+            Err(error) => {
+                warn!(%error, session = %session_id, "could not read what a woken turn stopped for");
+                None
+            }
+        };
+        let id = match waits.wakeups.list().await {
+            Ok(registrations) => registrations
+                .into_iter()
+                .find(|r| r.session_id == session_id && is_approval(&r.wakeup))
+                .map(|r| r.id),
+            Err(error) => {
+                warn!(%error, session = %session_id, "could not read a woken turn's new wait");
+                None
+            }
+        };
+        let (Some(summary), Some(id)) = (summary, id) else {
+            warn!(
+                session = %session_id,
+                "a woken turn stopped again with no wait to answer; \
+                 the next gateway start re-registers it"
+            );
+            return;
+        };
+        let body = format!(
+            "⚠️ 继续执行后又需要审批：{summary}\n回复 /approve {id} 批准本次 · /deny {id} 拒绝"
+        );
+        if let Err(error) = notifier.notify("Komo routine 等待批准", &body).await {
+            warn!(%error, session = %session_id, "failed to deliver a woken turn's new prompt");
+        }
     }
 
     /// What is driving the session — the record is the authority, since the

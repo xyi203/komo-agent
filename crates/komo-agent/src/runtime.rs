@@ -1807,6 +1807,28 @@ pub(crate) mod tests {
         }
     }
 
+    /// A second gated tool. The same request under a *different* call id, which
+    /// is what makes it an approval nobody has answered rather than one the log
+    /// already settled for this turn.
+    struct GatedAgain;
+
+    #[async_trait]
+    impl Tool for GatedAgain {
+        fn name(&self) -> &'static str {
+            "gated2"
+        }
+        fn description(&self) -> &'static str {
+            "asks for approval a second time"
+        }
+        async fn call(
+            &self,
+            input: serde_json::Value,
+            ctx: &komo_core::domain::context::ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Gated.call(input, ctx).await
+        }
+    }
+
     pub(crate) fn gated_runtime(
         db: Arc<Db>,
         approver: Arc<dyn komo_core::domain::approval::Approver>,
@@ -1823,6 +1845,33 @@ pub(crate) mod tests {
         let mut executor =
             ToolExecutor::new(komo_services::tool_execution::ToolExecutionConfig::default());
         executor.register(Arc::new(Gated));
+        rt.tool_executor = executor.with_events(db.clone()).with_approver(approver);
+        rt.wakeups = Some(db.clone());
+        rt
+    }
+
+    /// The same, for a turn that meets *two* approvals in a row — what a
+    /// routine's work usually looks like, since one answer rarely covers a whole
+    /// job. Its script starts at the second call, so it is what a continuation
+    /// runs: the round that stopped is replayed from the log, and the driver is
+    /// asked for what comes after it.
+    pub(crate) fn twice_gated_runtime(
+        db: Arc<Db>,
+        approver: Arc<dyn komo_core::domain::approval::Approver>,
+    ) -> AgentRuntime {
+        let (mut rt, _) = scripted_runtime(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("gated2", "{}")]),
+                Step::Final("done".into()),
+            ],
+            vec![],
+            30,
+        );
+        let mut executor =
+            ToolExecutor::new(komo_services::tool_execution::ToolExecutionConfig::default());
+        executor.register(Arc::new(Gated));
+        executor.register(Arc::new(GatedAgain));
         rt.tool_executor = executor.with_events(db.clone()).with_approver(approver);
         rt.wakeups = Some(db.clone());
         rt
@@ -4544,5 +4593,100 @@ pub(crate) mod tests {
         let settled = settled_of(&events).pop().unwrap();
         assert_eq!(settled.outcome, Outcome::Succeeded);
         assert_eq!(settled.summary, "the sub-agent's answer");
+    }
+
+    /// Nobody is holding a conversation open for a detached sub-agent, so an
+    /// action of its that needs approval is **refused** — and the sub-agent is
+    /// told so in as many words, which is what lets it wrap up instead of
+    /// reporting a failure nobody can act on (docs/bot-runtime.md §5.9).
+    #[tokio::test]
+    async fn a_detached_sub_agent_is_refused_an_approval_nobody_can_answer() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_bgdelegate_gate.db"))
+                .await
+                .unwrap(),
+        );
+        let tasks = task_store(&db, "bgdeleggate");
+
+        // The sub-agent carries the conversation's approver, exactly as the
+        // production sub-agent runtime does.
+        let (mut sub, refused) = task_runtime(
+            &db,
+            vec![
+                tool_calls(vec![call("gated", "{}")]),
+                Step::Final("could not do it".into()),
+            ],
+            vec![],
+            tasks.clone(),
+        );
+        let mut executor =
+            ToolExecutor::new(komo_services::tool_execution::ToolExecutionConfig::default());
+        executor.register(Arc::new(Gated));
+        sub.tool_executor = executor.with_events(db.clone()).with_approver(Arc::new(
+            crate::interaction::ChatApprover::new(Arc::new(
+                crate::interaction::ApprovalState::new(),
+            )),
+        ));
+
+        let (reporting, _) = task_runtime(
+            &db,
+            vec![Step::Final("noted".into())],
+            vec![],
+            tasks.clone(),
+        );
+        tasks.attach_dispatch(Arc::new(TaskWaker {
+            continuation: None,
+            fresh: Some(Arc::new(reporting)),
+            waits: wait_parts(&db),
+        }));
+
+        let delegate = Arc::new(crate::delegate::DelegateTool::new(
+            Arc::new(sub),
+            db.clone(),
+            Vec::new(),
+            "test-model".into(),
+        ));
+        let (rt, _) = task_runtime(
+            &db,
+            vec![
+                tool_calls(vec![call(
+                    "delegate",
+                    r#"{"task":"tidy the tree","detach":true}"#,
+                )]),
+                Step::Final("started".into()),
+            ],
+            vec![delegate],
+            tasks.clone(),
+        );
+        rt.handle_input("cli:bgdeleggate", "tidy up".into())
+            .await
+            .unwrap();
+
+        let events = until(&db, "cli:bgdeleggate", "the delegation settled", |events| {
+            !settled_of(events).is_empty()
+        })
+        .await;
+        let settled = settled_of(&events).pop().unwrap();
+        assert_eq!(
+            settled.outcome,
+            Outcome::Succeeded,
+            "the sub-agent finished; it was the action that was refused"
+        );
+        assert_eq!(settled.summary, "could not do it");
+
+        let told = refused.lock().unwrap()[0][0].content.clone();
+        assert!(
+            told.contains("没有人能应答"),
+            "the sub-agent is told why, not left guessing: {told}"
+        );
+
+        // And nothing is parked: a refusal is an answer, so there is no wait
+        // for an operator who was never asked.
+        assert!(
+            komo_core::domain::wakeup::WakeupRepository::list(&*db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

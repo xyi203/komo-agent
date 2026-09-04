@@ -154,7 +154,7 @@ impl Tool for DelegateTool {
                 },
                 "detach": {
                     "type": "boolean",
-                    "description": "Let the sub-agent run past this turn: the call returns a task id at once and its answer comes back to this conversation when it finishes. For work measured in minutes — never for something you need in order to answer now."
+                    "description": "Let the sub-agent run past this turn: the call returns a task id at once and its answer comes back to this conversation when it finishes. For work measured in minutes — never for something you need in order to answer now. Nobody is watching a detached sub-agent, so any action of its that needs the user's approval is refused rather than waiting for one: delegate work that will need permission without `detach`."
                 }
             },
             "required": ["task"]
@@ -190,11 +190,23 @@ impl DelegateTool {
     /// Hand the sub-agent turn to the background runtime and answer with its id.
     ///
     /// A detached delegation is the same delegation — same sub-session, same
-    /// recursion guard, same gate (there is none beyond the sub-agent's own
-    /// tools, which are gated individually). What changes is who waits, and
-    /// therefore what happens to an approval one of its tools asks for: nobody
-    /// is holding this conversation open for it, so it is answered where every
-    /// other parked approval is, by `/approve`.
+    /// recursion guard, same tools, each gated as usual. What changes is who is
+    /// there for it: the work runs in a task of the *process's*, outside any
+    /// conversation, so **a tool of its that needs approval is refused**, in as
+    /// many words, rather than parked on a wait.
+    ///
+    /// Prompting the parent conversation instead — which is what a detached
+    /// sub-agent inheriting its context would do — needs three things that do
+    /// not exist. The prompt would have to name a `wk-` id that only comes into
+    /// being *after* the approver has answered (the reason a routine's prompt is
+    /// sent by its sweep and not by its approver). The task would have to settle
+    /// twice, once to say it stopped and once to carry the answer the
+    /// continuation eventually produces, where `task/spawned` ↔ `task/settled`
+    /// allows one. And the approval slot is per session, so a background prompt
+    /// would displace the one the operator is answering in that conversation.
+    /// Until those exist, detachment is declared as what it is — in the tool's
+    /// own description, so the model chooses accordingly: work that needs
+    /// permission is work to delegate *without* `detach`.
     async fn detached(
         &self,
         session_id: &str,

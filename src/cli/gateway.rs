@@ -10,6 +10,7 @@ use crate::{
     cli::wiring,
     domain::{
         approval::Approver,
+        context::SessionOrigin,
         cron::CronJobRepository,
         gateway::MessageHandler,
         home::HomeRepository,
@@ -153,6 +154,16 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             db.clone(),
             db.clone(),
         )
+        // A woken turn comes back on the runtime it ran on. A routine that
+        // stopped to ask is still a routine when it resumes: the conversation's
+        // runtime would hand it a wider tool set, the user's memory library and
+        // an approver that answers for a human who is not there — so its next
+        // ungranted action would come back refused instead of stopping to ask.
+        .with_runtime(SessionOrigin::Cron, wired.cron_runtime.clone())
+        .with_runtime(SessionOrigin::Briefing, wired.briefing_runtime.clone())
+        // Where a woken routine's *next* question goes — the sweep that
+        // delivered the first one is long gone by then.
+        .with_notifier(notifier.clone())
         // What lets it bring a suspended turn back — for a sweep's wake and for
         // an arriving `/approve` alike.
         .with_waits(WaitParts {

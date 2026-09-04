@@ -522,14 +522,24 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   原来续跑用 detached context，routine 醒来按普通对话评估权限（更宽）且丢掉自己的 grants；
   `run_projection` 沿 `resumed_from` 链继承 `approval/resolved`，否则答复记在问的那个 turn、
   动作跑在续跑里，§8 判据 2 的 `waited_ms ≈ 5h` 永远是空的。
-  **遗留**：续跑跑在 dispatcher 的主 runtime 上，不是 cron runtime——工具集更大、经过 memory
-  enricher；权限上 fail-closed（主 runtime 内层是 `ChatApprover`，detached 非交互即拒绝），
-  但不对。要修需要 dispatcher 按 origin 路由 runtime，独立一件事。
+  **续跑的 runtime 也已经对上**：dispatcher 不再只握一个 handler，而是按 `SessionOrigin`
+  索引一组（`with_runtime`），主 / cron / briefing 三个在 `cli/gateway.rs` 一起传进去，
+  `continue_turn_with` 与 `start_turn_with` 用 `session_origin()` 选。这不是整洁问题：
+  主 runtime 的内层是 `ChatApprover`，续跑里第二个未授权动作会被**拒绝**而不是再次挂起，
+  正好和 §4.2 相反；顺带还会给一个 routine 更大的工具集、`delegate`，以及喂进用户记忆库的
+  enricher。`Delegate` origin 一律**不续跑**：委派是父 turn 自己的活跑在一条草稿 session 上，
+  会读它答案的那次 `delegate` 调用早已不在，续跑只会产出一份没有读者的回答。
+  第二次挂起的提示由 dispatcher 发（`announce_new_wait`，读日志的 `turn/suspended.summary`
+  加新登记的 id，只给 `/approve <id>`）：起这个 turn 的 sweep 已经不在后面了，而一个没人
+  知道 id 的等待就是一条挂到过期的 routine。
   验证：`a_routine_stops_for_an_ungranted_action_and_acts_once_it_is_approved`（真 sweep →
   真 runtime → 挂起 → notifier 收到 `wk-` 提示 → 拨快 5h → `answer_approval` → 续跑执行、
   step `approved_by = human`、`waited_ms = 18_000_000`、登记退休、approver 没再被问）、
   `a_refused_routine_comes_back_and_does_not_act`、`a_routine_never_waits_for_a_dangerous_one`、
-  `a_call_re_dispatched_after_a_wait_carries_the_answer_that_licensed_it`。
+  `a_call_re_dispatched_after_a_wait_carries_the_answer_that_licensed_it`、
+  `a_woken_routine_that_meets_another_ungranted_action_stops_again`（续跑落在 routine
+  runtime 上——会话 runtime 一次都没被调用——再次 `Suspended`、新登记指向续跑那个 turn、
+  通知带上新的 `wk-` id 且不提 `session`/`always`）。
 - **5.5 `awaiting` 投影** —— **已完成**：`Awaiting {turn_id, kind, since, summary, expires_at}`
   从日志 fold（`komo-core` 的 `domain::awaiting`），`turn/suspended` 置位，`wakeup/fired`、
   接手它的 `turn/started{resumed_from}`、以及那个 turn 的终止事件三者任一清除。fold 带
@@ -666,6 +676,15 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   这句话必须到达模型（§6「不自动重放 uncertain 的后台任务」）。
   审批不变：起后台命令和跑前台命令是同一个动作的两种执行方式，`shell` 的 gate 在分叉之前，
   `delegate` 沿用它今天的（子 agent 的工具各自受闸），递归仍由子 agent 工具集无 `delegate` 结构阻断。
+  **detach 的子 agent 不可审批**：后台 task 跑在进程自己的 task 里、不在任何会话中，
+  `ChatApprover` 看到的是 `handle_input` 就地建的非交互 context，于是需要审批的动作
+  **被拒绝**，并把这句话还给子 agent，让它收尾而不是报一个没人能处理的失败。
+  这条曾经写成「走 `/approve` 的挂起路径」，那是说的和做的不一致；真要挂起需要三样今天
+  没有的东西：提示得带上一个在审批器答完之后才存在的 `wk-` id（routine 的提示由 sweep 发
+  正是这个原因）、一个 task 得结算两次（`task/spawned` ↔ `task/settled` 只允许一次，
+  否则续跑几小时后产出的答案没有路回到父会话）、以及每个子 agent 一个审批位，否则后台
+  提示会顶掉操作者正在回答的那一条。所以改成把它说清楚：`detach` 的参数描述直接告诉模型，
+  需要授权的活别 detach。
   验证：`a_background_command_returns_at_once_and_reports_when_it_lands`（turn 答
   「started」没等命令、日志有 `task/spawned`、step 里给了模型 task_id；随后
   `task/settled{ok}` 且 `result_ref` 非空，session 上出现一条带结果的新 turn）、
@@ -677,7 +696,9 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   `a_background_task_a_restart_lost_settles_as_uncertain`（**新 runtime 实例** +
   启动核对，补 `task/settled{uncertain}`、没有第二条 `task/spawned`、新 turn 收到
   「may or may not」，再核对一次什么也不做）、
-  `a_detached_delegation_answers_with_an_id_and_reports_later`。
+  `a_detached_delegation_answers_with_an_id_and_reports_later`、
+  `a_detached_sub_agent_is_refused_an_approval_nobody_can_answer`（task 结算为 Succeeded、
+  子 agent 收到「没有人能应答」、没有留下任何登记）。
 - **5.10 kanban Task ↔ Wakeup**：`waiting_on_peer` / `wakeup_id` 列（kanban.db 加列，`ensure_columns`）；
   进入/离开 `Waiting` 登记/撤销；`FromPeer` 过滤器；`wait { for_task }`。
   验证：Task 等某 feishu peer，该 peer 来消息后 `task.source` 上出现一个带消息内容的新 turn，

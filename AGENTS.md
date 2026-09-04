@@ -209,7 +209,17 @@ fork — add new operator actions there, not in the CLI or api handlers.
   the other side: record `wakeup/fired`, retire every other wait that turn was
   holding, claim the session slot, continue (`interaction::record_wake` writes
   those events — one writer, so a second continuation path cannot forget the
-  `wakeup/fired`).
+  `wakeup/fired`). **A continuation runs on the runtime the turn ran on**: the
+  dispatcher holds one handler per `SessionOrigin` (`with_runtime`, wired in
+  `cli/gateway.rs`) and both `continue_turn_with` and `start_turn_with` pick by
+  the session record's origin, so a routine comes back as a routine — on the
+  conversation's runtime its next ungranted action would be *refused* by
+  `ChatApprover` instead of stopping to ask, which is the opposite of §4.2, and
+  it would be handed a wider tool set and the user's memory library besides. A
+  `Delegate` session is never continued at all: the `delegate` call that would
+  have read the answer is gone. A woken routine that stops *again* has no sweep
+  behind it to deliver the new `wk-` id, so the dispatcher sends that prompt
+  itself (`announce_new_wait`, `/approve <id>` only).
 - **A tool can raise the same wait** (`ToolContext::wait_for`, docs/bot-runtime.md
   §3.4): `wait` and `ask_user` fill in the *same* `PendingSuspension` the
   approval gate does, so the executor, the loop and the runtime need no second
@@ -495,9 +505,14 @@ call the same functions, which is what keeps validation from forking.
   (sub-agent tool set has `delegate: None`); each delegation is its own ledger
   run. The unattended cron runtime gets no `delegate`. `detach: true` runs that
   same sub-agent turn as a background task instead of inside the parent's — same
-  sub-session, same recursion guard, but nobody is holding the conversation open
-  for it, so an approval one of its tools asks for is answered by `/approve` like
-  any other parked one.
+  sub-session, same recursion guard, but it runs in a task of the process's,
+  outside any conversation, so **an action of its that needs approval is
+  refused**, not parked: prompting the parent would need a `wk-` id that does not
+  exist until after the approver has answered, a second settle for a task whose
+  `spawned`/`settled` pair allows one, and an approval slot per sub-agent so a
+  background prompt cannot displace the one the operator is answering. The tool's
+  `detach` description says so, so work that will need permission is delegated
+  without it.
 - `domain/background.rs` + `komo-services`' `background_tasks` — work a turn
   starts and does not wait for (docs/bot-runtime.md §5.9): `shell {background}`,
   `delegate {detach}`. **Two events and no status table** — `task/spawned` /

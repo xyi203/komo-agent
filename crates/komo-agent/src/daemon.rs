@@ -2519,11 +2519,32 @@ mod tests {
         }
     }
 
+    /// The conversation's runtime. A routine's continuation must never reach
+    /// it: its tool set is wider, it is fed the user's memory library, and its
+    /// approver answers on behalf of a human who is not in this turn.
+    #[derive(Default)]
+    struct ConversationHandler(Mutex<usize>);
+
+    #[async_trait]
+    impl komo_core::domain::gateway::MessageHandler for ConversationHandler {
+        async fn handle(&self, _session_id: &str, _input: String) -> anyhow::Result<String> {
+            *self.0.lock().unwrap() += 1;
+            Ok("the conversation answered".into())
+        }
+        async fn resume_interrupted(
+            &self,
+            _run: &komo_core::domain::run::Run,
+        ) -> anyhow::Result<Option<String>> {
+            *self.0.lock().unwrap() += 1;
+            Ok(Some("the conversation answered".into()))
+        }
+    }
+
     /// The gateway's two halves over one store: the routine runtime the sweep
     /// drives (it suspends where the policy would have to ask) and the
-    /// dispatcher that brings the turn back when the operator answers — which
-    /// is a *different* runtime in production too, and here carries an approver
-    /// that fails the test if it is consulted.
+    /// dispatcher that brings the turn back when the operator answers. The
+    /// dispatcher holds both runtimes production does — the conversation's and
+    /// the routine's — so which one a wake picks is what these tests are about.
     struct RoutineHarness {
         db: Arc<komo_infra::persistence::db::Db>,
         dispatcher: Arc<crate::interaction::GatewayDispatcher>,
@@ -2532,12 +2553,20 @@ mod tests {
         notifier: Arc<FakeNotifier>,
         asked: Arc<MustNotAsk>,
         continued_as: Arc<ContextProbe>,
+        conversation: Arc<ConversationHandler>,
     }
 
     async fn routine_harness(name: &str, job: CronJob) -> RoutineHarness {
+        routine_harness_with(name, job, false).await
+    }
+
+    /// `stops_again` gives the routine runtime a second ungranted action to meet
+    /// once the first is allowed — the continuation's own approval, which no
+    /// sweep is standing behind.
+    async fn routine_harness_with(name: &str, job: CronJob, stops_again: bool) -> RoutineHarness {
         use crate::interaction::{ApprovalState, GatewayDispatcher, TurnWaker, WaitParts};
         use crate::policy_approver::PolicyApprover;
-        use crate::runtime::tests::{gated_runtime, sqlite_url};
+        use crate::runtime::tests::{gated_runtime, sqlite_url, twice_gated_runtime};
         use crate::unattended::UnattendedSuspend;
         use komo_core::domain::policy::Policy;
 
@@ -2552,11 +2581,19 @@ mod tests {
         ));
         let asked = Arc::new(MustNotAsk::default());
         let continued_as = Arc::new(ContextProbe::default());
-        let mut continuing = gated_runtime(db.clone(), asked.clone());
+        let mut continuing = match stops_again {
+            true => twice_gated_runtime(
+                db.clone(),
+                PolicyApprover::wrap(Policy::default(), Arc::new(UnattendedSuspend)),
+            ),
+            false => gated_runtime(db.clone(), asked.clone()),
+        };
         continuing.turn_hooks = vec![continued_as.clone()];
+        let conversation = Arc::new(ConversationHandler::default());
+        let notifier = Arc::new(FakeNotifier::default());
         let dispatcher = Arc::new(
             GatewayDispatcher::new(
-                Arc::new(continuing),
+                conversation.clone(),
                 Arc::new(ApprovalState::new()),
                 db.clone(),
                 db.clone(),
@@ -2565,6 +2602,8 @@ mod tests {
                 db.clone(),
                 db.clone(),
             )
+            .with_runtime(SessionOrigin::Cron, Arc::new(continuing))
+            .with_notifier(notifier.clone())
             .with_waits(WaitParts {
                 runs: db.clone(),
                 events: db.clone(),
@@ -2574,7 +2613,6 @@ mod tests {
         let jobs = Arc::new(FakeCronRepo {
             jobs: Mutex::new(vec![job]),
         });
-        let notifier = Arc::new(FakeNotifier::default());
         let sweep = CronJobSweep {
             jobs: jobs.clone(),
             notifier: notifier.clone(),
@@ -2593,6 +2631,7 @@ mod tests {
             notifier,
             asked,
             continued_as,
+            conversation,
         }
     }
 
@@ -2730,6 +2769,11 @@ mod tests {
             *h.continued_as.seen.lock().unwrap(),
             Some((SessionOrigin::Cron, 1))
         );
+        assert_eq!(
+            *h.conversation.0.lock().unwrap(),
+            0,
+            "and it came back on the routine runtime, not the conversation's"
+        );
         let steps = RunRepository::steps(h.db.as_ref(), &continuation.id)
             .await
             .unwrap();
@@ -2802,6 +2846,83 @@ mod tests {
             steps[0].result
         );
         assert_eq!(steps[0].approved_by, "human");
+    }
+
+    /// The rest of §4.2: one answer rarely covers a whole job, so what matters
+    /// is what the *continuation* does when it meets a second action nobody
+    /// granted. It stops and asks again — which is only true because it runs on
+    /// the routine runtime. On the conversation's, the same action would come
+    /// back refused: its approver prompts a chat nobody is standing in.
+    ///
+    /// And because no sweep is behind this turn, the dispatcher is what tells
+    /// the operator which wait to answer this time.
+    #[tokio::test]
+    async fn a_woken_routine_that_meets_another_ungranted_action_stops_again() {
+        use crate::interaction::Answer;
+        use komo_core::domain::run::RunRepository;
+
+        let h = routine_harness_with("cron-wait-twice", granted_agent_job("nightly"), true).await;
+        h.sweep.run().await.unwrap();
+        let suspended = RunRepository::list(h.db.as_ref(), 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let first = WakeupRepository::list(h.db.as_ref())
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        assert!(
+            h.dispatcher
+                .answer_approval("home-chat", Some(&first.id), Answer::Once)
+                .await
+        );
+
+        let continuation = continuation_of(&h.db, &suspended.id).await;
+        assert_eq!(
+            continuation.status,
+            RunStatus::Suspended,
+            "it stopped to ask again rather than being refused"
+        );
+        assert_eq!(
+            *h.conversation.0.lock().unwrap(),
+            0,
+            "which is what running on the routine runtime buys"
+        );
+
+        // A wait of its own, standing for the continuation…
+        let second = WakeupRepository::list(h.db.as_ref())
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_ne!(second.id, first.id, "the answered wait was retired");
+        assert_eq!(second.turn_id.as_deref(), Some(continuation.id.as_str()));
+
+        // …and the operator hears about it, with the id to answer.
+        let told = until_notified(&h.notifier, 2).await.pop().unwrap();
+        assert!(told.1.contains(&second.id), "{}", told.1);
+        assert!(told.1.contains("delete the tree"), "{}", told.1);
+        assert!(
+            !told.1.contains("/approve session") && !told.1.contains("/approve always"),
+            "an unattended action is approved one at a time: {}",
+            told.1
+        );
+    }
+
+    /// The notifier's calls, once there are `want` of them. The continuation is
+    /// spawned, so its prompt lands after the run row does.
+    async fn until_notified(notifier: &Arc<FakeNotifier>, want: usize) -> Vec<(String, String)> {
+        for _ in 0..200 {
+            let calls = notifier.calls.lock().unwrap().clone();
+            if calls.len() >= want {
+                return calls;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the operator was never told");
     }
 
     #[tokio::test]

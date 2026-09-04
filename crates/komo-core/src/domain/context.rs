@@ -37,7 +37,9 @@ use crate::domain::session_event::{
 ///
 /// An enum rather than a `bool` because the callers already differ in more than
 /// attendance: a cron job's turn is scoped to *one job*, the briefing's is not.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionOrigin {
     /// A user-driven conversation — chat channel, CLI, TUI, HTTP API. Approval
