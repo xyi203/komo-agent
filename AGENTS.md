@@ -242,7 +242,12 @@ fork — add new operator actions there, not in the CLI or api handlers.
   `protected` (bearer key) and deliberately **not** in `operator_writes`, whose
   loopback layer would shut out its real callers — and by the same token
   loopback earns it no exemption. Its body is capped at `HOOK_BODY_LIMIT` and
-  read as text, never parsed.
+  read as text, never parsed. It **answers from the match and runs the work
+  behind the reply** (`on_event_detached`): an external caller's timeout is
+  seconds and its response to one is to redeliver, while a routine firing has
+  no dedupe key — so waiting would turn one notification into several runs of
+  the same routine. The `{routines, wakeups}` it returns is therefore what
+  matched, and deduplicating a redelivery is the caller's problem.
 
 ## Config
 

@@ -75,6 +75,23 @@ impl TriggerMatcher {
     ///
     /// Best-effort throughout: a trigger store that cannot be read must never
     /// keep the arrival itself from being answered.
+    /// How many standing wakes this arrival matches, claiming and waking
+    /// nothing. What an ingress that must answer before the work is done
+    /// reports (docs/bot-runtime.md §5.12) — a read, so asking twice costs
+    /// nothing and changes nothing.
+    pub async fn count_matching(&self, event: &InboundEvent<'_>) -> usize {
+        if self.dispatch.read().unwrap().is_none() {
+            return 0;
+        }
+        match self.wakeups.list().await {
+            Ok(rows) => matching(&rows, event).len(),
+            Err(error) => {
+                warn!(%error, "could not read standing wakes to count an event's matches");
+                0
+            }
+        }
+    }
+
     pub async fn on_event(&self, event: &InboundEvent<'_>, payload: &str) -> usize {
         let Some(dispatch) = self.dispatch.read().unwrap().clone() else {
             return 0;

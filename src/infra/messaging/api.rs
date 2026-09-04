@@ -496,6 +496,14 @@ const HOOK_BODY_LIMIT: usize = 64 * 1024;
 
 /// One inbound webhook: the routines it starts and the suspended turns it wakes.
 ///
+/// **It answers immediately and does the work behind the reply.** A routine is
+/// an agent turn — minutes, sometimes — while a caller's HTTP timeout is around
+/// ten seconds, and what an external system does with a timeout is *redeliver*.
+/// A routine firing has no dedupe key, so waiting here would turn one CI
+/// notification into two or three runs of the same several-minute routine. The
+/// counts in the body are therefore what the event **matched**, not what
+/// finished: both are reads, so they are cheap and repeatable.
+///
 /// The content type is not checked — a hook may post JSON, a form or plain text
 /// — because nothing here parses it: the body is read as text (lossily, so a
 /// binary payload is still an event rather than an error), summarised onto the
@@ -510,15 +518,15 @@ async fn inbound_hook(
         name: name.clone(),
         body: String::from_utf8_lossy(&body).into_owned(),
     };
-    let fired = state.dispatcher.on_external_event(&event).await;
+    let matched = state.dispatcher.on_external_event_detached(&event).await;
     info!(
         hook = %name,
-        routines = fired.routines,
-        wakeups = fired.wakeups,
+        routines = matched.routines,
+        wakeups = matched.wakeups,
         "webhook received"
     );
     Ok(Json(
-        json!({ "routines": fired.routines, "wakeups": fired.wakeups }),
+        json!({ "routines": matched.routines, "wakeups": matched.wakeups }),
     ))
 }
 

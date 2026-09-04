@@ -685,9 +685,10 @@ impl RoutineEventSource {
     /// It **runs the turns it starts**, so the answer is what actually
     /// happened rather than what was dispatched — that is what makes a routine
     /// firing testable, and what keeps two events on one routine from racing
-    /// each other's `runs` history. An ingress that cannot afford to wait
-    /// (a chat consumer, the file watcher) spawns the call; the webhook, which
-    /// owes its caller the count, does not.
+    /// each other's `runs` history. Every ingress therefore spawns it rather
+    /// than blocking on it: a chat consumer has a `/approve` to keep reading,
+    /// the file watcher has writes to keep debouncing, and an HTTP caller has a
+    /// timeout ([`RoutineEventSource::on_event_detached`] is the webhook's).
     ///
     /// Best-effort otherwise: an unreadable job store starts nothing and says
     /// so, rather than failing an ingress that owes somebody a reply.
@@ -719,6 +720,51 @@ impl RoutineEventSource {
             fanout.wakeups = triggers.on_event(&inbound, &event.summary()).await;
         }
         fanout
+    }
+
+    /// The same event for a caller that must be answered **now**: what it
+    /// matched, with the work left running behind it.
+    ///
+    /// This is the webhook's entry (docs/bot-runtime.md §5.12). An external
+    /// system's HTTP timeout is on the order of ten seconds and its response to
+    /// one is to *redeliver* — and a routine firing has no dedupe key, so a
+    /// hook that waited for a several-minute routine would be told to run it
+    /// again, and again. Answering the match and doing the work behind it is
+    /// what makes the reply's latency independent of the routine's.
+    ///
+    /// So the counts are **matched**, not finished: `routines` is how many
+    /// routines this event applies to, `wakeups` how many standing waits name
+    /// it. Both are read-only and repeatable, so they cost the caller nothing
+    /// and cannot themselves double-fire anything.
+    pub async fn on_event_detached(self: &Arc<Self>, event: &ExternalEvent) -> EventFanout {
+        let matched = self.count_matches(event).await;
+        let source = self.clone();
+        let event = event.clone();
+        tokio::spawn(async move { source.on_event(&event).await });
+        matched
+    }
+
+    /// How many routines and standing waits this event applies to. Reads only —
+    /// nothing is claimed, nothing is run, so it can be answered before the
+    /// work starts and asked again without consequence.
+    async fn count_matches(&self, event: &ExternalEvent) -> EventFanout {
+        let routines = match self.jobs.list().await {
+            Ok(jobs) => jobs
+                .iter()
+                .filter(|job| {
+                    job.status == CronJobStatus::Active && job.trigger.matched_by(event).is_some()
+                })
+                .count(),
+            Err(error) => {
+                warn!(%error, "could not read routines to count an event's matches");
+                0
+            }
+        };
+        let wakeups = match (&self.triggers, event.as_inbound()) {
+            (Some(triggers), Some(inbound)) => triggers.count_matching(&inbound).await,
+            _ => 0,
+        };
+        EventFanout { routines, wakeups }
     }
 
     /// Whether any active routine listens for a chat reaction — what lets an
@@ -2560,6 +2606,37 @@ mod tests {
         }
     }
 
+    /// Wait for a routine's history to hold `want` settled runs.
+    ///
+    /// The detached ingress answers before the work is done, so a test of what
+    /// the work *did* has to watch the record rather than the call — the same
+    /// shape `continuation_of` uses for a woken turn.
+    async fn settled_job(repo: &Arc<FakeCronRepo>, name: &str, want: usize) -> CronJob {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let found = repo
+                    .jobs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|job| job.name == name)
+                    .cloned();
+                if let Some(job) = found
+                    && job.runs.len() >= want
+                    && job
+                        .runs
+                        .iter()
+                        .all(|r| r.status != RoutineRunStatus::Running)
+                {
+                    return job;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("routine `{name}` never settled {want} run(s)"))
+    }
+
     /// §5.12, the routine half: a hook fires the routine watching for it, the
     /// run records the body, and the turn runs unattended.
     #[tokio::test]
@@ -2581,14 +2658,16 @@ mod tests {
         // Nothing is scheduled, so the clock half passes over both.
         assert_eq!(sweep.sweep_due().await.unwrap().jobs_run, 0);
 
-        let fanout = sweep
-            .on_event(&ExternalEvent::Webhook {
+        // The webhook's own entry: answered from the match, work left running.
+        let matched = sweep
+            .on_event_detached(&ExternalEvent::Webhook {
                 name: "ci".into(),
                 body: "build 4213 failed on main".into(),
             })
             .await;
-        assert_eq!(fanout.routines, 1, "only the routine that named `ci`");
+        assert_eq!(matched.routines, 1, "only the routine that named `ci`");
 
+        let fired = settled_job(&repo, "on-ci", 1).await;
         let seen = probe.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
         let (origin, grants, prompt) = &seen[0];
@@ -2597,8 +2676,6 @@ mod tests {
         assert!(prompt.contains("on-ci 的固定任务"), "{prompt}");
         assert!(prompt.contains("build 4213 failed"), "{prompt}");
 
-        let jobs = repo.jobs.lock().unwrap().clone();
-        let fired = jobs.iter().find(|j| j.name == "on-ci").unwrap();
         assert_eq!(fired.runs.len(), 1, "one event is one run");
         let run = fired.last_run().unwrap();
         assert_eq!(run.status, RoutineRunStatus::Ok);
@@ -2607,13 +2684,57 @@ mod tests {
         assert_eq!(fired.next_run_at, 0, "an event routine never gains a slot");
         // The one that named another hook did not run at all.
         assert!(
-            jobs.iter()
+            repo.jobs
+                .lock()
+                .unwrap()
+                .iter()
                 .find(|j| j.name == "on-deploy")
                 .unwrap()
                 .runs
                 .is_empty()
         );
         assert_eq!(notifier.calls.lock().unwrap().len(), 1);
+    }
+
+    /// A routine that takes minutes must not hold the hook's connection: an
+    /// external caller's timeout is seconds, and what it does with one is
+    /// redeliver — which would run the same several-minute routine again.
+    #[tokio::test]
+    async fn a_webhook_is_answered_before_its_routine_finishes() {
+        /// A routine turn long enough that waiting for it would be the bug.
+        struct SlowRuntime;
+
+        #[async_trait]
+        impl MessageHandler for SlowRuntime {
+            async fn handle(&self, _session: &str, _message: String) -> anyhow::Result<String> {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Ok("done at last".to_string())
+            }
+        }
+
+        let (sweep, repo, _notifier) = cron_sweep_full(
+            vec![event_job("on-ci", Trigger::Webhook { name: "ci".into() })],
+            false,
+            Some(Arc::new(SlowRuntime)),
+        );
+        let started = std::time::Instant::now();
+        let matched = sweep
+            .on_event_detached(&ExternalEvent::Webhook {
+                name: "ci".into(),
+                body: "green".into(),
+            })
+            .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the reply waited on the turn: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(matched.routines, 1, "the count is what matched");
+        // Claimed as `running` straight away, so the record exists before the
+        // turn does — and it settles on its own.
+        let fired = settled_job(&repo, "on-ci", 1).await;
+        assert_eq!(fired.last_run().unwrap().status, RoutineRunStatus::Ok);
+        assert_eq!(fired.last_run().unwrap().output, "done at last");
     }
 
     /// §5.13, criterion 6: a group member nobody allow-listed reacts with an

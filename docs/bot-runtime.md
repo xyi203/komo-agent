@@ -812,20 +812,27 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 `attach_routines` 是后绑的——source 要 waker，waker 要 dispatcher。
 
 `on_event` 自己是**等到跑完**的（返回的是实际发生了什么，而不是派发了什么；同一 routine 的两个
-事件也就不会互相踩 `runs`）；等不起的入口自己 spawn——飞书消费循环（挡住它就挡住了用户正在打的
-`/approve`）和文件 watcher（还要继续防抖后面的写入）都 spawn，webhook 因为要把 `{routines,
-wakeups}` 答给调用方而直接 await。
+事件也就不会互相踩 `runs`），所以**三个入口都不阻塞在它上面**：飞书消费循环（挡住它就挡住了用户
+正在打的 `/approve`）和文件 watcher（还要继续防抖后面的写入）直接 spawn；webhook 走
+`on_event_detached`——它先只读地数出匹配数答给调用方，再把 `on_event` spawn 出去（理由见 5.12）。
 
 - **5.12 Webhook** —— **已完成**：`POST /api/hooks/{name}`，并进 api channel 的
   `protected`（bearer key 网关），**不**进 `operator_writes`——那层 loopback 限制会把
   webhook 的真正调用方（CI、监控）挡在外面；反过来 loopback 也不免鉴权，key 就是全部的门。
   body 上限 `HOOK_BODY_LIMIT = 64 KB`（`DefaultBodyLimit`），内容类型不限、按文本读（lossy），
-  只取摘要进 `event`。响应 `{ "routines": n, "wakeups": m }`。
+  只取摘要进 `event`。
+  **它立即返回，routine 在后台跑**（`on_event_detached`：先只读地数出匹配数，再 spawn
+  `on_event`）。响应 `{ "routines": n, "wakeups": m }` 里的 n/m 是**匹配到的数量**，不是跑完的
+  数量——外部系统的 webhook 超时普遍在 10 秒量级，而超时的处置是重投；routine 命中没有去重键，
+  等一个几分钟的 routine 就等于把它跑两三次。所以**同一事件重投一次就再跑一次，去重是调用方的事**
+  （或者在 routine 的 prompt 里让它自己拿 body 中的 id 判断——事件内容是数据，判重也只能当数据判）。
+  唤醒那半是幂等的：登记被 `take` 认领过就不再命中，重投只会数出 0。
   验证：`a_webhook_without_the_key_is_refused`（无 key / 错 key → 401）、
   `an_oversized_webhook_body_is_refused`、`a_webhook_fires_the_routine_that_named_it`
-  （一条 run、`event` 含 body 摘要、turn 是 `origin=Cron` 且带 routine 的 grants）、
+  （轮询 run 记录：一条 run、`event` 含 body 摘要、turn 是 `origin=Cron` 且带 routine 的 grants）、
+  `a_webhook_is_answered_before_its_routine_finishes`（routine 跑 3 秒，响应在 1 秒内回）、
   `a_webhook_wakes_the_turn_that_was_waiting_for_it`（`wait { for_event }` 的 turn 被唤醒，
-  工具返回事件描述，重复投递不再唤醒）、`a_webhook_nobody_named_wakes_nothing`。
+  工具返回事件描述，重投不再命中）、`a_webhook_nobody_named_wakes_nothing`。
 - **5.13 Feishu match** —— **已完成**：`admit` 不再丢掉「群里没 @ 机器人」的消息，而是把
   它标成 `admitted: false` 带出来——routine 触发跟「有没有跟机器人说话」无关，群里一个关键词正是
   §5.13 存在的理由。channel 的消费循环先无条件调 `on_external_event`（routine 路径），

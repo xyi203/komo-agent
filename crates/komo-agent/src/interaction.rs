@@ -1018,6 +1018,17 @@ impl GatewayDispatcher {
         }
     }
 
+    /// The same event for an ingress that owes somebody an answer now — see
+    /// [`RoutineEventSource::on_event_detached`]. The counts are what the event
+    /// *matched*; the turns run behind the reply.
+    pub async fn on_external_event_detached(&self, event: &ExternalEvent) -> EventFanout {
+        let routines = self.routines.read().unwrap().clone();
+        match routines {
+            Some(routines) => routines.on_event_detached(event).await,
+            None => EventFanout::default(),
+        }
+    }
+
     /// Whether turning a chat reaction into an event is worth an ingress's
     /// trouble — see [`RoutineEventSource::wants_feishu_reactions`].
     pub async fn wants_feishu_reactions(&self) -> bool {
