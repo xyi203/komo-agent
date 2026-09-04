@@ -62,7 +62,7 @@ connect and renamed `<name>.merged-backup`.
 | Where | Contents | Durability |
 |---|---|---|
 | `komo.db` · `session_records`, `session_todo_records`, `reminder_records`, `pairing_records`, `setting_records`, `inbox_records`, run ledger (`run_records`, `run_step_records`, `run_memory_records`) | one turn's execution record and the session metadata around it | disposable **by row** — `komo run prune`, `komo sessions clean`; never by dropping the table |
-| `komo.db` · `task_records` | cross-session tasks | durable |
+| `komo.db` · `task_records` | cross-session tasks | durable — **additive changes only** (`kanban::ensure_schema`) |
 | `komo.db` · `memory_records` | long-term memories | durable — **additive changes only** |
 | `komo.db` · `cron_job_records` | scheduled cron jobs | durable |
 | `komo.db` · `wakeup_records` | standing wakeups — one row per suspended turn's wait | durable |
@@ -126,9 +126,9 @@ longer available for anything):
 
 - **Column additions never need a reset**: `komo-infra/src/persistence/mod.rs::ensure_columns`
   ALTERs in place on connect. Extend the list next to the model — `EXPECTED` in
-  `memory_db.rs` and `cron.rs`, `SESSION_COLUMNS` / `RUN_COLUMNS` /
+  `memory_db.rs`, `cron.rs` and `kanban.rs`, `SESSION_COLUMNS` / `RUN_COLUMNS` /
   `STEP_COLUMNS` in `db.rs::connect` — and add an `ensure_schema` for a table
-  that has none yet (`task_records`). Columns must be NOT NULL + DEFAULT, or
+  that has none yet. Columns must be NOT NULL + DEFAULT, or
   nullable.
 - **A new table** is added with `ensure_table` (its DDL kept beside the model,
   byte-parity locked by a test — see `INBOX_TABLE_DDL`), because an existing
@@ -405,7 +405,8 @@ call the same functions, which is what keeps validation from forking.
   one approval per batch, no rollback — reports exactly what landed),
   `web_fetch` (content-type gated, 256 KB download cap, deny-only network
   policy), `homeassistant` (`call_service` approval-gated; `BLOCKED_DOMAINS`
-  hardline), `task`, `todo` (session-scoped, dies at a `/new` boundary — the
+  hardline), `task` (a `waiting` task that names an address registers a wake —
+  see below), `todo` (session-scoped, dies at a `/new` boundary — the
   only thing that does), `memory`,
   `skill`, `cron`, `ask_user` / `wait` (the two sentinel tools: both stop the
   turn through `ToolContext::wait_for` and come back with the wake as their
@@ -941,6 +942,32 @@ call the same functions, which is what keeps validation from forking.
   but is a different guarantee — a confinement boundary, not a convenience.
   Recurring *work* = cron job, recurring *message* = reminder, one-shot
   scheduled work = `@at` job.
+- `domain/task.rs` + `komo-services`' `task_waiting` / `triggers` +
+  `komo-core`'s `domain::trigger` — kanban `Waiting` is a label **and** a
+  standing wake (docs/bot-runtime.md §3.7). A task that names who it waits on
+  as an *address* (`waiting_on_peer: Option<ChannelPeer>`) registers one
+  `Event{FromPeer}` and holds its id (`wakeup_id`); a task carrying only a name
+  is **not wakeable**, and every listing says so rather than implying somebody
+  is watching — `waiting_on` is for a human to read, and nothing here guesses a
+  peer from it. Both are additive columns on the durable `task_records`
+  (`kanban::ensure_schema`).
+  **One function registers and retires**: `TaskWaiting::sync`, which every
+  write that can enter or leave `Waiting` goes through (the `task` tool's
+  `capture` / `update` / `complete` today) — it mutates `wakeup_id` and the
+  caller writes the row, so one task change is still one write. The wake lands
+  on `task.source`, or the home session when the task came from no
+  conversation; it expires with the task's own `due_at`, else in 30 days.
+  **`TriggerMatcher` fires it**, from `GatewayDispatcher::handle` after the
+  inbox dedupe: pure matching in `domain::trigger` (so §5.13's chat-triggered
+  routine reuses it), the shell claims each hit with `take` before firing.
+  A hit **adds** a turn on the commitment's own session — the message still
+  runs its own conversation, because whoever wrote is talking to komo (§6, no
+  Task router). The task's **status is never changed automatically**: whether
+  that message discharges the commitment is a judgement, and the woken turn's
+  model makes it. `wait { for_task }` is the same wake consumed the other way
+  (`turn_id: Some`, exact continuation) — kanban ids and background-task ids
+  are both UUIDv7, so the kanban store is asked and anything it does not know
+  is a background task.
 - `apps/` — bun workspace: `apps/app` (shared React renderer) mounted by
   `apps/desktop` (Electron) and `apps/web` (SPA served via `web_dir`). Talks
   to the gateway over HTTP only (`HttpKomoClient`); feature-first layout;

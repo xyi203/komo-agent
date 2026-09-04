@@ -32,6 +32,7 @@ pub mod skill;
 pub mod task;
 pub mod todo;
 pub mod tool;
+pub mod trigger;
 pub mod wakeup;
 pub mod workday;
 pub mod workspace;

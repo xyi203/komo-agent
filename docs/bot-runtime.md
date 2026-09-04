@@ -699,10 +699,46 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   `a_detached_delegation_answers_with_an_id_and_reports_later`、
   `a_detached_sub_agent_is_refused_an_approval_nobody_can_answer`（task 结算为 Succeeded、
   子 agent 收到「没有人能应答」、没有留下任何登记）。
-- **5.10 kanban Task ↔ Wakeup**：`waiting_on_peer` / `wakeup_id` 列（kanban.db 加列，`ensure_columns`）；
-  进入/离开 `Waiting` 登记/撤销；`FromPeer` 过滤器；`wait { for_task }`。
-  验证：Task 等某 feishu peer，该 peer 来消息后 `task.source` 上出现一个带消息内容的新 turn，
-  Task 状态未被自动改动；Task 完成后同一 peer 再来消息不再触发；纯文字 `waiting_on` 在 list 里标「不可唤醒」。
+- **5.10 kanban Task ↔ Wakeup** —— **已完成**：`Waiting` 从一个标签变成一个标签**加一条登记**。
+  `task_records` 加三列（`waiting_on_platform` / `waiting_on_peer_id` / `wakeup_id`，
+  durable 表按 AGENTS.md 只加性变更，`kanban::ensure_schema` 就地 ALTER——这张表此前没有
+  `ensure_schema`，这次给它加了一个），映射到 `Task` 的两个字段：
+  `waiting_on_peer: Option<ChannelPeer>`（**没有地址就是不可唤醒**，绝不从名字猜）与
+  `wakeup_id: Option<String>`。
+  **进入 / 离开 `Waiting` 只有一个函数**：`komo-services` 的 `TaskWaiting::sync`，
+  它读 `task.is_wakeable()`，据此登记或撤销，只改 `task.wakeup_id`，由调用方落一次库——
+  「进来登记、出去撤销」写三遍就是三次漏登记的机会。今天的写入点只有 `task` 工具的
+  `capture` / `update` / `complete` 三条（`komo task` CLI 只有 `list`，reviewer 抽取一律落
+  `Inbox`），全部走它。登记是 `Event{FromPeer}` + `turn_id: None`，session 取 `task.source`，
+  为空则取 home session（`HomeRepository::home_session`）；`expires_at` 取 `due_at`，
+  没有就 30 天。同一个人换成另一个人、或登记已经被 fire 掉，`sync` 都会换一条新的，
+  不会留下一条谁也叫不醒的空 id。
+  **命中**是一个 `TriggerMatcher`（`komo-services/src/triggers.rs`），挂在
+  `GatewayDispatcher::handle` 的 inbox 去重之后、`dispatch` 之前。形状按 5.13 要求拆成两半：
+  纯函数在 `komo-core` 的 `domain::trigger`（`matches(&EventFilter, &InboundEvent)` +
+  `matching(&[WakeupRegistration], …)`，无 I/O、可单测），薄壳只做「列登记 → 逐条 take 认领
+  → fire」。**先 take 再 fire**，所以一条消息和同一刻过期它的 sweep 只会叫醒一次。
+  `turn_id: None` → `start_turn_with`，prompt 是「你在等 <waiting_on> 关于「<title>」的回复，
+  刚收到：<消息原文>」；`turn_id: Some` → 续跑，payload 就是消息原文（那个 turn 自己的历史里
+  已经有上下文了）。**消息本身照常走它自己的会话**——它是对方在和 komo 说话，命中只是在
+  `task.source` 上*另外*开一个 turn，不改消息的路由（§6「不做 Task Router」）。
+  Task 状态**不自动改**：这条算不算「回复了」是判断，由那个 turn 里的模型来做；命中后只把
+  `wakeup_id` 清空，`komo task list` 与工具的 list 立刻显示「不可唤醒」。
+  **`wait { for_task }` 是同一条登记的第二种消费方式**：kanban id 与后台任务 id 都是
+  UUIDv7，只能查表区分——`WaitTool` 拿到 `TaskRepository`，先问 kanban，认得且有
+  `waiting_on_peer` 就登记 `Event{FromPeer}` + `turn_id: Some`（deadline 用 Task 自己的
+  `due_at`），认不得（或只有名字）就还是 `TaskDone`。
+  `due_at` 到期仍由 `TaskSweep` 投递提醒，没动。
+  验证：`a_waiting_tasks_peer_writing_opens_a_turn_where_the_task_came_from`
+  （登记形状 + `wakeup_id` 回写 → 该 peer 来消息 → `task.source` 上出现带消息内容与 title 的
+  新 turn、消息自己的会话也有一个 turn、Task 仍是 `Waiting`、登记已被 take → 标 done 后同一
+  peer 再来消息不再触发）、`a_turn_waiting_on_a_task_is_continued_by_that_peers_message`
+  （`turn_id: Some` 走续跑，`wakeup/fired{event}` 的 payload 就是消息原文）、
+  `a_commitment_with_an_address_registers_a_wake_and_completing_it_retires_it`、
+  `a_commitment_naming_only_a_person_is_listed_as_unwakeable`、
+  `waiting_for_a_kanban_task_waits_for_the_person_it_waits_on`、
+  `an_unknown_id_is_still_a_background_task`、
+  `a_message_that_ended_a_task_wait_comes_back_as_its_text`。
 
 ### 第三批 · Trigger 泛化
 

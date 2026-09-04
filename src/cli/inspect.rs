@@ -232,6 +232,12 @@ pub async fn task_list(control: &OperatorControl) -> anyhow::Result<()> {
             if !t.waiting_on.is_empty() {
                 line.push_str(&format!("  (waiting on: {})", t.waiting_on));
             }
+            // A name is not an address: nothing can match an inbound message
+            // against it, so nothing will ever wake this task
+            // (docs/bot-runtime.md §3.7).
+            if status == TaskStatus::Waiting && t.waiting_on_peer.is_none() {
+                line.push_str("  [不可唤醒]");
+            }
             if let Some(due) = t.due_at {
                 line.push_str(&format!("  due {}", local_time(due)));
             }

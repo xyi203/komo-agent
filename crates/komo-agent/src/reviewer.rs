@@ -645,6 +645,15 @@ mod tests {
                 .find(|t| t.source == source && t.source_message_id == source_message_id)
                 .cloned())
         }
+        async fn find_by_wakeup_id(&self, wakeup_id: &str) -> anyhow::Result<Option<Task>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.wakeup_id.as_deref() == Some(wakeup_id))
+                .cloned())
+        }
     }
 
     /// A consolidator over `memories` whose classifier always answers

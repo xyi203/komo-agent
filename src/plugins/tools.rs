@@ -27,6 +27,8 @@ use komo_tools::web_fetch::WebFetchTool;
 use komo_tools::web_search::WebSearchTool;
 use komo_tools::write::WriteTool;
 
+use komo_services::task_waiting::TaskWaiting;
+
 use super::{Plugin, Scope, ToolCx, ToolRegistry};
 
 /// komo's own tool set. Scopes reproduce the pre-plugin wiring exactly:
@@ -76,13 +78,25 @@ impl Plugin for CoreToolsPlugin {
             Scope::AGENTIC,
             Arc::new(CronTool::new(cx.cron_jobs.clone())),
         );
-        reg.tool(Scope::AGENTIC, Arc::new(TaskTool::new(cx.kanban.clone())));
+        // A `waiting` task registers a standing wake, so the task tool needs
+        // the registration store and the home conversation a source-less task
+        // falls back to (docs/bot-runtime.md §3.7).
+        let task_waiting = Arc::new(TaskWaiting::new(cx.db.clone(), cx.db.clone()));
+        reg.tool(
+            Scope::AGENTIC,
+            Arc::new(TaskTool::new(cx.kanban.clone()).with_waiting(task_waiting)),
+        );
         reg.tool(Scope::AGENTIC, Arc::new(TodoTool::new(cx.db.clone())));
         reg.tool(Scope::AGENTIC, Arc::new(AskUserTool::new()));
         // Waiting is not conversation: a routine that checks something, waits two
         // hours and checks again is the reason this is registered everywhere an
         // agent turn runs, unattended ones included.
-        reg.tool(Scope::ALL, Arc::new(WaitTool));
+        // The kanban store is what lets `for_task` tell a commitment from a
+        // background job — two id spaces of the same shape.
+        reg.tool(
+            Scope::ALL,
+            Arc::new(WaitTool::new().with_tasks(cx.kanban.clone())),
+        );
         reg.tool(
             Scope::AGENTIC,
             Arc::new(MemoryTool::new(

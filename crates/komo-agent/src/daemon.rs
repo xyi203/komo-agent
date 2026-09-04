@@ -3280,6 +3280,15 @@ mod tests {
                 .find(|t| t.source == source && t.source_message_id == source_message_id)
                 .cloned())
         }
+        async fn find_by_wakeup_id(&self, wakeup_id: &str) -> anyhow::Result<Option<Task>> {
+            Ok(self
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.wakeup_id.as_deref() == Some(wakeup_id))
+                .cloned())
+        }
     }
 
     fn task_sweep_with(tasks: Vec<Task>) -> (TaskSweep, Arc<FakeTasks>, Arc<FakeNotifier>) {

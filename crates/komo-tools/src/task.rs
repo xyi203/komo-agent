@@ -4,6 +4,12 @@
 //! `list` shows open tasks, `update` retriages (status / due / waiting_on),
 //! `complete` closes. No `plan_today` — daily planning is the briefing
 //! sweep's job, where the model reads this list and organizes it itself.
+//!
+//! `waiting` is the one status with a runtime consequence: a task that names
+//! *who* it waits on as an address registers a standing wake, and their next
+//! message opens a turn about the commitment (docs/bot-runtime.md §3.7). Every
+//! write here that can enter or leave `waiting` goes through
+//! [`TaskWaiting::sync`] rather than touching registrations itself.
 
 use std::sync::Arc;
 
@@ -13,9 +19,11 @@ use serde_json::{Value, json};
 
 use komo_core::domain::{
     context::ToolContext,
+    session::ChannelPeer,
     task::{Task, TaskRepository, TaskStatus, parse_task_status},
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
+use komo_services::task_waiting::TaskWaiting;
 
 #[derive(Deserialize)]
 struct TaskArgs {
@@ -24,18 +32,53 @@ struct TaskArgs {
     note: Option<String>,
     status: Option<String>,
     waiting_on: Option<String>,
+    waiting_on_peer: Option<PeerArgs>,
     due: Option<String>,
     id: Option<String>,
     board: Option<String>,
 }
 
+/// The correspondent to listen for, as the model reads it off the conversation
+/// — never derived from `waiting_on`, which is a name.
+#[derive(Deserialize)]
+struct PeerArgs {
+    platform: String,
+    peer_id: String,
+}
+
 pub struct TaskTool {
     tasks: Arc<dyn TaskRepository>,
+    /// Registers and retires the standing wake a `waiting` task holds. `None` =
+    /// this runtime has no wakeup store, and `waiting` is a label again.
+    waiting: Option<Arc<TaskWaiting>>,
 }
 
 impl TaskTool {
     pub fn new(tasks: Arc<dyn TaskRepository>) -> Self {
-        Self { tasks }
+        Self {
+            tasks,
+            waiting: None,
+        }
+    }
+
+    pub fn with_waiting(mut self, waiting: Arc<TaskWaiting>) -> Self {
+        self.waiting = Some(waiting);
+        self
+    }
+
+    /// Bring the task's wake in line with what it now says, before it is
+    /// written — one task change, one row write. A failure here is reported as
+    /// the tool's error: a `waiting` task the store never registered looks
+    /// identical to one that will be woken, and the model has to know which.
+    async fn sync_wait(&self, task: &mut Task) -> Result<(), ToolError> {
+        let Some(waiting) = &self.waiting else {
+            return Ok(());
+        };
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        waiting
+            .sync(task, now)
+            .await
+            .map_err(|e| ToolError::Failed(e.context("could not update this task's wake")))
     }
 }
 
@@ -60,6 +103,9 @@ fn render(task: &Task) -> String {
     if !task.waiting_on.is_empty() {
         line.push_str(&format!(" (waiting on: {})", task.waiting_on));
     }
+    if task.status == TaskStatus::Waiting && task.waiting_on_peer.is_none() {
+        line.push_str(" [不可唤醒]");
+    }
     if let Some(due) = task.due_at {
         line.push_str(&format!(" (due {})", local_time(due)));
     }
@@ -81,6 +127,8 @@ impl Tool for TaskTool {
          when it is already actionable, waiting_on when it is a commitment to/from \
          someone); action=\"list\" shows open tasks; action=\"update\" changes \
          status/due/waiting_on/title/note/board by id; action=\"complete\" marks a task done. \
+         With status=\"waiting\", pass waiting_on_peer when you know the channel address of \
+         the person being waited on — their next message then reopens this task. \
          Optional `board` groups tasks by project; pass it on list to filter. \
          Tasks with a due time are delivered as notifications by the gateway."
     }
@@ -110,6 +158,15 @@ impl Tool for TaskTool {
                 "waiting_on": {
                     "type": "string",
                     "description": "Who this task waits on / was promised to (optional)."
+                },
+                "waiting_on_peer": {
+                    "type": "object",
+                    "properties": {
+                        "platform": { "type": "string", "description": "Channel the person writes on (\"feishu\", \"telegram\", \"wechat\")." },
+                        "peer_id": { "type": "string", "description": "That channel's id for them, as it appears on their messages." }
+                    },
+                    "required": ["platform", "peer_id"],
+                    "description": "The address of the person this waits on, taken from the conversation — NOT guessed from their name. With it, their next message brings this task back; without it the task still waits, but nothing will wake it."
                 },
                 "due": {
                     "type": "string",
@@ -147,6 +204,9 @@ impl Tool for TaskTool {
                 if let Some(waiting_on) = args.waiting_on {
                     task.waiting_on = waiting_on;
                 }
+                if let Some(peer) = args.waiting_on_peer {
+                    task.waiting_on_peer = Some(ChannelPeer::new(peer.platform, peer.peer_id));
+                }
                 if let Some(due) = args.due {
                     task.due_at =
                         Some(parse_due(&due).map_err(|e| ToolError::InvalidInput(e.to_string()))?);
@@ -154,6 +214,7 @@ impl Tool for TaskTool {
                 if let Some(board) = args.board {
                     task.board = board;
                 }
+                self.sync_wait(&mut task).await?;
                 self.tasks.save(&task).await?;
                 Ok(ToolOutput::text(format!("Captured: {}", render(&task)))
                     .with_structured(json!({ "id": task.id, "status": task.status.as_str() })))
@@ -202,6 +263,9 @@ impl Tool for TaskTool {
                 if let Some(waiting_on) = args.waiting_on {
                     task.waiting_on = waiting_on;
                 }
+                if let Some(peer) = args.waiting_on_peer {
+                    task.waiting_on_peer = Some(ChannelPeer::new(peer.platform, peer.peer_id));
+                }
                 if let Some(due) = args.due {
                     task.due_at =
                         Some(parse_due(&due).map_err(|e| ToolError::InvalidInput(e.to_string()))?);
@@ -211,6 +275,7 @@ impl Tool for TaskTool {
                 if let Some(board) = args.board {
                     task.board = board;
                 }
+                self.sync_wait(&mut task).await?;
                 self.tasks.update(&task).await?;
                 Ok(ToolOutput::text(format!("Updated: {}", render(&task)))
                     .with_structured(json!({ "id": task.id, "status": task.status.as_str() })))
@@ -226,6 +291,7 @@ impl Tool for TaskTool {
                     })?;
                 task.status = TaskStatus::Done;
                 task.completed_at = Some(time::OffsetDateTime::now_utc().unix_timestamp());
+                self.sync_wait(&mut task).await?;
                 self.tasks.update(&task).await?;
                 Ok(ToolOutput::text(format!("Completed: {}", task.title))
                     .with_structured(json!({ "id": task.id, "status": "done" })))
@@ -294,6 +360,15 @@ mod tests {
                 .unwrap()
                 .iter()
                 .find(|t| t.source == source && t.source_message_id == source_message_id)
+                .cloned())
+        }
+        async fn find_by_wakeup_id(&self, wakeup_id: &str) -> anyhow::Result<Option<Task>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.wakeup_id.as_deref() == Some(wakeup_id))
                 .cloned())
         }
     }
@@ -406,5 +481,126 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
         assert!(err.to_string().contains("unknown task status"));
+    }
+
+    // --- the standing wake a `waiting` task holds (§3.7) ---------------------
+
+    #[derive(Default)]
+    struct MemWakeups(std::sync::Mutex<Vec<komo_core::domain::wakeup::WakeupRegistration>>);
+
+    #[async_trait]
+    impl komo_core::domain::wakeup::WakeupRepository for MemWakeups {
+        async fn save(
+            &self,
+            registration: &komo_core::domain::wakeup::WakeupRegistration,
+        ) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(registration.clone());
+            Ok(())
+        }
+        async fn list(&self) -> anyhow::Result<Vec<komo_core::domain::wakeup::WakeupRegistration>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        async fn take(&self, id: &str) -> anyhow::Result<bool> {
+            let mut rows = self.0.lock().unwrap();
+            let before = rows.len();
+            rows.retain(|r| r.id != id);
+            Ok(rows.len() != before)
+        }
+        async fn take_for_turn(&self, _session: &str, _turn: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    struct MemHome;
+
+    #[async_trait]
+    impl komo_core::domain::home::HomeRepository for MemHome {
+        async fn get(&self) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn set(&self, _address: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn home_session(&self) -> anyhow::Result<String> {
+            Ok("home-session".to_string())
+        }
+    }
+
+    fn waking_tool() -> (TaskTool, Arc<MemTasks>, Arc<MemWakeups>) {
+        let repo = Arc::new(MemTasks::default());
+        let wakeups = Arc::new(MemWakeups::default());
+        let waiting = Arc::new(TaskWaiting::new(wakeups.clone(), Arc::new(MemHome)));
+        (
+            TaskTool::new(repo.clone()).with_waiting(waiting),
+            repo,
+            wakeups,
+        )
+    }
+
+    /// An address makes a commitment wakeable; the id of the wake it registered
+    /// lives on the task, and completing it takes the wake with it.
+    #[tokio::test]
+    async fn a_commitment_with_an_address_registers_a_wake_and_completing_it_retires_it() {
+        use komo_core::domain::wakeup::WakeupRepository;
+
+        let (tool, repo, wakeups) = waking_tool();
+        tool.call(
+            json!({
+                "action": "capture",
+                "title": "等张三的方案",
+                "status": "waiting",
+                "waiting_on": "张三",
+                "waiting_on_peer": { "platform": "feishu", "peer_id": "ou_x" }
+            }),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+
+        let (id, wake) = {
+            let rows = repo.rows.lock().unwrap();
+            (rows[0].id.clone(), rows[0].wakeup_id.clone())
+        };
+        let registered = wakeups.list().await.unwrap();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(wake.as_deref(), Some(registered[0].id.as_str()));
+        assert_eq!(
+            registered[0].wakeup,
+            komo_core::domain::session_event::Wakeup::Event {
+                filter: komo_core::domain::session_event::EventFilter::FromPeer {
+                    platform: "feishu".into(),
+                    peer_id: "ou_x".into()
+                }
+            }
+        );
+
+        tool.call(json!({"action":"complete","id":id}), &ctx())
+            .await
+            .unwrap();
+        assert!(wakeups.list().await.unwrap().is_empty());
+        assert_eq!(repo.rows.lock().unwrap()[0].wakeup_id, None);
+    }
+
+    /// A name is not an address. The commitment stands, nothing listens, and
+    /// the listing says so rather than implying somebody is watching.
+    #[tokio::test]
+    async fn a_commitment_naming_only_a_person_is_listed_as_unwakeable() {
+        use komo_core::domain::wakeup::WakeupRepository;
+
+        let (tool, _repo, wakeups) = waking_tool();
+        tool.call(
+            json!({"action":"capture","title":"周报","status":"waiting","waiting_on":"boss"}),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(wakeups.list().await.unwrap().is_empty());
+
+        let listed = tool
+            .call(json!({"action":"list"}), &ctx())
+            .await
+            .unwrap()
+            .text;
+        assert!(listed.contains("[不可唤醒]"), "{listed}");
     }
 }

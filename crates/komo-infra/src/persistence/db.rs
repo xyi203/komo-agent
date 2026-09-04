@@ -430,8 +430,8 @@ impl Db {
             ensure_table(p, WAKEUP_TABLE, WAKEUP_TABLE_DDL).await?;
             // The durable tables keep their own schema knowledge in their own
             // modules; they are migrated in place and never dropped to be
-            // rebuilt. (`task_records` has gained no column since it was
-            // created — when it does, it gets an `ensure_schema` of its own.)
+            // rebuilt.
+            super::kanban::ensure_schema(p).await?;
             super::cron::ensure_schema(p).await?;
             crate::memory::memory_db::ensure_schema(p).await?;
         }

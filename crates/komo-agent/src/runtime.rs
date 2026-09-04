@@ -2321,7 +2321,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_wait_stops_the_turn_and_says_when_to_come_back() {
         let db = Arc::new(Db::connect(&sqlite_url("komo_rt_wait.db")).await.unwrap());
-        let rt = waiting_runtime(db.clone(), Arc::new(WaitTool), r#"{"until":"2h"}"#);
+        let rt = waiting_runtime(db.clone(), Arc::new(WaitTool::new()), r#"{"until":"2h"}"#);
 
         let outcome = rt
             .handle_input("cli:timer", "check back in two hours".into())
@@ -2392,7 +2392,7 @@ pub(crate) mod tests {
         );
 
         // 1. A turn stops on a timer, and the process ends.
-        let rt = waiting_runtime(db.clone(), Arc::new(WaitTool), r#"{"until":"2h"}"#);
+        let rt = waiting_runtime(db.clone(), Arc::new(WaitTool::new()), r#"{"until":"2h"}"#);
         assert!(
             rt.handle_input("cli:fired", "wait for it".into())
                 .await
@@ -2406,7 +2406,7 @@ pub(crate) mod tests {
         //    the registration, checks the log still says "waiting", and fires.
         let rt = Arc::new(waiting_runtime(
             db.clone(),
-            Arc::new(WaitTool),
+            Arc::new(WaitTool::new()),
             r#"{"until":"2h"}"#,
         ));
         let sweep = crate::daemon::CronJobSweep {
@@ -4314,7 +4314,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let args = format!(r#"{{"for_task":"{task_id}"}}"#);
-        let rt = waiting_runtime(db.clone(), Arc::new(WaitTool), &args);
+        let rt = waiting_runtime(db.clone(), Arc::new(WaitTool::new()), &args);
         assert!(
             rt.handle_input("cli:bgwait", "tell me when it is done".into())
                 .await
@@ -4328,7 +4328,7 @@ pub(crate) mod tests {
         tasks.attach_dispatch(Arc::new(TaskWaker {
             continuation: Some(Arc::new(waiting_runtime(
                 db.clone(),
-                Arc::new(WaitTool),
+                Arc::new(WaitTool::new()),
                 &args,
             ))),
             fresh: None,

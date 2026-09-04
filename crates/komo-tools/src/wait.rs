@@ -13,11 +13,13 @@
 //! - `until` — a relative delay (`2h`) or a local wall-clock time
 //!   (`2026-09-03 09:00`). The sweep fires it; this is what lets a routine
 //!   check something, wait, and check again inside one turn.
-//! - `for_task` — a background task this turn started. The task runtime is
-//!   §5.9 and does not exist yet, so **nothing fires this today**: the
-//!   registration is written and, having no deadline of its own (the task's
-//!   own timeout is meant to be the deadline), it stands until something
-//!   settles the task.
+//! - `for_task` — a background task this turn started, **or** a kanban task
+//!   waiting on somebody. Two id spaces of the same shape (both UUIDv7), so
+//!   the kanban store is asked first and anything it does not know is a
+//!   background task: a kanban task that names an address becomes a wait for
+//!   that person's next message (deadline: the task's own `due_at`), and a
+//!   background task stands until it settles, its own timeout being the
+//!   deadline.
 //! - `for_event` — a named inbound webhook. The ingress is §5.12 and does not
 //!   exist yet either, so today this stands until its 30-day expiry brings the
 //!   turn back saying nothing arrived.
@@ -29,9 +31,12 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use std::sync::Arc;
+
 use komo_core::domain::{
     context::{ToolContext, WaitRefused},
     session_event::{EventFilter, Wakeup, WakeupCause},
+    task::TaskRepository,
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
@@ -58,7 +63,48 @@ struct EventArgs {
     webhook: String,
 }
 
-pub struct WaitTool;
+pub struct WaitTool {
+    /// The kanban store, so `for_task` can tell a commitment from a background
+    /// job. `None` = every `for_task` is a background task, which is what it
+    /// was before §5.10.
+    tasks: Option<Arc<dyn TaskRepository>>,
+}
+
+impl WaitTool {
+    pub fn new() -> Self {
+        Self { tasks: None }
+    }
+
+    pub fn with_tasks(mut self, tasks: Arc<dyn TaskRepository>) -> Self {
+        self.tasks = Some(tasks);
+        self
+    }
+
+    /// A kanban task's wait, if this id names one that can be woken at all.
+    ///
+    /// A commitment with only a name attached is *not* a wait: registering one
+    /// would park the turn on something nothing can fire, and the model is
+    /// better told that than left waiting out a 30-day expiry.
+    async fn kanban_wait(&self, id: &str) -> Option<(Wakeup, Option<i64>)> {
+        let task = self.tasks.as_ref()?.find(id).await.ok().flatten()?;
+        let peer = task.waiting_on_peer?;
+        Some((
+            Wakeup::Event {
+                filter: EventFilter::FromPeer {
+                    platform: peer.platform,
+                    peer_id: peer.peer_id,
+                },
+            },
+            task.due_at,
+        ))
+    }
+}
+
+impl Default for WaitTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 impl Tool for WaitTool {
@@ -86,7 +132,7 @@ impl Tool for WaitTool {
                 },
                 "for_task": {
                     "type": "string",
-                    "description": "Id of a background task to wait for."
+                    "description": "Id of a background task to wait for, or of a kanban task that is waiting on someone (then this turn resumes when they write)."
                 },
                 "for_event": {
                     "type": "object",
@@ -123,16 +169,26 @@ impl Tool for WaitTool {
         }
 
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let wakeup = match (args.until, args.for_task, args.for_event) {
-            (Some(until), None, None) => Wakeup::At {
-                at: parse_until(&until, now).map_err(|e| ToolError::InvalidInput(e.to_string()))?,
-            },
-            (None, Some(task_id), None) => Wakeup::TaskDone { task_id },
-            (None, None, Some(event)) => Wakeup::Event {
-                filter: EventFilter::Webhook {
-                    name: event.webhook,
+        let (wakeup, expires_at) = match (args.until, args.for_task, args.for_event) {
+            (Some(until), None, None) => (
+                Wakeup::At {
+                    at: parse_until(&until, now)
+                        .map_err(|e| ToolError::InvalidInput(e.to_string()))?,
                 },
+                None,
+            ),
+            (None, Some(task_id), None) => match self.kanban_wait(&task_id).await {
+                Some((wakeup, due_at)) => (wakeup, due_at),
+                None => (Wakeup::TaskDone { task_id }, None),
             },
+            (None, None, Some(event)) => (
+                Wakeup::Event {
+                    filter: EventFilter::Webhook {
+                        name: event.webhook,
+                    },
+                },
+                None,
+            ),
             _ => {
                 return Err(ToolError::InvalidInput(
                     "pass exactly one of `until`, `for_task`, `for_event`".into(),
@@ -141,7 +197,7 @@ impl Tool for WaitTool {
         };
 
         let summary = summarize(&wakeup);
-        match ctx.wait_for(wakeup, summary.clone(), None) {
+        match ctx.wait_for(wakeup, summary.clone(), expires_at) {
             // Discarded: the turn ends here, and this call is re-dispatched
             // when the wake arrives.
             Ok(()) => Ok(ToolOutput::text(format!("Waiting {summary}."))),
@@ -282,7 +338,10 @@ mod tests {
     #[tokio::test]
     async fn a_delay_stops_the_turn_on_a_timer() {
         let ctx = ctx();
-        WaitTool.call(v(r#"{"until":"2h"}"#), &ctx).await.unwrap();
+        WaitTool::new()
+            .call(v(r#"{"until":"2h"}"#), &ctx)
+            .await
+            .unwrap();
         let pending = ctx
             .run
             .as_ref()
@@ -312,7 +371,10 @@ mod tests {
                 payload: String::new(),
             }),
         });
-        let out = WaitTool.call(v(r#"{"until":"2h"}"#), &ctx).await.unwrap();
+        let out = WaitTool::new()
+            .call(v(r#"{"until":"2h"}"#), &ctx)
+            .await
+            .unwrap();
         assert!(out.text.contains("The wait is over"), "{}", out.text);
         assert!(ctx.run.as_ref().unwrap().suspension().is_none());
     }
@@ -327,7 +389,10 @@ mod tests {
             taken: vec![Wakeup::At { at: 1 }; WAIT_BUDGET_PER_TURN],
             resumed: None,
         });
-        let out = WaitTool.call(v(r#"{"until":"2h"}"#), &ctx).await.unwrap();
+        let out = WaitTool::new()
+            .call(v(r#"{"until":"2h"}"#), &ctx)
+            .await
+            .unwrap();
         assert!(out.text.contains("budget exhausted"), "{}", out.text);
         assert!(
             ctx.run.as_ref().unwrap().suspension().is_none(),
@@ -341,7 +406,7 @@ mod tests {
         for bad in [r#"{}"#, r#"{"until":"2h","for_task":"t1"}"#] {
             assert!(
                 matches!(
-                    WaitTool.call(v(bad), &ctx).await,
+                    WaitTool::new().call(v(bad), &ctx).await,
                     Err(ToolError::InvalidInput(_))
                 ),
                 "{bad}"
@@ -356,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn an_event_wait_is_registered_with_its_filter() {
         let ctx = ctx();
-        WaitTool
+        WaitTool::new()
             .call(v(r#"{"for_event":{"webhook":"ci-done"}}"#), &ctx)
             .await
             .unwrap();
@@ -408,5 +473,123 @@ mod tests {
         let text = describe(&wakeup, WakeupCause::Expired, "");
         assert!(text.contains("ran out"), "{text}");
         assert!(text.contains("ci"), "{text}");
+    }
+
+    /// A kanban commitment and a background job share an id shape, so the
+    /// kanban store decides: a task that names an address becomes a wait for
+    /// that person, deadlined by the task's own `due_at`.
+    #[tokio::test]
+    async fn waiting_for_a_kanban_task_waits_for_the_person_it_waits_on() {
+        use komo_core::domain::session::ChannelPeer;
+        use komo_core::domain::task::{Task, TaskStatus};
+
+        let mut task = Task::new("等张三的方案".into());
+        task.status = TaskStatus::Waiting;
+        task.waiting_on_peer = Some(ChannelPeer::new("feishu", "ou_x"));
+        task.due_at = Some(9_000);
+        let id = task.id.clone();
+        let tool = WaitTool::new().with_tasks(Arc::new(MemoryTasks(vec![task])));
+
+        let ctx = ctx();
+        tool.call(v(&format!(r#"{{"for_task":"{id}"}}"#)), &ctx)
+            .await
+            .unwrap();
+        let pending = ctx.run.as_ref().unwrap().suspension().unwrap();
+        assert_eq!(
+            pending.wakeup,
+            Wakeup::Event {
+                filter: EventFilter::FromPeer {
+                    platform: "feishu".into(),
+                    peer_id: "ou_x".into()
+                }
+            }
+        );
+        assert_eq!(
+            pending.expires_at,
+            Some(9_000),
+            "the commitment's deadline is the wait's"
+        );
+    }
+
+    /// Anything the kanban store does not know — and any commitment carrying
+    /// only a name — is a background task, which is what `for_task` always was.
+    #[tokio::test]
+    async fn an_unknown_id_is_still_a_background_task() {
+        use komo_core::domain::task::Task;
+
+        let unwakeable = Task::new("等张三".into());
+        let id = unwakeable.id.clone();
+        let tool = WaitTool::new().with_tasks(Arc::new(MemoryTasks(vec![unwakeable])));
+
+        for task_id in [id.as_str(), "bg-1"] {
+            let ctx = ctx();
+            tool.call(v(&format!(r#"{{"for_task":"{task_id}"}}"#)), &ctx)
+                .await
+                .unwrap();
+            let pending = ctx.run.as_ref().unwrap().suspension().unwrap();
+            assert!(
+                matches!(pending.wakeup, Wakeup::TaskDone { .. }),
+                "{task_id}"
+            );
+        }
+    }
+
+    /// Back from a task wait, the call returns what arrived — the message text
+    /// is the whole point of having waited.
+    #[tokio::test]
+    async fn a_message_that_ended_a_task_wait_comes_back_as_its_text() {
+        let ctx = ctx();
+        let wakeup = Wakeup::Event {
+            filter: EventFilter::FromPeer {
+                platform: "feishu".into(),
+                peer_id: "ou_x".into(),
+            },
+        };
+        ctx.run.as_ref().unwrap().resumed_with(TurnWaits {
+            taken: vec![wakeup.clone()],
+            resumed: Some(ResumedWait {
+                call_id: "c1".into(),
+                wakeup,
+                cause: WakeupCause::Event,
+                payload: "方案发你了".into(),
+            }),
+        });
+        let out = WaitTool::new()
+            .call(v(r#"{"for_task":"task-1"}"#), &ctx)
+            .await
+            .unwrap();
+        assert!(out.text.contains("方案发你了"), "{}", out.text);
+        assert!(ctx.run.as_ref().unwrap().suspension().is_none());
+    }
+
+    struct MemoryTasks(Vec<komo_core::domain::task::Task>);
+
+    #[async_trait]
+    impl komo_core::domain::task::TaskRepository for MemoryTasks {
+        async fn save(&self, _task: &komo_core::domain::task::Task) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find(&self, id: &str) -> anyhow::Result<Option<komo_core::domain::task::Task>> {
+            Ok(self.0.iter().find(|t| t.id == id).cloned())
+        }
+        async fn list_open(&self) -> anyhow::Result<Vec<komo_core::domain::task::Task>> {
+            Ok(self.0.clone())
+        }
+        async fn update(&self, _task: &komo_core::domain::task::Task) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find_by_source_message_id(
+            &self,
+            _source: &str,
+            _key: &str,
+        ) -> anyhow::Result<Option<komo_core::domain::task::Task>> {
+            Ok(None)
+        }
+        async fn find_by_wakeup_id(
+            &self,
+            _wakeup_id: &str,
+        ) -> anyhow::Result<Option<komo_core::domain::task::Task>> {
+            Ok(None)
+        }
     }
 }

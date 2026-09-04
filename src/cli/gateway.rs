@@ -4,6 +4,7 @@ use komo_agent::interaction::{
     ApprovalState, ChatApprover, GatewayDispatcher, TurnWaker, WaitParts,
 };
 use komo_infra::persistence::db::Db;
+use komo_services::triggers::TriggerMatcher;
 use std::sync::Arc;
 
 use crate::{
@@ -143,6 +144,11 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     let handler: Arc<dyn MessageHandler> = Arc::new(wired.runtime);
     let sessions: Arc<dyn SessionRepository> = db.clone();
     let todos: Arc<dyn SessionTodoRepository> = db.clone();
+    // An inbound message may be the reply a `waiting` kanban Task is holding a
+    // standing wake for (docs/bot-runtime.md §3.7). Built before the
+    // dispatcher because the dispatcher consults it; its way *back* to a turn
+    // is attached below, once the waker exists.
+    let triggers = Arc::new(TriggerMatcher::new(db.clone(), kanban.clone()));
     let dispatcher = Arc::new(
         GatewayDispatcher::new(
             handler.clone(),
@@ -170,7 +176,8 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             runs: db.clone(),
             events: db.clone(),
             wakeups: db.clone(),
-        }),
+        })
+        .with_triggers(triggers.clone()),
     );
 
     // Waking a suspended turn: the scheduler fires, this continues the turn.
@@ -182,6 +189,9 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // task store was built before the dispatcher existed.
     let background = wired.background.clone();
     background.attach_dispatch(waker.clone());
+    // Same late binding, same reason: a triggered wake continues (or opens) a
+    // turn exactly as a sweep's does.
+    triggers.attach_dispatch(waker.clone());
     // The third crash-residue check, after the interrupted runs and the
     // suspended turns: a task the dead process was still running. Settled
     // `uncertain` and never re-run — the process group is gone and whether the

@@ -5,6 +5,8 @@
 
 use async_trait::async_trait;
 
+use super::session::ChannelPeer;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -63,6 +65,14 @@ pub struct Task {
     pub source: String,
     /// Dedup key for automated extraction (reviewer); empty for manual captures.
     pub source_message_id: String,
+    /// Who is being waited on, as an address an inbound message can be compared
+    /// with. `None` = `waiting_on` is only words, and this task cannot be woken
+    /// — never guessed from the name, which is for a human to read
+    /// (docs/bot-runtime.md §3.7).
+    pub waiting_on_peer: Option<ChannelPeer>,
+    /// The standing wake registered while this task is `Waiting`; retired when
+    /// it leaves. `None` = nothing is watching for a reply.
+    pub wakeup_id: Option<String>,
     /// Optional project/grouping label. Empty string = the default board. A
     /// plain string (not a separate model) — multi-project grouping without the
     /// weight of a Project entity (the roadmap §2 escape hatch, as hermes does).
@@ -84,11 +94,20 @@ impl Task {
             due_at: None,
             source: String::new(),
             source_message_id: String::new(),
+            waiting_on_peer: None,
+            wakeup_id: None,
             board: String::new(),
             due_notified_at: None,
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             completed_at: None,
         }
+    }
+
+    /// Whether a reply from the person this waits on could bring it back —
+    /// `Waiting` plus an address to match against. What `komo task list` marks
+    /// when it is false.
+    pub fn is_wakeable(&self) -> bool {
+        self.status == TaskStatus::Waiting && self.waiting_on_peer.is_some()
     }
 }
 
@@ -109,4 +128,9 @@ pub trait TaskRepository: Send + Sync {
         source: &str,
         source_message_id: &str,
     ) -> anyhow::Result<Option<Task>>;
+
+    /// The task that registered this wake, across every status. Read when a
+    /// registration fires, to say which commitment the arriving message is
+    /// about and to clear the id it just spent.
+    async fn find_by_wakeup_id(&self, wakeup_id: &str) -> anyhow::Result<Option<Task>>;
 }
