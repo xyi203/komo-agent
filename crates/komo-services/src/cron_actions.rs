@@ -8,10 +8,51 @@
 
 use komo_core::domain::cron::{
     CronAction, CronJob, CronJobRepository, CronJobSpec, CronJobStatus,
-    DEFAULT_CRON_JOB_TIMEOUT_SECS, MAX_CRON_JOB_NAME_LEN, next_occurrence_local,
-    valid_cron_job_name,
+    DEFAULT_CRON_JOB_TIMEOUT_SECS, MAX_ANY_TRIGGERS, MAX_CRON_JOB_NAME_LEN, Trigger,
+    next_occurrence_local, schedule_is_once, valid_cron_job_name,
 };
 use komo_core::domain::policy::{Matcher, RuleSpec};
+
+/// The one place a schedule *string* becomes a [`Trigger`]: a 5-field cron
+/// expression, or `@at YYYY-MM-DD HH:MM` resolved to the local moment it names.
+/// The `komo cron` CLI and the agent's `cron` tool both hold strings and both
+/// call this; structured triggers (`Any`, and the event-shaped ones) are passed
+/// as themselves and never round-trip through a string at all.
+///
+/// Parsing here also proves the expression schedulable — a past `@at` is
+/// refused while the person who typed it is still there.
+pub fn parse_schedule(schedule: &str, now: i64) -> anyhow::Result<Trigger> {
+    let schedule = schedule.trim();
+    if schedule.is_empty() {
+        anyhow::bail!("a cron job needs a schedule");
+    }
+    let at = next_occurrence_local(schedule, now)?;
+    Ok(match schedule_is_once(schedule) {
+        true => Trigger::At { at },
+        false => Trigger::cron(schedule),
+    })
+}
+
+/// Reject a trigger nothing could act on, before it reaches the store.
+fn validate_trigger(trigger: &Trigger, now: i64) -> anyhow::Result<()> {
+    if let Trigger::Any { triggers } = trigger {
+        if triggers.is_empty() {
+            anyhow::bail!("an `any` trigger needs at least one listener");
+        }
+        if triggers.len() > MAX_ANY_TRIGGERS {
+            anyhow::bail!("an `any` trigger holds at most {MAX_ANY_TRIGGERS} listeners");
+        }
+        if triggers.iter().any(|t| matches!(t, Trigger::Any { .. })) {
+            anyhow::bail!("`any` triggers do not nest");
+        }
+    }
+    // Proves every cron member parses, and that a schedule-shaped trigger still
+    // has a future — a `@at` moment that has passed schedules nothing.
+    if trigger.next_slot(now)?.is_none() && trigger.is_scheduled() {
+        anyhow::bail!("`{}` is already past", trigger.describe());
+    }
+    Ok(())
+}
 
 /// Validate a job spec and create it — schedule parsed with the same cron
 /// parser the sweep uses (so nothing invalid ever reaches the store), name
@@ -79,11 +120,18 @@ pub async fn add_cron_job(
     if jobs.find_by_name(name).await?.is_some() {
         anyhow::bail!("a cron job named `{name}` already exists");
     }
-    // Also proves the expression parses — next_occurrence_local rejects
-    // anything croner can't schedule.
-    let next_run_at = next_occurrence_local(&spec.schedule, now)?;
-    let job = CronJob::new(name, &spec.schedule, action, next_run_at)
+    validate_trigger(&spec.trigger, now)?;
+    // An event-only trigger has no moment to wait for: `0` is what keeps the
+    // sweep from reading "due since the epoch".
+    let next_run_at = spec
+        .trigger
+        .next_slot(now)?
+        .map(|(at, _)| at)
+        .unwrap_or_default();
+    let mut job = CronJob::new(name, spec.trigger, action, next_run_at)
         .with_grants(normalize_grants(spec.grants)?);
+    job.catch_up = spec.catch_up;
+    job.notify = spec.notify;
     jobs.save(&job).await?;
     Ok(job)
 }
@@ -193,7 +241,17 @@ pub async fn set_cron_enabled(
         );
     }
     if enabled && job.status == CronJobStatus::Paused {
-        job.next_run_at = next_occurrence_local(&job.schedule, now)?;
+        job.next_run_at = match job.trigger.next_slot(now)? {
+            Some((at, _)) => at,
+            None if job.trigger.is_scheduled() => anyhow::bail!(
+                "cron job `{name}` has no future occurrence left (`{}` is already past) — \
+                 create a new job to run it again",
+                job.trigger.describe()
+            ),
+            // An event-only routine has nothing to schedule; resuming it just
+            // puts it back in earshot.
+            None => 0,
+        };
     }
     job.status = if enabled {
         CronJobStatus::Active
@@ -280,9 +338,15 @@ mod tests {
     }
 
     fn done_job(name: &str) -> CronJob {
-        let mut job = CronJob::new_command(name, "@at 2020-01-01 08:00", "/bin/true", 0);
+        let mut job = CronJob::new_command(name, Trigger::At { at: 100 }, "/bin/true", 0);
         job.status = CronJobStatus::Done;
-        job.last_run_at = Some(100);
+        let run = job.begin_run(100, "@at".into());
+        job.finish_run(
+            &run,
+            komo_core::domain::cron::RoutineRunStatus::Ok,
+            "",
+            None,
+        );
         job
     }
 
@@ -306,24 +370,32 @@ mod tests {
         );
     }
 
+    fn command_spec(name: &str, trigger: Trigger) -> CronJobSpec {
+        CronJobSpec {
+            catch_up: Default::default(),
+            notify: Default::default(),
+            name: name.into(),
+            trigger,
+            action: CronAction::Command {
+                command: "/bin/true".into(),
+                args: vec![],
+                workdir: None,
+                timeout_secs: 0,
+            },
+            grants: vec![],
+        }
+    }
+
     #[tokio::test]
     async fn add_accepts_a_future_one_shot_and_rejects_a_past_one() {
         let jobs = FakeJobs::default();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let job = add_cron_job(
             &jobs,
-            CronJobSpec {
-                catch_up: Default::default(),
-                name: "reboot-nas".into(),
-                schedule: "@at 2030-01-02 08:30".into(),
-                action: CronAction::Command {
-                    command: "/bin/true".into(),
-                    args: vec![],
-                    workdir: None,
-                    timeout_secs: 0,
-                },
-                grants: vec![],
-            },
+            command_spec(
+                "reboot-nas",
+                parse_schedule("@at 2030-01-02 08:30", now).unwrap(),
+            ),
             now,
         )
         .await
@@ -332,25 +404,111 @@ mod tests {
         assert!(job.next_run_at > now);
         assert_eq!(job.status, CronJobStatus::Active);
 
+        // Refused at the parse, where the person who typed it still is.
+        let err = parse_schedule("@at 2020-01-01 08:00", now).unwrap_err();
+        assert!(err.to_string().contains("already past"), "{err}");
+        // …and again at the store, for a structured trigger that never passed
+        // through a string.
         let err = add_cron_job(
             &jobs,
-            CronJobSpec {
-                catch_up: Default::default(),
-                name: "too-late".into(),
-                schedule: "@at 2020-01-01 08:00".into(),
-                action: CronAction::Command {
-                    command: "/bin/true".into(),
-                    args: vec![],
-                    workdir: None,
-                    timeout_secs: 0,
-                },
-                grants: vec![],
-            },
+            command_spec("too-late", Trigger::At { at: 100 }),
             now,
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("already past"), "{err}");
+        assert!(jobs.find_by_name("too-late").await.unwrap().is_none());
+    }
+
+    /// The single string→trigger parse site: a 5-field expression stays one, an
+    /// `@at` becomes the moment it names.
+    #[tokio::test]
+    async fn parse_schedule_maps_both_written_forms() {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        assert_eq!(
+            parse_schedule("0 8 * * *", now).unwrap(),
+            Trigger::cron("0 8 * * *")
+        );
+        let Trigger::At { at } = parse_schedule("@at 2030-01-02 08:30", now).unwrap() else {
+            panic!("@at is a one-shot moment");
+        };
+        assert!(at > now);
+        assert!(parse_schedule("not a cron", now).is_err());
+        assert!(parse_schedule("  ", now).is_err());
+    }
+
+    /// An event-only routine is stored with no moment at all, so the sweep
+    /// reads it as waiting rather than as due since the epoch.
+    #[tokio::test]
+    async fn an_event_only_trigger_schedules_nothing() {
+        let jobs = FakeJobs::default();
+        let job = add_cron_job(
+            &jobs,
+            command_spec("on-ci", Trigger::Webhook { name: "ci".into() }),
+            1000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(job.next_run_at, 0);
+        assert!(!job.is_due(i64::MAX));
+    }
+
+    /// `Any` schedules to its soonest member, and its shape is checked before
+    /// it is stored.
+    #[tokio::test]
+    async fn an_any_trigger_is_bounded_and_schedules_to_its_soonest_member() {
+        let jobs = FakeJobs::default();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let soon = now + 60;
+        let job = add_cron_job(
+            &jobs,
+            command_spec(
+                "either",
+                Trigger::Any {
+                    triggers: vec![Trigger::cron("0 8 * * *"), Trigger::At { at: soon }],
+                },
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(job.next_run_at, soon);
+
+        for bad in [
+            Trigger::Any { triggers: vec![] },
+            Trigger::Any {
+                triggers: vec![Trigger::cron("0 8 * * *"); MAX_ANY_TRIGGERS + 1],
+            },
+            Trigger::Any {
+                triggers: vec![Trigger::Any {
+                    triggers: vec![Trigger::cron("0 8 * * *")],
+                }],
+            },
+            Trigger::Any {
+                triggers: vec![Trigger::cron("not a cron")],
+            },
+        ] {
+            assert!(
+                add_cron_job(&jobs, command_spec("nope", bad.clone()), now)
+                    .await
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// The two per-job settings the operator gives at creation are stored, not
+    /// dropped for the defaults.
+    #[tokio::test]
+    async fn catch_up_and_notify_survive_creation() {
+        use komo_core::domain::cron::{CatchUp, NotifyPolicy};
+        let jobs = FakeJobs::default();
+        let mut spec = command_spec("lights", Trigger::cron("0 23 * * *"));
+        spec.catch_up = CatchUp::Skip;
+        spec.notify = NotifyPolicy::OnError;
+        let job = add_cron_job(&jobs, spec, 1000).await.unwrap();
+        assert_eq!(job.catch_up, CatchUp::Skip);
+        assert_eq!(job.notify, NotifyPolicy::OnError);
     }
 
     fn spec(category: &str, matcher: &str, value: &str) -> RuleSpec {
@@ -417,8 +575,9 @@ mod tests {
     fn agent_spec(name: &str, workspace: Option<&str>) -> CronJobSpec {
         CronJobSpec {
             catch_up: Default::default(),
+            notify: Default::default(),
             name: name.into(),
-            schedule: "0 8 * * *".into(),
+            trigger: Trigger::cron("0 8 * * *"),
             action: CronAction::Agent {
                 prompt: "tidy up".into(),
                 skills: vec![],

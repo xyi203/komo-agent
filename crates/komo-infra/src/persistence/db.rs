@@ -3383,7 +3383,7 @@ mod tests {
             &jobs,
             &CronJob::new(
                 "nightly",
-                "0 3 * * *",
+                komo_core::domain::cron::Trigger::cron("0 3 * * *"),
                 CronAction::Command {
                     command: "/opt/backup.sh".into(),
                     args: Vec::new(),

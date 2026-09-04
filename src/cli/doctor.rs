@@ -54,7 +54,7 @@ pub async fn doctor(config: &ConfigSnapshot, control: &OperatorControl) -> anyho
 /// Scheduled cron jobs (cron.db): count, disabled ones, and any whose last run
 /// failed — the operator's "is my weekly job actually running" glance.
 async fn cron_health(control: &OperatorControl) {
-    use crate::domain::cron::{CronJobStatus, CronRunStatus};
+    use crate::domain::cron::{CronJobStatus, RoutineRunStatus};
     println!("\ncron jobs:");
     let fetched = control
         .query(OperatorQuery::CronJobs)
@@ -77,7 +77,7 @@ async fn cron_health(control: &OperatorControl) {
     for job in &jobs {
         let mark = if job.status != CronJobStatus::Active {
             OFF
-        } else if job.last_status == Some(CronRunStatus::Failed) {
+        } else if job.last_run().map(|r| r.status) == Some(RoutineRunStatus::Error) {
             BAD
         } else {
             OK
@@ -87,13 +87,19 @@ async fn cron_health(control: &OperatorControl) {
             CronJobStatus::Paused => "paused".to_string(),
             CronJobStatus::Done => "done".to_string(),
         };
-        let last = match (&job.last_status, job.last_run_at) {
-            (Some(status), Some(at)) => {
-                format!(", last {} {}", status.as_str(), local_time(at))
-            }
-            _ => String::new(),
+        let last = match job.last_run() {
+            Some(run) => format!(
+                ", last {} {}",
+                run.status.as_str(),
+                local_time(run.started_at)
+            ),
+            None => String::new(),
         };
-        println!("  {mark} {}  [{}]  {state}{last}", job.name, job.schedule);
+        println!(
+            "  {mark} {}  [{}]  {state}{last}",
+            job.name,
+            job.trigger.describe()
+        );
     }
 }
 

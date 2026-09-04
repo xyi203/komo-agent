@@ -259,6 +259,9 @@ enum CronAction {
         /// once, if it is late by less than the job's own interval.
         #[arg(long)]
         skip_missed: bool,
+        /// Where each run's outcome goes: always (default), on_error, never.
+        #[arg(long, default_value = "always")]
+        notify: String,
     },
     /// Add an agent job: the gateway runs a prompt through an unattended,
     /// tool-capable agent turn on schedule and delivers the reply. Side effects
@@ -288,6 +291,9 @@ enum CronAction {
         /// Never run a slot the gateway slept through (see `cron add`).
         #[arg(long)]
         skip_missed: bool,
+        /// Where each run's outcome goes: always (default), on_error, never.
+        #[arg(long, default_value = "always")]
+        notify: String,
     },
     /// Remove a scheduled job by name
     Remove { name: String },
@@ -587,12 +593,13 @@ pub async fn run() -> anyhow::Result<()> {
                 workdir,
                 timeout_secs,
                 skip_missed,
+                notify,
             } => {
                 inspect::cron_add(
                     &operator(&config).await?,
                     crate::domain::cron::CronJobSpec {
                         name,
-                        schedule,
+                        trigger: parse_schedule_arg(&schedule)?,
                         action: crate::domain::cron::CronAction::Command {
                             command,
                             args,
@@ -603,6 +610,7 @@ pub async fn run() -> anyhow::Result<()> {
                         // approver in the loop — nothing to grant.
                         grants: Vec::new(),
                         catch_up: catch_up_of(skip_missed),
+                        notify: notify_of(&notify)?,
                     },
                 )
                 .await
@@ -615,6 +623,7 @@ pub async fn run() -> anyhow::Result<()> {
                 workspace,
                 grants,
                 skip_missed,
+                notify,
             } => {
                 let grants = grants
                     .iter()
@@ -624,7 +633,7 @@ pub async fn run() -> anyhow::Result<()> {
                     &operator(&config).await?,
                     crate::domain::cron::CronJobSpec {
                         name,
-                        schedule,
+                        trigger: parse_schedule_arg(&schedule)?,
                         action: crate::domain::cron::CronAction::Agent {
                             prompt,
                             skills,
@@ -632,6 +641,7 @@ pub async fn run() -> anyhow::Result<()> {
                         },
                         grants,
                         catch_up: catch_up_of(skip_missed),
+                        notify: notify_of(&notify)?,
                     },
                 )
                 .await
@@ -887,4 +897,26 @@ fn catch_up_of(skip_missed: bool) -> crate::domain::cron::CatchUp {
     } else {
         crate::domain::cron::CatchUp::Late
     }
+}
+
+/// `--notify` as a [`NotifyPolicy`]. Refused rather than defaulted: a typo that
+/// silently means "always" would be discovered only by the notification the
+/// operator asked not to get.
+fn notify_of(value: &str) -> anyhow::Result<crate::domain::cron::NotifyPolicy> {
+    use crate::domain::cron::NotifyPolicy;
+    match value.trim() {
+        "always" => Ok(NotifyPolicy::Always),
+        "on_error" => Ok(NotifyPolicy::OnError),
+        "never" => Ok(NotifyPolicy::Never),
+        other => anyhow::bail!("invalid --notify `{other}` (always | on_error | never)"),
+    }
+}
+
+/// A schedule typed on the command line, through the shared parse site — so a
+/// CLI job and a chat-created one accept exactly the same expressions.
+fn parse_schedule_arg(schedule: &str) -> anyhow::Result<crate::domain::cron::Trigger> {
+    komo_services::cron_actions::parse_schedule(
+        schedule,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    )
 }

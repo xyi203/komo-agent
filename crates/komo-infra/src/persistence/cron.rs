@@ -16,21 +16,22 @@ use async_trait::async_trait;
 use super::db::Db;
 use crate::persistence::with_write_retry;
 use komo_core::domain::cron::{
-    CronAction, CronJob, CronJobRepository, parse_catch_up, parse_cron_job_status,
-    parse_cron_run_status,
+    CronAction, CronJob, CronJobRepository, RoutineRun, Trigger, once_moment_local, parse_catch_up,
+    parse_cron_job_status, parse_notify_policy, parse_routine_run_status, schedule_is_once,
 };
 use komo_core::domain::policy::RuleSpec;
 
 // Optional i64 fields use 0 as the "unset" sentinel; `args` is a JSON array
-// string; `status` is "active"/"paused"/"done"; `last_status` is
-// ""/"ok"/"failed" (same conventions as the other stores).
+// string; `status` is "active"/"paused"/"done" (same conventions as the other
+// stores).
 #[derive(Debug, toasty::Model)]
 pub(crate) struct CronJobRecord {
     #[key]
     id: String,
     #[index]
     name: String,
-    schedule: String,
+    /// JSON `Trigger` — what makes the routine fire.
+    trigger: String,
     /// "command" | "agent" — discriminates the columns below.
     kind: String,
     // Command-mode columns (empty/0 for agent jobs).
@@ -44,16 +45,27 @@ pub(crate) struct CronJobRecord {
     status: String,
     /// "late" | "skip" — what to do with a missed slot. Additive column.
     catch_up: String,
+    /// "always" | "on_error" | "never" — where a run's outcome is delivered.
+    notify: String,
     next_run_at: i64,
-    last_run_at: i64,
-    last_status: String,
     last_error: String,
-    last_output: String,
-    last_run_session: String,
+    /// JSON array of `RoutineRun`, newest last, capped at
+    /// `ROUTINE_RUN_HISTORY`. Empty string = never ran.
+    runs: String,
     /// JSON array of `RuleSpec` — the actions this job may take unattended.
     /// Empty string = no grants (every job written before the column existed).
     grants: String,
     created_at: i64,
+    // Retired columns, still written because the table is durable: dropping a
+    // column is a non-additive change, and one declared NOT NULL without a
+    // default fails every insert that stops mentioning it. `trigger` replaced
+    // `schedule`, `runs` replaced the four `last_*` run fields; both were
+    // read once by `backfill_triggers` and are dead from then on.
+    schedule: String,
+    last_run_at: i64,
+    last_status: String,
+    last_output: String,
+    last_run_session: String,
 }
 
 /// Columns added to `cron_job_records` after a `komo.db` was created. Extend
@@ -71,13 +83,17 @@ const EXPECTED: &[(&str, &str)] = &[
         "last_run_session",
         "\"last_run_session\" text NOT NULL DEFAULT ''",
     ),
+    ("trigger", "\"trigger\" text NOT NULL DEFAULT ''"),
+    ("runs", "\"runs\" text NOT NULL DEFAULT ''"),
+    ("notify", "\"notify\" text NOT NULL DEFAULT 'always'"),
 ];
 
 /// Bring an existing file's `cron_job_records` up to the current column set,
 /// before toasty opens it.
 pub(crate) async fn ensure_schema(path: &Path) -> anyhow::Result<()> {
     crate::persistence::ensure_columns(path, "cron_job_records", EXPECTED).await?;
-    migrate_enabled_to_status(path).await
+    migrate_enabled_to_status(path).await?;
+    backfill_triggers(path).await
 }
 
 /// Every job in a legacy `cron.db`, for the one-time merge into `komo.db`.
@@ -145,6 +161,102 @@ async fn migrate_enabled_to_status(path: &std::path::Path) -> anyhow::Result<()>
     Ok(())
 }
 
+/// One-time repair of rows written before `Trigger` and `runs` existed: the old
+/// `schedule` string becomes a stored trigger, and the four `last_*` fields
+/// become the single run they described.
+///
+/// A **repair**, not a read-path fallback: the read path knows only the new
+/// columns, so nothing downstream branches on which shape a row was written in.
+/// Idempotent by construction — only rows whose `trigger` is still empty are
+/// touched, and every row this writes gets a non-empty one. The retired columns
+/// are left where they are: `cron_job_records` is durable, and dropping a column
+/// is not an additive change.
+async fn backfill_triggers(path: &Path) -> anyhow::Result<()> {
+    let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+        .build()
+        .await
+        .with_context(|| format!("opening {} for the trigger backfill", path.display()))?;
+    let conn = db.connect()?;
+    conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+
+    let mut pending = Vec::new();
+    let mut rows = match conn
+        .query(
+            "SELECT \"id\", \"schedule\", \"last_run_at\", \"last_status\", \"last_output\", \
+             \"last_run_session\" FROM \"cron_job_records\" WHERE \"trigger\" = ''",
+            (),
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        // No table yet: a brand-new file, which push_schema builds with the
+        // current columns and nothing to repair.
+        Err(_) => return Ok(()),
+    };
+    while let Some(row) = rows.next().await? {
+        let text = |i: usize| -> anyhow::Result<String> {
+            Ok(match row.get_value(i)? {
+                turso::Value::Text(s) => s,
+                _ => String::new(),
+            })
+        };
+        let number = |i: usize| -> anyhow::Result<i64> {
+            Ok(match row.get_value(i)? {
+                turso::Value::Integer(n) => n,
+                _ => 0,
+            })
+        };
+        pending.push((text(0)?, text(1)?, number(2)?, text(3)?, text(4)?, text(5)?));
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    for (id, schedule, last_run_at, last_status, last_output, last_run_session) in &pending {
+        let trigger = trigger_from_schedule(schedule);
+        let runs = match (*last_run_at != 0) || !last_status.is_empty() {
+            true => vec![RoutineRun {
+                id: uuid::Uuid::now_v7().to_string(),
+                status: parse_routine_run_status(last_status),
+                started_at: *last_run_at,
+                event: trigger.slot_event(*last_run_at),
+                session_id: (!last_run_session.is_empty()).then(|| last_run_session.clone()),
+                output: last_output.clone(),
+            }],
+            false => Vec::new(),
+        };
+        conn.execute(
+            "UPDATE \"cron_job_records\" SET \"trigger\" = ?, \"runs\" = ? WHERE \"id\" = ?",
+            turso::params![
+                serde_json::to_string(&trigger)?,
+                encode_runs(&runs)?,
+                id.clone()
+            ],
+        )
+        .await
+        .with_context(|| format!("backfilling trigger for cron job {id}"))?;
+    }
+    tracing::info!(
+        jobs = pending.len(),
+        "backfilled cron triggers and run history from the schedule/last_* columns"
+    );
+    Ok(())
+}
+
+/// The pre-`Trigger` schedule string as a trigger. `@at` resolves to the moment
+/// it named — past included, since a spent one-shot still has to say what it
+/// was — and anything else is the cron expression it always was; an expression
+/// that no longer parses stays stored, and the sweep pauses the job with the
+/// reason, exactly as it did before.
+fn trigger_from_schedule(schedule: &str) -> Trigger {
+    if schedule_is_once(schedule)
+        && let Ok(at) = once_moment_local(schedule)
+    {
+        return Trigger::At { at };
+    }
+    Trigger::cron(schedule)
+}
+
 #[async_trait]
 impl CronJobRepository for Db {
     async fn save(&self, job: &CronJob) -> anyhow::Result<()> {
@@ -154,7 +266,7 @@ impl CronJobRepository for Db {
             toasty::create!(CronJobRecord {
                 id: job.id.clone(),
                 name: job.name.clone(),
-                schedule: job.schedule.clone(),
+                trigger: serde_json::to_string(&job.trigger)?,
                 kind: job.action.kind().to_string(),
                 command: cols.command.clone(),
                 args: cols.args.clone(),
@@ -164,18 +276,17 @@ impl CronJobRepository for Db {
                 skills: cols.skills.clone(),
                 status: job.status.as_str().to_string(),
                 catch_up: job.catch_up.as_str().to_string(),
+                notify: job.notify.as_str().to_string(),
                 next_run_at: job.next_run_at,
-                last_run_at: job.last_run_at.unwrap_or(0),
-                last_status: job
-                    .last_status
-                    .as_ref()
-                    .map(|s| s.as_str().to_string())
-                    .unwrap_or_default(),
                 last_error: job.last_error.clone(),
-                last_output: job.last_output.clone(),
-                last_run_session: job.last_run_session.clone().unwrap_or_default(),
+                runs: encode_runs(&job.runs)?,
                 created_at: job.created_at,
                 grants: encode_grants(&job.grants)?,
+                schedule: String::new(),
+                last_run_at: 0,
+                last_status: String::new(),
+                last_output: String::new(),
+                last_run_session: String::new(),
             })
             .exec(&mut conn)
             .await?;
@@ -214,7 +325,7 @@ impl CronJobRepository for Db {
             record
                 .update()
                 .name(job.name.clone())
-                .schedule(job.schedule.clone())
+                .trigger(serde_json::to_string(&job.trigger)?)
                 .kind(job.action.kind().to_string())
                 .command(cols.command.clone())
                 .args(cols.args.clone())
@@ -223,17 +334,11 @@ impl CronJobRepository for Db {
                 .prompt(cols.prompt.clone())
                 .skills(cols.skills.clone())
                 .status(job.status.as_str().to_string())
+                .catch_up(job.catch_up.as_str().to_string())
+                .notify(job.notify.as_str().to_string())
                 .next_run_at(job.next_run_at)
-                .last_run_at(job.last_run_at.unwrap_or(0))
-                .last_status(
-                    job.last_status
-                        .as_ref()
-                        .map(|s| s.as_str().to_string())
-                        .unwrap_or_default(),
-                )
                 .last_error(job.last_error.clone())
-                .last_output(job.last_output.clone())
-                .last_run_session(job.last_run_session.clone().unwrap_or_default())
+                .runs(encode_runs(&job.runs)?)
                 .grants(encode_grants(&job.grants)?)
                 .exec(&mut conn)
                 .await?;
@@ -313,8 +418,15 @@ fn encode_grants(grants: &[RuleSpec]) -> anyhow::Result<String> {
     Ok(serde_json::to_string(grants)?)
 }
 
+/// Same convention as grants: a routine that never ran writes `''`, not `'[]'`.
+fn encode_runs(runs: &[RoutineRun]) -> anyhow::Result<String> {
+    if runs.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(serde_json::to_string(runs)?)
+}
+
 fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
-    let nonzero = |v: i64| (v != 0).then_some(v);
     // Default to command for legacy rows written before `kind` existed.
     let action = if record.kind == "agent" {
         CronAction::Agent {
@@ -333,16 +445,20 @@ fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
     Ok(CronJob {
         id: record.id,
         name: record.name,
-        schedule: record.schedule,
+        // Every row has one by the time this runs: `ensure_schema` repairs the
+        // pre-`Trigger` shape before toasty opens the file. A row that somehow
+        // has neither falls back to its retired schedule column, and the sweep
+        // pauses it with the parse error — a visible stop, never a listing that
+        // fails for every other job too.
+        trigger: serde_json::from_str(&record.trigger)
+            .unwrap_or_else(|_| Trigger::cron(&record.schedule)),
         action,
         status: parse_cron_job_status(&record.status),
         catch_up: parse_catch_up(&record.catch_up),
+        notify: parse_notify_policy(&record.notify),
         next_run_at: record.next_run_at,
-        last_run_at: nonzero(record.last_run_at),
-        last_status: parse_cron_run_status(&record.last_status),
         last_error: record.last_error,
-        last_output: record.last_output,
-        last_run_session: (!record.last_run_session.is_empty()).then_some(record.last_run_session),
+        runs: serde_json::from_str(&record.runs).unwrap_or_default(),
         created_at: record.created_at,
         // A row written before the column existed reads as empty, which is the
         // same thing as "no grants" — never an error.
@@ -353,7 +469,7 @@ fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komo_core::domain::cron::{CronJobStatus, CronRunStatus};
+    use komo_core::domain::cron::{CronJobStatus, NotifyPolicy, RoutineRunStatus};
 
     /// A `komo.db` in a home of this test's own — `Db::connect` scans its
     /// directory for legacy files to merge.
@@ -371,7 +487,7 @@ mod tests {
             .unwrap();
         let job = CronJob::new(
             "weekly",
-            "0 14 * * 5",
+            Trigger::cron("0 14 * * 5"),
             CronAction::Command {
                 command: "/opt/rotate.py".into(),
                 args: vec!["--push".into(), "第二个".into()],
@@ -400,28 +516,35 @@ mod tests {
         assert_eq!(*timeout_secs, 600);
         assert_eq!(listed[0].next_run_at, 1234);
         assert_eq!(listed[0].status, CronJobStatus::Active);
-        assert!(listed[0].last_status.is_none());
-        assert_eq!(listed[0].last_output, "");
-        assert_eq!(listed[0].last_run_session, None);
+        assert_eq!(listed[0].trigger, Trigger::cron("0 14 * * 5"));
+        assert!(listed[0].runs.is_empty());
+        assert_eq!(listed[0].notify, NotifyPolicy::Always);
 
         let mut updated = listed[0].clone();
         updated.status = CronJobStatus::Paused;
         updated.next_run_at = 9999;
-        updated.last_run_at = Some(5000);
-        updated.last_status = Some(CronRunStatus::Failed);
+        updated.notify = NotifyPolicy::OnError;
         updated.last_error = "exit status: 3".into();
-        updated.last_output = "boom\n".into();
-        updated.last_run_session = Some("cron:weekly:5000".into());
+        let run = updated.begin_run(5000, "cron `0 14 * * 5` @ 2026-01-02 14:00".into());
+        updated.finish_run(
+            &run,
+            RoutineRunStatus::Error,
+            "boom\n",
+            Some("cron:weekly:5000".into()),
+        );
         db.update(&updated).await.unwrap();
 
         let found = db.find_by_name("weekly").await.unwrap().unwrap();
         assert_eq!(found.status, CronJobStatus::Paused);
         assert_eq!(found.next_run_at, 9999);
-        assert_eq!(found.last_run_at, Some(5000));
-        assert_eq!(found.last_status, Some(CronRunStatus::Failed));
+        assert_eq!(found.notify, NotifyPolicy::OnError);
         assert_eq!(found.last_error, "exit status: 3");
-        assert_eq!(found.last_output, "boom\n");
-        assert_eq!(found.last_run_session.as_deref(), Some("cron:weekly:5000"));
+        let last = found.last_run().expect("one recorded run");
+        assert_eq!(last.status, RoutineRunStatus::Error);
+        assert_eq!(last.started_at, 5000);
+        assert_eq!(last.output, "boom\n");
+        assert_eq!(last.event, "cron `0 14 * * 5` @ 2026-01-02 14:00");
+        assert_eq!(last.session_id.as_deref(), Some("cron:weekly:5000"));
 
         assert!(db.delete("weekly").await.unwrap());
         assert!(
@@ -497,6 +620,12 @@ mod tests {
         assert_eq!(command, "/opt/rotate.py");
         assert_eq!(args, &vec!["--push".to_string()]);
         assert_eq!(found.status, CronJobStatus::Active, "enabled=1 → active");
+        assert_eq!(
+            found.trigger,
+            Trigger::cron("0 14 * * 5"),
+            "the retired schedule column is repaired into a trigger on connect"
+        );
+        assert!(found.runs.is_empty(), "a row that never ran has no history");
         assert!(
             found.grants.is_empty(),
             "a row written before the grants column must read as ungranted, not error"
@@ -507,7 +636,7 @@ mod tests {
         // 3. The added columns are usable: an agent job saves and reads back.
         db.save(&CronJob::new(
             "brief",
-            "0 8 * * *",
+            Trigger::cron("0 8 * * *"),
             CronAction::Agent {
                 prompt: "hi".into(),
                 skills: vec!["s".into()],
@@ -521,6 +650,109 @@ mod tests {
         assert_eq!(agent.action.kind(), "agent");
     }
 
+    /// The one-time repair, on a row in the shape the store actually held
+    /// before `Trigger`: a `@at` schedule becomes the moment it named, the four
+    /// `last_*` fields become the single run they described, and running it
+    /// again changes nothing.
+    #[tokio::test]
+    async fn a_pre_trigger_row_is_repaired_on_connect() {
+        let home = std::env::temp_dir().join("komo-cron-backfill");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        let path = home.join("komo.db");
+
+        // A file with today's columns minus `trigger`/`runs`/`notify`, holding
+        // one recurring job that failed last night and one spent one-shot.
+        {
+            let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+            conn.execute(
+                "CREATE TABLE \"cron_job_records\" (\
+                 \"id\" TEXT NOT NULL, \"name\" TEXT NOT NULL, \"schedule\" TEXT NOT NULL, \
+                 \"kind\" TEXT NOT NULL, \"command\" TEXT NOT NULL, \"args\" TEXT NOT NULL, \
+                 \"workdir\" TEXT NOT NULL, \"timeout_secs\" BIGINT NOT NULL, \
+                 \"prompt\" TEXT NOT NULL, \"skills\" TEXT NOT NULL, \"status\" TEXT NOT NULL, \
+                 \"catch_up\" TEXT NOT NULL, \"next_run_at\" BIGINT NOT NULL, \
+                 \"last_run_at\" BIGINT NOT NULL, \"last_status\" TEXT NOT NULL, \
+                 \"last_error\" TEXT NOT NULL, \"last_output\" TEXT NOT NULL, \
+                 \"last_run_session\" TEXT NOT NULL, \"grants\" TEXT NOT NULL, \
+                 \"created_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO \"cron_job_records\" VALUES \
+                 ('id-1', 'nightly', '0 3 * * *', 'agent', '', '', '', 0, 'back up', '[]', \
+                 'active', 'late', 3000, 2000, 'failed', '', 'disk full', 'sess-1', '', 100)",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO \"cron_job_records\" VALUES \
+                 ('id-2', 'reboot', '@at 2024-01-02 09:30', 'command', '/sbin/reboot', '[]', \
+                 '', 900, '', '', 'done', 'late', 1704155400, 1704155400, 'ok', '', 'done', \
+                 '', '', 100)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        std::fs::write(
+            crate::persistence::turso_marker_path(&path),
+            b"turso-native\n",
+        )
+        .unwrap();
+
+        let db = Db::connect(&format!("turso:{}", path.display()))
+            .await
+            .unwrap();
+        let nightly = db.find_by_name("nightly").await.unwrap().unwrap();
+        assert_eq!(nightly.trigger, Trigger::cron("0 3 * * *"));
+        assert_eq!(nightly.notify, NotifyPolicy::Always);
+        let run = nightly.last_run().expect("last_* became one run");
+        assert_eq!(run.status, RoutineRunStatus::Error);
+        assert_eq!(run.started_at, 2000);
+        assert_eq!(run.output, "disk full");
+        assert_eq!(run.session_id.as_deref(), Some("sess-1"));
+        assert!(run.event.contains("0 3 * * *"), "{}", run.event);
+
+        // A spent one-shot keeps the moment it named — a `Trigger::At`, past or
+        // not, because the record still has to say what it was.
+        let reboot = db.find_by_name("reboot").await.unwrap().unwrap();
+        let Trigger::At { at } = reboot.trigger else {
+            panic!(
+                "an `@at` schedule becomes a one-shot moment: {:?}",
+                reboot.trigger
+            );
+        };
+        assert_eq!(
+            at,
+            komo_core::domain::cron::once_moment_local("@at 2024-01-02 09:30").unwrap()
+        );
+        assert_eq!(reboot.status, CronJobStatus::Done);
+        assert_eq!(
+            reboot.last_run().map(|r| r.status),
+            Some(RoutineRunStatus::Ok)
+        );
+
+        // Idempotent: connecting again repairs nothing and changes nothing.
+        drop(db);
+        let db = Db::connect(&format!("turso:{}", path.display()))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.find_by_name("nightly").await.unwrap().unwrap().runs,
+            nightly.runs,
+            "a second connect must not re-append the imported run"
+        );
+    }
+
     #[tokio::test]
     async fn agent_job_roundtrips() {
         let db = Db::connect(&turso_url("komo_cron_agent_test.db"))
@@ -528,7 +760,7 @@ mod tests {
             .unwrap();
         let job = CronJob::new(
             "brief",
-            "0 8 * * *",
+            Trigger::cron("0 8 * * *"),
             CronAction::Agent {
                 prompt: "总结我今天的日程".into(),
                 skills: vec!["calendar".into(), "weather".into()],
@@ -557,7 +789,7 @@ mod tests {
             .unwrap();
         db.save(&CronJob::new(
             "tidy",
-            "0 8 * * *",
+            Trigger::cron("0 8 * * *"),
             CronAction::Agent {
                 prompt: "tidy".into(),
                 skills: vec![],
@@ -569,7 +801,7 @@ mod tests {
         .unwrap();
         db.save(&CronJob::new(
             "backup",
-            "0 9 * * *",
+            Trigger::cron("0 9 * * *"),
             CronAction::Command {
                 command: "/bin/true".into(),
                 args: vec![],
@@ -614,7 +846,7 @@ mod tests {
         };
         let job = CronJob::new(
             "ac-temp",
-            "0 22 * * *",
+            Trigger::cron("0 22 * * *"),
             CronAction::Agent {
                 prompt: "设到 26 度".into(),
                 skills: vec![],
@@ -635,11 +867,12 @@ mod tests {
         assert_eq!(rules[0].value, "climate.set_temperature");
 
         let mut updated = found;
-        updated.last_run_at = Some(999);
+        let run = updated.begin_run(999, "cron `0 22 * * *` @ slot".into());
+        updated.finish_run(&run, RoutineRunStatus::Ok, "26", None);
         db.update(&updated).await.unwrap();
         let again = db.find_by_name("ac-temp").await.unwrap().unwrap();
         assert_eq!(again.grants.len(), 1, "update must not drop grants");
-        assert_eq!(again.last_run_at, Some(999));
+        assert_eq!(again.last_run().unwrap().started_at, 999);
     }
 
     /// A job without grants writes the empty column, so it is indistinguishable
@@ -660,7 +893,7 @@ mod tests {
             .unwrap();
         let job = CronJob::new(
             "ac-temp",
-            "0 22 * * *",
+            Trigger::cron("0 22 * * *"),
             CronAction::Agent {
                 prompt: "设到 26 度".into(),
                 skills: vec![],
@@ -706,9 +939,14 @@ mod tests {
             .await
             .unwrap();
         for name in ["zeta", "alpha", "mid"] {
-            db.save(&CronJob::new_command(name, "* * * * *", "/bin/true", 0))
-                .await
-                .unwrap();
+            db.save(&CronJob::new_command(
+                name,
+                Trigger::cron("* * * * *"),
+                "/bin/true",
+                0,
+            ))
+            .await
+            .unwrap();
         }
         let names: Vec<String> = db
             .list()

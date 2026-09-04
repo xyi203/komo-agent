@@ -64,7 +64,7 @@ connect and renamed `<name>.merged-backup`.
 | `komo.db` · `session_records`, `session_todo_records`, `reminder_records`, `pairing_records`, `setting_records`, `inbox_records`, run ledger (`run_records`, `run_step_records`, `run_memory_records`) | one turn's execution record and the session metadata around it | disposable **by row** — `komo run prune`, `komo sessions clean`; never by dropping the table |
 | `komo.db` · `task_records` | cross-session tasks | durable — **additive changes only** (`kanban::ensure_schema`) |
 | `komo.db` · `memory_records` | long-term memories | durable — **additive changes only** |
-| `komo.db` · `cron_job_records` | scheduled cron jobs | durable |
+| `komo.db` · `cron_job_records` | routines: a `Trigger`, an action, and the last 20 `RoutineRun`s | durable — **additive changes only**; `schedule` / `last_*` are retired columns kept (and written empty) because dropping one is not additive |
 | `komo.db` · `wakeup_records` | standing wakeups — one row per suspended turn's wait | durable |
 | `~/.komo/sessions/` | transcripts — one append-only `.jsonl` per session | disposable |
 | `~/.komo/permissions.json` | saved approval grants | durable |
@@ -919,12 +919,30 @@ call the same functions, which is what keeps validation from forking.
   rendering off the folded content) and `coalesce_rapid_keys` rebuilds a paste
   that a terminal without bracketed paste delivered as keystrokes. Input events
   go through a channel so a batch can be collected before it is interpreted.
-- `cron` (`cron_job_records`, `CronJobSweep`) — two job modes: **command**
+- `cron` (`cron_job_records`, `CronJobSweep`) — **routines**: a `Trigger`, an
+  action, and a `runs` history. Two job modes: **command**
   (operator-authored, runs directly, no approver) and **agent** (unattended
   turn on `cron_runtime`: a side effect needs an `unattended = true` policy
   rule or one of the job's own grants, else the turn **suspends** and the
-  operator answers `/approve wk-<id>` in the home chat — `last_status` is then
-  `waiting`, which is neither ran nor failed).
+  operator answers `/approve wk-<id>` in the home chat — the run's status is
+  then `waiting`, which is neither ran nor failed).
+  **`Trigger` is what makes it fire** (docs/bot-runtime.md §3.3), replacing the
+  schedule string: `Cron`/`At` name a moment `next_run_at` holds, and
+  `Feishu`/`Webhook`/`FileChanged` are defined but not yet fired (5.12–5.14) —
+  they have no occurrence, so `next_run_at = 0` and the sweep passes over them.
+  `Any` (≤ 8) schedules to its soonest member and **fires once**, with the run's
+  `event` naming the member that hit; a spent `At` inside it simply stops
+  appearing in `next_slot`. A schedule *string* becomes a `Trigger` in exactly
+  one place, `cron_actions::parse_schedule` — the CLI and the `cron` tool both
+  call it, and structured triggers never round-trip through a string.
+  **One firing is one `RoutineRun`**, claimed `running` in the same write as the
+  slot (a crash mid-run leaves the record of what was in flight) and settled
+  `ok`/`error`/`waiting` after; `runs` keeps the newest 20 and `runs.last()` is
+  what every "how did that job go?" surface reads. `last_error` stays reserved
+  for trigger/config problems.
+  **`notify`** (`always` default / `on_error` / `never`) filters *delivery*, never
+  the record — and never a `waiting` run, which is the routine asking for
+  something rather than reporting.
   Chat-created jobs (`tools/cron.rs`) are approval-gated at creation; a
   command job from chat is `Risk::Dangerous`. An agent job declares the actions
   it needs as `grants`, approved in that **same** prompt (which is why a
@@ -932,9 +950,9 @@ call the same functions, which is what keeps validation from forking.
   `unattended` rule and revoked when the job is removed. A job's lifecycle is a
   **stored status** (`active`/`paused`/`done` — the sole authority, no enabled
   flag); a `@at YYYY-MM-DD HH:MM` schedule is a one-shot that completes (`done`)
-  at claim time and keeps its row as the queryable record — `last_output` holds
-  every run's delivered body and `last_run_session` links an agent run to its
-  ledger transcript, so "what did that job do" outlives the notification.
+  at claim time and keeps its row as the queryable record — each run holds its
+  delivered body and, for an agent run, the session linking it to its ledger
+  transcript, so "what did that job do" outlives the notification.
   `enable`/`run` refuse a `done` job. An agent job may also name a
   **`workspace`** — the directory its file and shell tools are confined to,
   installed on the turn's `SessionContext::workspace_root` by the sweep. It is

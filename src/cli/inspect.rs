@@ -6,12 +6,16 @@
 use komo_core::domain::checkpoint::CheckpointStore;
 
 use crate::{
-    domain::cron::{CronAction, CronJob, CronJobSpec, CronJobStatus},
+    domain::cron::{CronAction, CronJob, CronJobSpec, CronJobStatus, NotifyPolicy},
     domain::task::TaskStatus,
     services::operator_control::{
         OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery, OperatorQueryResult,
     },
 };
+
+/// How many of a job's firings `komo cron list` prints. The store keeps
+/// `ROUTINE_RUN_HISTORY`; a listing is a glance, not the archive.
+const CRON_RUNS_SHOWN: usize = 3;
 
 pub(crate) fn local_time(unix: i64) -> String {
     chrono::DateTime::from_timestamp(unix, 0)
@@ -100,28 +104,39 @@ fn print_cron_job(job: &CronJob) {
         "  {}  ({})  [{}]  {}  → {}",
         job.name,
         job.action.kind(),
-        job.schedule,
+        job.trigger.describe(),
         state,
         target
     );
+    if job.notify != NotifyPolicy::Always {
+        println!("      notify {}", job.notify.as_str());
+    }
     // Spelled out, not counted: "2 grants" would make the operator run another
     // command to learn what they approved, and this listing is where they look.
     for rule in job.granted_rules() {
         println!("      grant {}", rule.describe());
     }
-    if let (Some(at), Some(status)) = (job.last_run_at, &job.last_status) {
-        let mut line = format!("      last run {} {}", local_time(at), status.as_str());
-        if !job.last_output.is_empty() {
-            let first = job.last_output.lines().next().unwrap_or_default();
+    // Newest first, and only the last few: "has this been failing all week?" is
+    // answered by a handful of lines, and the rest is what `runs` keeps for the
+    // job's own record.
+    for run in job.runs.iter().rev().take(CRON_RUNS_SHOWN) {
+        let mut line = format!(
+            "      run {} {} ({})",
+            local_time(run.started_at),
+            run.status.as_str(),
+            run.event
+        );
+        if !run.output.is_empty() {
+            let first = run.output.lines().next().unwrap_or_default();
             line.push_str(&format!(" — {first}"));
         }
         println!("{line}");
-        if let Some(session) = &job.last_run_session {
-            println!("      transcript: komo run list (session {session})");
+        if let Some(session) = &run.session_id {
+            println!("          transcript: komo run list (session {session})");
         }
     }
     if !job.last_error.is_empty() {
-        println!("      schedule error: {}", job.last_error);
+        println!("      trigger error: {}", job.last_error);
     }
 }
 
@@ -136,7 +151,7 @@ pub async fn cron_add(control: &OperatorControl, spec: CronJobSpec) -> anyhow::R
         "Added {} job `{}` [{}] — first run {}.",
         job.action.kind(),
         job.name,
-        job.schedule,
+        job.trigger.describe(),
         local_time(job.next_run_at)
     );
     if !control.via_gateway() {

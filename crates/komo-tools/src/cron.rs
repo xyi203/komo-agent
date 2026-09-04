@@ -35,7 +35,7 @@ use komo_core::domain::{
     context::ToolContext,
     cron::{
         CronAction, CronJob, CronJobRepository, CronJobSpec, CronJobStatus,
-        DEFAULT_CRON_JOB_TIMEOUT_SECS,
+        DEFAULT_CRON_JOB_TIMEOUT_SECS, NotifyPolicy, RoutineRun, parse_notify_policy,
     },
     policy::RuleSpec,
     tool::{Tool, ToolError, ToolOutput, parse_args},
@@ -52,6 +52,9 @@ struct CronArgs {
     name: Option<String>,
     #[serde(default)]
     schedule: Option<String>,
+    /// Where each run's outcome goes: `always` (default), `on_error`, `never`.
+    #[serde(default)]
+    notify: Option<String>,
     // Agent-mode fields.
     #[serde(default)]
     prompt: Option<String>,
@@ -147,7 +150,7 @@ impl Tool for CronTool {
     fn description(&self) -> &'static str {
         "Manage the gateway's scheduled jobs — scheduled *work*, unlike \
          `reminder`, which only re-delivers a message. \
-         action=\"list\" returns every job with its schedule, status, next run \
+         action=\"list\" returns every job with its trigger, status, next run \
          and last outcome; \
          action=\"add\" creates one (requires `name` + `schedule` — a 5-field \
          cron expression for recurring work, or `@at YYYY-MM-DD HH:MM` for a \
@@ -160,6 +163,8 @@ impl Tool for CronTool {
          of them is refused when it runs; \
          action=\"disable\" / \"enable\" pauses and resumes a job by `name`; \
          action=\"remove\" deletes it; action=\"run\" fires it once now. \
+         `notify` decides where each run's outcome goes — \"on_error\" for \
+         \"only tell me when it breaks\". \
          A one-shot job completes after firing (status `done`) and stays listed \
          with its output — do not remove it to \"clean up\", the row is the \
          record of what ran. \
@@ -191,6 +196,11 @@ impl Tool for CronTool {
                 "schedule": {
                     "type": "string",
                     "description": "When the job fires, in the user's local timezone (action=add). Recurring: a 5-field cron expression, e.g. \"0 8 * * *\" for 8 AM daily or \"0 14 * * 5\" for Friday 2 PM. One-shot: \"@at YYYY-MM-DD HH:MM\", e.g. \"@at 2026-08-12 08:30\" — fires once, then the job completes (a past time is rejected)."
+                },
+                "notify": {
+                    "type": "string",
+                    "enum": ["always", "on_error", "never"],
+                    "description": "Where each run's outcome goes (action=add; default \"always\"). Use \"on_error\" when the user says something like \"只有出问题才告诉我\" / \"only ping me if it fails\" — a successful run then goes unreported and stays in the job's run history. \"never\" delivers nothing at all. A job that stops to ask for approval is delivered under every setting."
                 },
                 "prompt": {
                     "type": "string",
@@ -287,6 +297,17 @@ impl Tool for CronTool {
                         )
                     })?
                     .to_string();
+                // The single string→trigger parse site, shared with the CLI:
+                // a bad expression is refused here, not at 03:00.
+                let trigger = actions::parse_schedule(&schedule, now)
+                    .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+                let notify = args
+                    .notify
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(parse_notify_policy)
+                    .unwrap_or_default();
 
                 let (action, request, grants) = match (args.prompt, args.command) {
                     (Some(_), Some(_)) => {
@@ -392,26 +413,33 @@ impl Tool for CronTool {
                     self.jobs.as_ref(),
                     CronJobSpec {
                         name,
-                        schedule,
+                        trigger,
                         action,
                         grants,
                         catch_up: Default::default(),
+                        notify,
                     },
                     now,
                 )
                 .await?;
+                let delivery = match job.notify {
+                    NotifyPolicy::Always => "output goes to the home channel",
+                    NotifyPolicy::OnError => "only failures are delivered to the home channel",
+                    NotifyPolicy::Never => "nothing is delivered; check `cron list` for its runs",
+                };
                 Ok(ToolOutput::text(format!(
                     "Scheduled {} job `{}` [{}] — first run {}. Runs while `komo gateway` \
-                     is up; output goes to the home channel.",
+                     is up; {delivery}.",
                     job.action.kind(),
                     job.name,
-                    job.schedule,
+                    job.trigger.describe(),
                     local_time(job.next_run_at)
                 ))
                 .with_structured(json!({
                     "name": job.name,
                     "kind": job.action.kind(),
-                    "schedule": job.schedule,
+                    "trigger": job.trigger,
+                    "notify": job.notify.as_str(),
                 })))
             }
 
@@ -547,25 +575,35 @@ fn describe_job(job: &CronJob) -> String {
         "{} ({}) [{}] {} → {}",
         job.name,
         job.action.kind(),
-        job.schedule,
+        job.trigger.describe(),
         state,
         target
     );
-    if let (Some(at), Some(status)) = (job.last_run_at, &job.last_status) {
-        line.push_str(&format!(
-            " | last run {} {}",
-            local_time(at),
-            status.as_str()
-        ));
-        if !job.last_output.is_empty() {
-            line.push_str(&format!(" — {}", oneline(&job.last_output, PROMPT_PREVIEW)));
-        }
+    if job.notify != NotifyPolicy::Always {
+        line.push_str(&format!(" | notify {}", job.notify.as_str()));
+    }
+    if let Some(run) = job.last_run() {
+        line.push_str(&format!(" | {}", describe_run(run)));
     }
     if !job.last_error.is_empty() {
         line.push_str(&format!(
-            " | schedule error: {}",
+            " | trigger error: {}",
             oneline(&job.last_error, PROMPT_PREVIEW)
         ));
+    }
+    line
+}
+
+/// One firing as a line: when, how it went, what set it off, what it produced.
+fn describe_run(run: &RoutineRun) -> String {
+    let mut line = format!(
+        "last run {} {} ({})",
+        local_time(run.started_at),
+        run.status.as_str(),
+        run.event
+    );
+    if !run.output.is_empty() {
+        line.push_str(&format!(" — {}", oneline(&run.output, PROMPT_PREVIEW)));
     }
     line
 }
@@ -611,7 +649,7 @@ fn local_time(unix: i64) -> String {
 mod tests {
     use super::*;
     use komo_core::domain::approval::Decision;
-    use komo_core::domain::cron::CronRunStatus;
+    use komo_core::domain::cron::{RoutineRunStatus, Trigger};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -719,7 +757,7 @@ mod tests {
 
         let stored = jobs.jobs.lock().unwrap();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].schedule, "0 8 * * *");
+        assert_eq!(stored[0].trigger, Trigger::cron("0 8 * * *"));
         let CronAction::Agent { prompt, skills, .. } = &stored[0].action else {
             panic!("agent job");
         };
@@ -1040,14 +1078,65 @@ mod tests {
         .unwrap();
         {
             let mut stored = jobs.jobs.lock().unwrap();
-            stored[0].last_run_at = Some(1_700_000_000);
-            stored[0].last_status = Some(CronRunStatus::Failed);
-            stored[0].last_output = "boom\nsecond line".into();
+            let id = stored[0].begin_run(1_700_000_000, "cron `0 8 * * *` @ slot".into());
+            stored[0].finish_run(&id, RoutineRunStatus::Error, "boom\nsecond line", None);
         }
         let out = run(&t, json!({"action": "list"}), &rec).await.unwrap().text;
-        assert!(out.contains("j (agent) [0 8 * * *]"), "{out}");
+        assert!(out.contains("j (agent) [cron `0 8 * * *`]"), "{out}");
         assert!(out.contains("last run"), "{out}");
-        assert!(out.contains("failed — boom second line"), "{out}");
+        assert!(out.contains("error (cron `0 8 * * *` @ slot)"), "{out}");
+        assert!(out.contains("— boom second line"), "{out}");
+    }
+
+    /// "只有出问题才告诉我" reaches the store as the job's own policy, and the
+    /// listing says so — a silenced job that looked ordinary would be the kind
+    /// of surprise nobody debugs.
+    #[tokio::test]
+    async fn a_notify_policy_is_stored_and_listed() {
+        let (t, jobs, rec) = tool(true);
+        run(
+            &t,
+            json!({"action": "add", "name": "backup", "schedule": "0 3 * * *",
+                   "prompt": "back things up", "notify": "on_error"}),
+            &rec,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            jobs.jobs.lock().unwrap()[0].notify,
+            komo_core::domain::cron::NotifyPolicy::OnError
+        );
+        let out = run(&t, json!({"action": "list"}), &rec).await.unwrap().text;
+        assert!(out.contains("notify on_error"), "{out}");
+
+        // Unstated stays today's behaviour, and is not called out in the list.
+        run(
+            &t,
+            json!({"action": "add", "name": "brief", "schedule": "0 8 * * *", "prompt": "brief"}),
+            &rec,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            jobs.jobs.lock().unwrap()[1].notify,
+            komo_core::domain::cron::NotifyPolicy::Always
+        );
+    }
+
+    /// The schedule is parsed where the model can be told it was wrong, not at
+    /// 03:00 against a store that already accepted it.
+    #[tokio::test]
+    async fn a_broken_schedule_is_refused_at_add() {
+        let (t, jobs, rec) = tool(true);
+        let err = run(
+            &t,
+            json!({"action": "add", "name": "j", "schedule": "not a cron", "prompt": "p"}),
+            &rec,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not a cron"), "{err}");
+        assert!(jobs.jobs.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

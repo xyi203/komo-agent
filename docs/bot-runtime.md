@@ -229,34 +229,53 @@ struct WakeupRegistration {
 Event 30d。过期一律以 `cause: expired` 唤醒并把「没等到」告诉模型，**不静默丢弃**——
 一个从未被回答的问题不能让 turn 永远悬着。
 
-### 3.3 Routine（CronJob 泛化）
+### 3.3 Routine（CronJob 泛化）—— **已完成**（5.11）
 
 ```rust
 enum Trigger {
-    Cron { expr: String },                          // 现有 5 段 + `@every 30m` + `CRON_TZ=`
-    At { at: i64 },                                 // 现有 `@at`
+    Cron { expr: String },                          // 现有 5 段（`@every 30m` / `CRON_TZ=` 未做）
+    At { at: i64 },                                 // 现有 `@at`，创建时解析成那个本地时刻
     Feishu { chat: String, match: FeishuMatch },    // mention | keyword(s) | reaction(emoji)
     Webhook { name: String },                       // POST /api/hooks/{name}，bearer key
     FileChanged { root: PathBuf, glob: String },
-    Any(Vec<Trigger>),                              // ≤ 8，任一命中
+    Any { triggers: Vec<Trigger> },                 // ≤ 8，任一命中
 }
 
 struct RoutineRun {
     id: String,
-    status: RoutineRunStatus,   // running | ok | error
+    status: RoutineRunStatus,   // running | ok | error | waiting
     started_at: i64,
     event: String,              // 触发它的事件的一行描述：cron 槽位 / 消息摘要 / 文件路径
     session_id: Option<String>, // agent 模式：那次 turn 的 session
-    output: String,             // 有界
+    output: String,             // 有界（1000 字符；投递出去的通知不截）
 }
 ```
 
 `CronJob.schedule` → `trigger`；`last_output` / `last_run_session` / `last_run_at` / `last_status`
-→ `runs: Vec<RoutineRun>`（保留最近 20 条）。不留兼容层：cron.db 按 AGENTS.md 规则删库重建
-（`CronJobRecord → cron.db` 在「非加性变更删文件」清单里）。
+→ `runs: Vec<RoutineRun>`（保留最近 20 条，新的在末尾）。`last_error` 留着——它记的是
+schedule/config 问题，不是 run 结果。
 
-事件触发的 routine 不记 `event` 就说不清「这次为什么跑」——Grok 每条 run 都带
-`event`（`routines/controller.ts: RoutineRun {id, status, startedAt, detail, event}`）。
+**`Cron` / `At` 是「有槽位」的，事件类三种不是**：`next_slot` 只对前者答得出时刻，
+`next_run_at = 0` 就是「没有时刻」，sweep 于是跳过纯事件 routine（5.12–5.14 接上它们的 fire）。
+`Any` 取成员里最近的那个槽位；一次 firing 只产生一条 `RoutineRun`，`event` 写的是
+**命中的那个成员**（`owner_of`），不是整个集合——事件触发的 routine 不记 `event` 就说不清
+「这次为什么跑」（Grok 每条 run 都带 `event`：`routines/controller.ts`）。`Any` 里的 `At`
+用完就自然从 `next_slot` 里消失，剩下的 cron 成员继续把 job 带下去。
+
+**存储是加性的，不是删库重建。** 本节早先写的「cron.db 按 AGENTS.md 规则删库重建」是
+ADR 0004 合库之前的说法，已作废：`cron_job_records` 现在在 `komo.db` 里，是 durable 表，
+只允许加性变更。实际做法：
+
+- 加三个列 `trigger` / `runs` / `notify`（都 `NOT NULL DEFAULT`，走
+  `komo-infra/src/persistence/cron.rs` 的 `EXPECTED` + `ensure_columns`）；
+- 老列 `schedule` / `last_run_at` / `last_status` / `last_output` / `last_run_session`
+  **留在表里也留在 model 里**（durable 表不能删列，而 `NOT NULL` 无默认值的列一旦不再出现在
+  INSERT 里就会让每次写入失败），新写入一律写空值；
+- 连接时一次性回填（`backfill_triggers`，紧挨 `ensure_columns`）：`trigger = ''` 的行按老
+  `schedule` 算出 `Cron` 或 `At`，`last_*` 拼成一条 `RoutineRun`。只动 `trigger = ''` 的行，
+  所以幂等。
+- **这是一次性 repair，不是读路径上的 fallback**：读路径只认新列，下游没有任何地方需要判断
+  一行是哪个形状写的。
 
 `Feishu` trigger 命中的消息**不是**普通聊天输入：它以 routine 的 prompt 开一个 `origin = cron`
 的 turn，消息作为 event 注入，走 routine 的 grants。否则群里任何人一个 emoji 就能触发有授权的动作。
@@ -515,8 +534,8 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   无人值守永不放行危险动作，事后 `/approve` 也不行。提示由 `CronJobSweep` 发而不是 approver 发，
   因为 `wk-<id>` 要等登记写完才存在：sweep 拿到 `Suspended` 后从日志读 `turn/suspended.summary`、
   从登记读 id，走已有 notifier 投递「回复 `/approve <id>` / `/deny <id>`」，只给 Once——
-  `session`/`always` 是放宽，无人值守不给。job 的 `last_status` 多一个取值 `waiting`
-  （不是 ok 也不是 failed），`last_run_session` 指向挂起的 turn。briefing 保持 deny：
+  `session`/`always` 是放宽，无人值守不给。那次 firing 的 run 记 `waiting`
+  （不是 ok 也不是 error；5.11 之前是 `last_status`），`session_id` 指向挂起的 turn。briefing 保持 deny：
   它一失败就降级成无工具 compose，简报已经投出去了，挂起只会留一条没人听的续跑。
   顺带补的两处：`continue_turn` 从 session 记录读回 `origin`、从登记读回 grants——
   原来续跑用 detached context，routine 醒来按普通对话评估权限（更宽）且丢掉自己的 grants；
@@ -742,8 +761,22 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 
 ### 第三批 · Trigger 泛化
 
-- **5.11 `Trigger` 枚举 + `runs` 历史**：替换 `schedule` 与 `last_*`；cron.db 重建；`komo cron`
-  CLI/`cron` 工具/api 三个入口走同一 `cron_actions`。验证：现有 cron 测试全绿；`Any` 任一命中只跑一次。
+- **5.11 `Trigger` 枚举 + `runs` 历史** —— **已完成**：`CronJob.schedule` → `trigger`，
+  `last_*` → `runs`（最近 20 条），存储按 §3.3 的加性做法 + 一次性回填，**不删库**。
+  字符串 schedule → `Trigger` 的解析只有一处（`cron_actions::parse_schedule`）：
+  `komo cron add/add-agent`、`cron` 工具、api handler 三个入口都调它，结构化 trigger
+  （`Any` 与事件类）直接以自己的形状传，根本不经过字符串。`CronJobSpec.schedule` 换成
+  `trigger`，`CronRunStatus` 并进 `RoutineRunStatus`（多一个 `running`——claim 时就写下，
+  崩在半路也留得下「当时在跑什么」）。sweep 的 claim 变成「算下一个槽位 → 写一条 `running` 的
+  run」一次写入；`--skip-missed`、晚到裁决、`@at` 一次性 `done` 都没动，只是「还有没有下一个
+  槽位」从 `is_once()` 换成了 `next_slot()` 的答案。`komo cron list` 显示 trigger 与最近 3 条 run
+  （`komo doctor` 同样改读 `runs.last()`）。
+  顺带修掉一个既有 bug：`CronJobSpec.catch_up` 从来没被 `add_cron_job` 写进 job，
+  `--skip-missed` 一直是个空开关。
+  验证：现有 cron 测试全绿；`a_pre_trigger_row_is_repaired_on_connect`（老形状的行连接后
+  读出正确的 `Trigger` 与那条 run，且再连一次不重复）、`an_any_trigger_fires_once_and_names_what_hit`
+  （两个成员同一槽位 → 一条 run，`event` 说出是哪个）、`a_slot_two_members_share_is_owned_by_one_of_them`、
+  `event_triggers_have_no_occurrence`、`history_keeps_the_newest_runs_only`。
 - **5.12 Webhook**：`/api/hooks/{name}`。验证：无 key 401；命中登记唤醒；命中 routine 开 turn 且 `event` 记录 body 摘要。
 - **5.13 Feishu match**：`TriggerMatcher`（与 5.10 的 `FromPeer` 共用）；命中不进聊天路径。
   验证：非 `allow_from` 的群成员 reaction 能触发 routine 但 turn 的 grants 是 routine 的，不是发送者的。
@@ -751,8 +784,20 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 
 ### 第四批 · 收口
 
-- **5.15 per-routine 通知策略**：`notify: always | on_error | never`（Grok 每 agent 有
-  `notificationsEnabled` / `notifyOnUpdatesEnabled`）。「有异常才告诉我」在这里。
+- **5.15 per-routine 通知策略** —— **已完成**：`CronJob.notify: NotifyPolicy`
+  （`always` 默认 = 今天的行为 / `on_error` / `never`；Grok 每 agent 有
+  `notificationsEnabled` / `notifyOnUpdatesEnabled`）。「有异常才告诉我」就是 `on_error`。
+  `cron` 工具 `add` 有 `notify` 参数，CLI 是 `komo cron add|add-agent --notify`
+  （值写错直接报错，不静默回落成 `always`——一个手滑的静音只会被那条本来该收到的通知发现），
+  `komo cron list` 在非 `always` 时显示。
+  两条边界：**它过滤的是通知，不是记录**——`never` 的 routine 每次 firing 照样进 `runs`；
+  **`waiting` 永远投递**——routine 停下等审批时发出去的不是结果报告，是它在要东西，
+  没人会替它来问（`NotifyPolicy::delivers`）。读不出来的列一律读成 `always`：
+  一个被静音的 routine 是唯一没人会察觉的故障。
+  验证：`a_notify_policy_filters_delivery_but_not_the_run_history`（五种组合的投递次数 +
+  被静音的 run 仍有 output）、`a_silenced_routine_still_asks_for_its_approval`
+  （`never` 的 routine 停下等审批，提示照样送到）、
+  `notify_policies_filter_results_but_never_a_waiting_routine`、`a_notify_policy_is_stored_and_listed`。
 - **5.16 per-task artifacts** —— **已完成**：`komo-services` 的 `ArtifactStore`，根
   `<komo home>/artifacts`，每个 session 一个子目录，目录名与 `tool_output_store` 共用同一个
   `sanitize`（两处拼出两个名字就是两个目录）。**按需创建**：`session_dir()` 只算路径，第一次

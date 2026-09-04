@@ -26,7 +26,7 @@ use komo_core::domain::{
     briefing::BriefingMarkRepository,
     context::{SessionContext, SessionOrigin},
     cron::{
-        CatchUpVerdict, CronAction, CronJob, CronJobRepository, CronJobStatus, CronRunStatus,
+        CatchUpVerdict, CronAction, CronJob, CronJobRepository, CronJobStatus, RoutineRunStatus,
         next_occurrence_in, next_occurrence_local,
     },
     gateway::MessageHandler,
@@ -570,33 +570,41 @@ impl Maintenance for CronJobSweep {
                 }
                 CatchUpVerdict::OnTime => false,
             };
+            // What this firing was, before the claim advances past it — for an
+            // `Any` this is the only place that can still say which member hit.
+            let event = job.trigger.slot_event(job.next_run_at);
             // Claim the slot before executing (see the type docs). A broken
             // expression (bypassed add-time validation) pauses the job with
             // the reason recorded, rather than erroring every tick.
-            let mut broken_schedule = false;
-            if job.is_once() {
-                // A one-shot completes at claim time — the same crash-safety
-                // as advancing `next_run_at`, and the row stays behind as the
-                // queryable record of what ran.
-                job.status = CronJobStatus::Done;
-            } else {
-                match next_occurrence_local(&job.schedule, now) {
-                    Ok(next) => job.next_run_at = next,
-                    Err(e) => {
-                        warn!(job = %job.name, error = %e, "broken cron schedule; pausing job");
-                        job.status = CronJobStatus::Paused;
-                        job.last_error = format!("invalid schedule: {e}");
-                        broken_schedule = true;
-                    }
+            let mut broken_trigger = false;
+            match job.trigger.next_slot(now) {
+                Ok(Some((next, _))) => job.next_run_at = next,
+                // Nothing left to fire. A one-shot completes at claim time —
+                // the same crash-safety as advancing `next_run_at`, and the row
+                // stays behind as the queryable record of what ran. An
+                // event-only routine has no moment to begin with and goes back
+                // to waiting for its event.
+                Ok(None) if job.trigger.is_scheduled() => job.status = CronJobStatus::Done,
+                Ok(None) => job.next_run_at = 0,
+                Err(e) => {
+                    warn!(job = %job.name, error = %e, "broken cron trigger; pausing job");
+                    job.status = CronJobStatus::Paused;
+                    job.last_error = format!("invalid schedule: {e}");
+                    broken_trigger = true;
                 }
             }
-            job.last_run_at = Some(now);
+            if broken_trigger || abandoned {
+                if let Err(error) = self.jobs.update(&job).await {
+                    warn!(%error, job = %job.name, "failed to claim cron job");
+                }
+                continue;
+            }
+            // The claim and the `running` run are one write: a crash between
+            // them would leave a slot claimed with no record of what it ran.
+            let run_id = job.begin_run(now, event);
             if let Err(error) = self.jobs.update(&job).await {
                 // Unclaimed → don't run: missing one slot beats double-running it.
                 warn!(%error, job = %job.name, "failed to claim cron job; skipping this run");
-                continue;
-            }
-            if broken_schedule || abandoned {
                 continue;
             }
 
@@ -604,33 +612,44 @@ impl Maintenance for CronJobSweep {
             let outcome = self.execute(&job).await;
             let elapsed_s = started.elapsed().as_secs();
             match outcome.status {
-                CronRunStatus::Ok => {
+                RoutineRunStatus::Ok => {
                     info!(job = %job.name, kind = job.action.kind(), elapsed_s, "cron job succeeded");
                     summary.jobs_run += 1;
                 }
-                CronRunStatus::Failed => {
+                RoutineRunStatus::Error => {
                     error!(job = %job.name, kind = job.action.kind(), elapsed_s, outcome = %outcome.body, "cron job failed")
                 }
                 // Neither ran nor failed: it stopped for an approval and comes
                 // back when the operator answers, so it is not this cycle's
                 // completed work.
-                CronRunStatus::Waiting => {
+                RoutineRunStatus::Waiting => {
                     info!(job = %job.name, kind = job.action.kind(), elapsed_s, "cron job is waiting for an approval")
                 }
+                RoutineRunStatus::Running => {}
             }
-            if let Err(error) = self.notifier.notify(&outcome.title, &outcome.body).await {
-                warn!(%error, job = %job.name, "failed to deliver cron job outcome");
-                delivery_failures += 1;
+            // Per-routine notification policy (docs/bot-runtime.md §5.15). A
+            // silenced routine still records every run — "tell me only when it
+            // breaks" is about the notification, not about the history.
+            if job.notify.delivers(outcome.status) {
+                if let Err(error) = self.notifier.notify(&outcome.title, &outcome.body).await {
+                    warn!(%error, job = %job.name, "failed to deliver cron job outcome");
+                    delivery_failures += 1;
+                }
+            } else {
+                info!(
+                    job = %job.name,
+                    notify = job.notify.as_str(),
+                    status = outcome.status.as_str(),
+                    "cron job outcome not delivered by its notification policy"
+                );
             }
-            // Record the outcome best-effort (the run itself already happened).
-            // The delivered body lands in `last_output` — success, failure and
-            // "waiting for an approval" alike — so what ran stays queryable
-            // after the notification is gone; `last_error` is reserved for
-            // schedule/config problems.
-            job.last_status = Some(outcome.status);
+            // Settle the run best-effort (it already happened). The delivered
+            // body lands on the run — success, failure and "waiting for an
+            // approval" alike — so what ran stays queryable after the
+            // notification is gone; `last_error` is reserved for trigger/config
+            // problems.
             job.last_error = String::new();
-            job.last_output = outcome.body;
-            job.last_run_session = outcome.session;
+            job.finish_run(&run_id, outcome.status, &outcome.body, outcome.session);
             if let Err(error) = self.jobs.update(&job).await {
                 warn!(%error, job = %job.name, "failed to record cron job outcome");
             }
@@ -759,8 +778,8 @@ impl CronJobSweep {
                     title,
                     body,
                     status: match ok {
-                        true => CronRunStatus::Ok,
-                        false => CronRunStatus::Failed,
+                        true => RoutineRunStatus::Ok,
+                        false => RoutineRunStatus::Error,
                     },
                     session: None,
                 }
@@ -794,7 +813,7 @@ impl CronJobSweep {
                 title: fail_title,
                 body: "agent-mode cron jobs need the gateway's cron runtime, which is not wired"
                     .to_string(),
-                status: CronRunStatus::Failed,
+                status: RoutineRunStatus::Error,
                 session: None,
             };
         };
@@ -837,7 +856,7 @@ impl CronJobSweep {
                 JobOutcome {
                     title: format!("Komo job「{name}」"),
                     body,
-                    status: CronRunStatus::Ok,
+                    status: RoutineRunStatus::Ok,
                     session: Some(session_id),
                 }
             }
@@ -848,13 +867,13 @@ impl CronJobSweep {
             Err(error) if is_suspended(&error) => JobOutcome {
                 title: format!("Komo job「{name}」等待批准"),
                 body: self.approval_notice(name, &session_id).await,
-                status: CronRunStatus::Waiting,
+                status: RoutineRunStatus::Waiting,
                 session: Some(session_id),
             },
             Err(e) => JobOutcome {
                 title: fail_title,
                 body: format!("agent turn failed: {e}"),
-                status: CronRunStatus::Failed,
+                status: RoutineRunStatus::Error,
                 session: Some(session_id),
             },
         }
@@ -924,7 +943,7 @@ impl CronJobSweep {
 struct JobOutcome {
     title: String,
     body: String,
-    status: CronRunStatus,
+    status: RoutineRunStatus,
     /// Ledger session of an agent run; `None` for command jobs.
     session: Option<String>,
 }
@@ -1621,6 +1640,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use komo_core::domain::cron::Trigger;
     use komo_core::domain::reminder::{Reminder, ReminderStatus};
     use komo_core::domain::session_event::WakeupCause;
     use komo_core::domain::task::{Task, TaskStatus};
@@ -2101,7 +2121,7 @@ mod tests {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         CronJob::new(
             name,
-            "* * * * *",
+            Trigger::cron("* * * * *"),
             CronAction::Command {
                 command: "/bin/sh".into(),
                 args: vec!["-c".into(), script.into()],
@@ -2153,9 +2173,15 @@ mod tests {
         assert_eq!(calls[0].1, "hello-from-job");
         let job = repo.jobs.lock().unwrap()[0].clone();
         assert!(job.next_run_at > now, "the fired slot is rescheduled");
-        assert_eq!(job.last_status, Some(CronRunStatus::Ok));
         assert!(job.last_error.is_empty());
-        assert!(job.last_run_at.is_some());
+        let run = job.last_run().expect("the firing is recorded");
+        assert_eq!(run.status, RoutineRunStatus::Ok);
+        assert!(run.started_at > 0);
+        assert!(
+            run.event.contains("* * * * *"),
+            "the run says what fired it: {}",
+            run.event
+        );
     }
 
     #[tokio::test]
@@ -2180,15 +2206,16 @@ mod tests {
         assert!(calls[0].1.contains("partial"));
         assert!(calls[0].1.contains("boom"));
         let job = repo.jobs.lock().unwrap()[0].clone();
-        assert_eq!(job.last_status, Some(CronRunStatus::Failed));
+        let run = job.last_run().expect("the firing is recorded");
+        assert_eq!(run.status, RoutineRunStatus::Error);
         assert!(
-            job.last_output.contains("boom"),
+            run.output.contains("boom"),
             "the failure body is queryable after the notification: {}",
-            job.last_output
+            run.output
         );
         assert!(
             job.last_error.is_empty(),
-            "last_error is reserved for schedule problems"
+            "last_error is reserved for trigger problems"
         );
     }
 
@@ -2204,19 +2231,13 @@ mod tests {
         assert_eq!(summary.jobs_run, 0);
         assert!(notifier.calls.lock().unwrap().is_empty());
         // Neither was claimed or touched.
-        assert!(
-            repo.jobs
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|j| j.last_run_at.is_none())
-        );
+        assert!(repo.jobs.lock().unwrap().iter().all(|j| j.runs.is_empty()));
     }
 
     #[tokio::test]
     async fn cron_job_broken_schedule_is_paused_not_run() {
         let mut job = due_job("broken", "echo nope");
-        job.schedule = "not a cron".into();
+        job.trigger = Trigger::cron("not a cron");
         let (sweep, repo, notifier) = cron_sweep_with(vec![job], false);
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.jobs_run, 0);
@@ -2231,12 +2252,15 @@ mod tests {
             "a broken schedule pauses the job"
         );
         assert!(job.last_error.contains("invalid schedule"));
+        assert!(job.runs.is_empty(), "nothing ran, so nothing is recorded");
     }
 
     #[tokio::test]
     async fn one_shot_job_runs_once_and_completes() {
         let mut job = due_job("once", "echo done-and-dusted");
-        job.schedule = "@at 2030-01-02 08:30".into();
+        job.trigger = Trigger::At {
+            at: job.next_run_at,
+        };
         let (sweep, repo, notifier) = cron_sweep_with(vec![job], false);
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.jobs_run, 1);
@@ -2244,12 +2268,13 @@ mod tests {
 
         let job = repo.jobs.lock().unwrap()[0].clone();
         assert_eq!(job.status, CronJobStatus::Done, "one-shot completes");
-        assert!(job.last_run_at.is_some());
-        assert_eq!(job.last_status, Some(CronRunStatus::Ok));
+        let run = job.last_run().expect("the firing is recorded");
+        assert_eq!(run.status, RoutineRunStatus::Ok);
+        assert!(run.event.starts_with("@at"), "{}", run.event);
         assert!(
-            job.last_output.contains("done-and-dusted"),
+            run.output.contains("done-and-dusted"),
             "the output stays queryable on the row: {}",
-            job.last_output
+            run.output
         );
         assert!(!job.is_due(i64::MAX), "a completed one-shot never re-fires");
 
@@ -2257,6 +2282,40 @@ mod tests {
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.jobs_run, 0);
         assert_eq!(notifier.calls.lock().unwrap().len(), 1);
+    }
+
+    /// Judgement 5. Two members of one `Any` are due at the same moment: the
+    /// routine runs **once**, and the run says which of them owns the slot.
+    #[tokio::test]
+    async fn an_any_trigger_fires_once_and_names_what_hit() {
+        let mut job = due_job("either", "echo hi");
+        // The same slot from both sides: the minute-granularity cron expression
+        // and a one-shot at the very moment the sweep finds due.
+        job.trigger = Trigger::Any {
+            triggers: vec![
+                Trigger::cron("* * * * *"),
+                Trigger::At {
+                    at: job.next_run_at,
+                },
+            ],
+        };
+        let (sweep, repo, notifier) = cron_sweep_with(vec![job], false);
+        let summary = sweep.run().await.unwrap();
+
+        assert_eq!(summary.jobs_run, 1, "one firing, not one per member");
+        assert_eq!(notifier.calls.lock().unwrap().len(), 1);
+        let job = repo.jobs.lock().unwrap()[0].clone();
+        assert_eq!(job.runs.len(), 1, "one firing is one run");
+        let event = &job.last_run().unwrap().event;
+        assert!(
+            event.contains("* * * * *") || event.starts_with("@at"),
+            "the run names the member that hit, not the set: {event}"
+        );
+        assert!(!event.contains("any("), "{event}");
+        // The recurring member carries it on: an `Any` holding a cron is never
+        // a one-shot, however spent its `@at` half is.
+        assert_eq!(job.status, CronJobStatus::Active);
+        assert!(job.next_run_at > 0);
     }
 
     #[tokio::test]
@@ -2282,7 +2341,7 @@ mod tests {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let job = CronJob::new(
             "ghost",
-            "* * * * *",
+            Trigger::cron("* * * * *"),
             CronAction::Command {
                 command: "/nonexistent/komo-test-binary".into(),
                 args: vec![],
@@ -2429,7 +2488,7 @@ mod tests {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         CronJob::new(
             name,
-            "* * * * *",
+            Trigger::cron("* * * * *"),
             CronAction::Agent {
                 prompt: prompt.to_string(),
                 skills,
@@ -2473,9 +2532,10 @@ mod tests {
         // the row, so the run stays traceable after the notification is gone.
         assert_eq!(notifier.calls.lock().unwrap()[0].1, "本周值班：Alice");
         let job = repo.jobs.lock().unwrap()[0].clone();
-        assert_eq!(job.last_status, Some(CronRunStatus::Ok));
-        assert_eq!(job.last_output, "本周值班：Alice");
-        assert_eq!(job.last_run_session.as_deref(), Some(seen[0].0.as_str()));
+        let run = job.last_run().expect("the firing is recorded");
+        assert_eq!(run.status, RoutineRunStatus::Ok);
+        assert_eq!(run.output, "本周值班：Alice");
+        assert_eq!(run.session_id.as_deref(), Some(seen[0].0.as_str()));
     }
 
     // ── unattended approval (docs/bot-runtime.md §5.4) ───────────────────────
@@ -2735,20 +2795,18 @@ mod tests {
 
         // The operator was handed that wait's id, and what it is for.
         let job = h.jobs.jobs.lock().unwrap()[0].clone();
-        assert_eq!(job.last_status, Some(CronRunStatus::Waiting));
-        assert_eq!(
-            job.last_run_session.as_deref(),
-            Some(wait.session_id.as_str())
-        );
-        assert!(job.last_output.contains(&wait.id), "{}", job.last_output);
+        let run = job.last_run().expect("the firing is recorded").clone();
+        assert_eq!(run.status, RoutineRunStatus::Waiting);
+        assert_eq!(run.session_id.as_deref(), Some(wait.session_id.as_str()));
+        assert!(run.output.contains(&wait.id), "{}", run.output);
         assert!(
-            job.last_output.contains("delete the tree"),
+            run.output.contains("delete the tree"),
             "the operator is told what it wants to do: {}",
-            job.last_output
+            run.output
         );
         let delivered = h.notifier.calls.lock().unwrap()[0].clone();
         assert!(delivered.0.contains("nightly"), "{}", delivered.0);
-        assert_eq!(delivered.1, job.last_output);
+        assert_eq!(delivered.1, run.output);
 
         // Five hours later, in a chat of their own, they allow it.
         age_the_wait(&h.db, &wait, 5 * 3_600).await;
@@ -2796,6 +2854,25 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "an answered wait is retired"
+        );
+    }
+
+    /// §5.15's exception, end to end: a routine set to deliver *nothing* still
+    /// delivers the question it stopped on. Silencing results must never
+    /// silence a routine that is waiting for a person — nobody else is coming.
+    #[tokio::test]
+    async fn a_silenced_routine_still_asks_for_its_approval() {
+        let mut job = granted_agent_job("nightly");
+        job.notify = komo_core::domain::cron::NotifyPolicy::Never;
+        let h = routine_harness("cron-wait-silenced", job).await;
+        h.sweep.run().await.unwrap();
+
+        let delivered = h.notifier.calls.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "the approval prompt went out anyway");
+        assert!(delivered[0].0.contains("等待批准"), "{}", delivered[0].0);
+        assert_eq!(
+            h.jobs.jobs.lock().unwrap()[0].last_run().map(|r| r.status),
+            Some(RoutineRunStatus::Waiting)
         );
     }
 
@@ -2933,8 +3010,8 @@ mod tests {
         assert_eq!(summary.jobs_run, 0);
         assert!(notifier.calls.lock().unwrap()[0].0.contains("failed"));
         assert_eq!(
-            repo.jobs.lock().unwrap()[0].last_status,
-            Some(CronRunStatus::Failed)
+            repo.jobs.lock().unwrap()[0].last_run().map(|r| r.status),
+            Some(RoutineRunStatus::Error)
         );
     }
 
@@ -2954,7 +3031,39 @@ mod tests {
         assert!(sweep.run().await.is_err());
         // The slot was still claimed and the outcome still recorded.
         let job = repo.jobs.lock().unwrap()[0].clone();
-        assert_eq!(job.last_status, Some(CronRunStatus::Ok));
+        assert_eq!(job.last_run().map(|r| r.status), Some(RoutineRunStatus::Ok));
+    }
+
+    /// §5.15. "Only tell me when it breaks" silences the *notification*, never
+    /// the record — and never a routine that stopped to ask for something.
+    #[tokio::test]
+    async fn a_notify_policy_filters_delivery_but_not_the_run_history() {
+        use komo_core::domain::cron::NotifyPolicy;
+
+        for (policy, script, delivered) in [
+            (NotifyPolicy::OnError, "echo fine", false),
+            (NotifyPolicy::OnError, "exit 3", true),
+            (NotifyPolicy::Never, "echo fine", false),
+            (NotifyPolicy::Never, "exit 3", false),
+            (NotifyPolicy::Always, "echo fine", true),
+        ] {
+            let mut job = due_job("quiet", script);
+            job.notify = policy;
+            let (sweep, repo, notifier) = cron_sweep_with(vec![job], false);
+            sweep.run().await.unwrap();
+            assert_eq!(
+                notifier.calls.lock().unwrap().len(),
+                usize::from(delivered),
+                "{policy:?} + `{script}`"
+            );
+            let job = repo.jobs.lock().unwrap()[0].clone();
+            let run = job.last_run().expect("every firing is recorded");
+            assert_ne!(run.status, RoutineRunStatus::Running, "the run is settled");
+            assert!(
+                !run.output.is_empty(),
+                "a silenced run still keeps its output: {policy:?}"
+            );
+        }
     }
 
     #[test]
