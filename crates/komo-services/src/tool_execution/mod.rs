@@ -645,7 +645,10 @@ impl ToolExecutionCore {
                     context.session.clone(),
                     context.run.clone(),
                     self.approver.clone(),
-                );
+                )
+                // Which call this is — what a tool that stops to wait names, so
+                // the continuation re-dispatches it as itself.
+                .with_call(call_id, call_index);
                 // Makes this call's approval a durable fact — the widest crash
                 // window in a turn is a person deciding.
                 if let (Some(events), Some(run)) = (&self.events, &context.run) {
@@ -830,12 +833,14 @@ impl ToolExecutionCore {
         // run before the step is recorded, which is what carries the path.
         let bounded = result.map(|out| self.bound(out, context, seq_field));
 
-        // A call that stopped to wait for an approval **did not happen**: no
-        // step, no `tool/call-settled`, nothing for a continuation to replay.
-        // Its `tool/call-started` and `approval/requested` stand, which is
-        // exactly the "requested, never resolved ⇒ not started" reading
-        // recovery already has — and what lets the re-dispatch after the answer
-        // be the first and only run of it.
+        // A call that stopped to wait **did not happen**: no step, no
+        // `tool/call-settled`, nothing for a continuation to replay. Its
+        // `tool/call-started` stands, beside either the `approval/requested`
+        // that has no answer yet or the `turn/suspended` naming this call —
+        // which is exactly the "asked for, never ran" reading recovery already
+        // has, and what lets the re-dispatch after the wake be the first and
+        // only run of it. The two cases differ only in who raised the wait
+        // (the gate, or the tool through `ToolContext::wait_for`).
         let suspended = context
             .run
             .as_ref()

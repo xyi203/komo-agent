@@ -146,7 +146,6 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         GatewayDispatcher::new(
             handler.clone(),
             approvals.clone(),
-            wired.clarify.clone(),
             sessions,
             home_repo,
             todos,
@@ -255,7 +254,6 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             config_home.clone(),
             crate::infra::messaging::api::ModelMenu::from_config(&rt.model),
             approvals.clone(),
-            wired.clarify.clone(),
             rt.home.join("workspaces"),
             std::env::current_dir().unwrap_or_else(|_| rt.home.clone()),
         )));

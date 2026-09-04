@@ -411,14 +411,17 @@ impl App {
                 // stay folded to their chip label. The agent gets `text`, which
                 // is always the full content.
                 let shown = self.folded_input();
+                // A question the turn stopped on takes the next thing typed as
+                // its answer — the suspended turn continues with it rather than
+                // a second turn starting beside it. Checked ahead of
+                // `in_flight` because a suspended turn is *not* in flight: it
+                // gave up its slot precisely so this could be typed.
+                if self.awaiting_answer {
+                    self.clear_input();
+                    self.awaiting_answer = false;
+                    return Some(Action::Answer { text, shown });
+                }
                 if self.in_flight {
-                    // A pending clarify question lets the input through as its
-                    // answer — the suspended turn continues with it.
-                    if self.awaiting_answer {
-                        self.clear_input();
-                        self.awaiting_answer = false;
-                        return Some(Action::Answer { text, shown });
-                    }
                     // One turn at a time; keep the draft so nothing is lost.
                     return None;
                 }

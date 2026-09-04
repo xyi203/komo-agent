@@ -192,7 +192,20 @@ fork — add new operator actions there, not in the CLI or api handlers.
   answer was recorded against the turn that *asked*, and the turn asking now is
   its continuation — so nobody approves the same action twice. `TurnWaker` is
   the other side: record `wakeup/fired`, retire every other wait that turn was
-  holding, claim the session slot, continue.
+  holding, claim the session slot, continue (`interaction::record_wake` writes
+  those events — one writer, so a second continuation path cannot forget the
+  `wakeup/fired`).
+- **A tool can raise the same wait** (`ToolContext::wait_for`, docs/bot-runtime.md
+  §3.4): `wait` and `ask_user` fill in the *same* `PendingSuspension` the
+  approval gate does, so the executor, the loop and the runtime need no second
+  path. What differs is only the way back: `turn/suspended` carries the
+  **`call_id`** that stopped, which puts it in `rebuild_from_events`' `gated`
+  set (re-dispatched regardless of idempotency, for the same "it never ran"
+  reason), and the runtime folds the chain's waits onto the `RunContext`
+  (`fold_turn_waits`) as the continuation opens — so `ctx.resumed_wait()` hands
+  the call its own wake, and `ctx.waits_taken()` is a per-turn budget counted
+  from the log rather than from memory it would lose. A tool reading `Some`
+  from `resumed_wait` must return it, never wait again.
 - api channel is loopback/ephemeral by default; `[channels.api] enabled = true`
   + `API_SERVER_KEY` widens it. `web_dir` serves the built SPA same-origin;
   `remote_interactive = true` lets keyed remote callers run interactive turns
@@ -294,7 +307,7 @@ komo-wiki      note-vault vector index: edge (qdrant-edge, in-process) /
 komo-infra     persistence · memory · skills · logs · workday ·
                permissions_store · codex · embedding         (→ core, config, provider)
 komo-services  tool_execution · tool_output_store · memory_query ·
-               memory_consolidation · memory_enrichment · clarify ·
+               memory_consolidation · memory_enrichment ·
                skill_registry · cron_actions · wiki_indexing ·
                session_indexing · episode ·
                diff/patch/search/file_mutation                (→ core, config)
@@ -367,7 +380,9 @@ call the same functions, which is what keeps validation from forking.
   `web_fetch` (content-type gated, 256 KB download cap, deny-only network
   policy), `homeassistant` (`call_service` approval-gated; `BLOCKED_DOMAINS`
   hardline), `task`, `todo` (session-scoped, dies on `/new`), `memory`,
-  `skill`, `cron`, `ask_user` (clarify), `logs` (tail of komo's own
+  `skill`, `cron`, `ask_user` / `wait` (the two sentinel tools: both stop the
+  turn through `ToolContext::wait_for` and come back with the wake as their
+  result — no process waits, and a restart loses nothing), `logs` (tail of komo's own
   tracing log — file lookup shared with `komo logs` via `komo-infra`'s `logs`, same
   deny-only file-read gate as `read`), `wiki_read` (vault-confined by
   canonicalized prefix, `Risk::Safe` deny-only; reads the markdown, not the
@@ -769,7 +784,11 @@ call the same functions, which is what keeps validation from forking.
   platform message id use `InboundOrigin::local()`, which is never a duplicate.
   Chat commands: `/new` (rotate
   session, clear todos + approval state), `/approve [session|always]`,
-  `/deny`, `/sethome`, `/wechat login`. `ChatApprover` sends the prompt and
+  `/deny`, `/skip` (decline an `ask_user` question — the turn continues on its
+  own assumptions instead of standing for a week), `/sethome`,
+  `/wechat login`. A plain message answers a pending question
+  (`answer_question`, which is also the GUI's inline reply and the api's
+  cancel), and the answer rides back on `wakeup/fired{reply, payload}`. `ChatApprover` sends the prompt and
   answers `Decision::Suspend` — the turn gives up its slot and comes back when
   `/approve` (or the GUI modal, through the same
   `GatewayDispatcher::answer_approval`) writes the answer into the log, in this
@@ -870,8 +889,11 @@ call the same functions, which is what keeps validation from forking.
   format* — only if it speaks neither Responses nor Messages — is a module in
   `crates/komo-provider` and a `Wire` variant.
 - **Agent-loop control**: add round-level control points in `komo-agent`'s `run_agent_loop`;
-  extend `TurnDriver`/`Step`. Clarify (`tools/ask_user.rs` +
-  `services/clarify.rs`) is the sentinel-tool reference.
+  extend `TurnDriver`/`Step`. `komo-tools`' `wait.rs` / `ask_user.rs` are the
+  sentinel-tool reference: a tool stops its turn with
+  `ToolContext::wait_for(wakeup, …)` and reads `ctx.resumed_wait()` on the way
+  back, which the executor and the loop treat exactly like a gated call that
+  stopped for an approval.
 - **Scheduled action**: implement `Maintenance`, construct in `cli/gateway.rs`.
 - **Gateway ingress**: implement `Channel`, `add_channel` in `cli/gateway.rs`,
   gate behind a `[channels.*]` declaration — feishu is the reference.

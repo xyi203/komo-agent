@@ -3767,6 +3767,7 @@ mod tests {
                     wakeup: Wakeup::Approval {
                         call_id: "c1".into(),
                     },
+                    call_id: "c1".into(),
                     summary: "shell: rm -rf build".into(),
                     expires_at: Some(9_999),
                 }),

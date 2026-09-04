@@ -26,7 +26,6 @@ use komo_infra::embedding::{GatedEmbedder, OllamaEmbedder};
 use komo_infra::permissions_store::PermissionsStore;
 use komo_infra::persistence::db::Db;
 use komo_infra::skills::FsSkillStore;
-use komo_services::clarify::ClarifyState;
 use komo_services::memory_enrichment::MemoryEnricher;
 use komo_services::skill_registry::SkillRegistry;
 use komo_services::tool_execution::{ToolExecutionConfig, ToolExecutor};
@@ -57,9 +56,6 @@ pub struct Wiring {
     /// The governed skill store (`~/.komo/skills`, files — roadmap §9), shared
     /// with the gateway's api channel.
     pub skills: Arc<FsSkillStore>,
-    /// Mid-turn clarify state: the `ask_user` tool waits on it; the gateway
-    /// dispatcher (and the TUI) resolve an inbound message into it.
-    pub clarify: Arc<ClarifyState>,
     /// The briefing sweep's tool-capable agent (roadmap §2): aux model over a
     /// read-only tool set, policy-gated with a deny-all inner approver — only
     /// explicit `unattended` policy rules can grant a `Risk::Normal` action.
@@ -259,11 +255,6 @@ pub async fn build(
     );
 
     // ── Shared dependencies (built once, used by every tool set) ─────────────
-    // Mid-turn clarification (roadmap §7): the sentinel tool suspends the turn
-    // on a question; whoever routes inbound messages (gateway dispatcher, TUI)
-    // resolves the answer through this shared state.
-    let clarify = Arc::new(ClarifyState::new());
-
     // Memories are `memory_records` in `komo.db`, shared by the `memory` tool,
     // the reflective reviewer, the L1 pinned injection and the briefing sweep.
     // On first run they seed themselves from any legacy markdown memories under
@@ -411,7 +402,6 @@ pub async fn build(
         kanban: kanban.clone(),
         cron_jobs: cron_jobs.clone(),
         workspace: workspace.clone(),
-        clarify: clarify.clone(),
         memory_repo: memory_repo.clone(),
         episodic: episodic.clone(),
         memory_query: memory_query.clone(),
@@ -795,7 +785,6 @@ pub async fn build(
         memories: memory_repo,
         memory_query: memory_query.clone(),
         skills: skill_store,
-        clarify,
         briefing_runtime,
         cron_runtime,
         output_store,

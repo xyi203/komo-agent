@@ -125,6 +125,7 @@ mod tests {
                 wakeup: Wakeup::Approval {
                     call_id: "c1".to_string(),
                 },
+                call_id: "c1".to_string(),
                 summary: "rm -rf build".to_string(),
                 expires_at: Some(at + 86_400),
             }),

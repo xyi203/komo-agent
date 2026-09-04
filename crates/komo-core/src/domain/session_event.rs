@@ -339,6 +339,12 @@ pub enum EventFilter {
 pub struct TurnSuspendedEvent {
     pub turn_id: String,
     pub wakeup: Wakeup,
+    /// The call that stopped. A call that stopped to wait **did not happen**,
+    /// so this is what tells a continuation to re-dispatch it — the same
+    /// reading `approval/requested` without a `resolved` carries — and what
+    /// lets the tool recognise its own wake on the way back.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub call_id: String,
     /// One line for the operator: what this turn is waiting for, in words.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub summary: String,
@@ -736,6 +742,73 @@ pub fn attempt_chain(events: &[SessionEvent], turn_id: &str) -> std::collections
             _ => return chain,
         }
     }
+}
+
+/// What ended one call's wait, as the log recorded it.
+///
+/// Handed back to the call that stopped, so a `wait` that has come due returns
+/// "the time you asked for arrived" instead of stopping the turn a second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumedWait {
+    /// The call that stopped — the one this wake belongs to.
+    pub call_id: String,
+    pub wakeup: Wakeup,
+    pub cause: WakeupCause,
+    /// What the wake brought: the user's answer, an event body, nothing for a
+    /// timer.
+    pub payload: String,
+}
+
+/// Everything one turn's chain of attempts has waited for.
+///
+/// Two answers from one fold, because a tool asks both at once: *have I already
+/// waited too often this turn* — the budget, which has to survive a suspension
+/// a per-process counter would lose — and *am I being re-dispatched because my
+/// own wait ended*.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnWaits {
+    /// Every wait this turn registered, oldest first, served or not.
+    pub taken: Vec<Wakeup>,
+    /// The wake that brought this attempt back, if one did.
+    pub resumed: Option<ResumedWait>,
+}
+
+/// Fold a turn's waits out of its session log.
+///
+/// Read across the whole [`attempt_chain`], because a suspension is recorded
+/// against the turn that *stopped* and the turn asking now is its continuation
+/// — the same reason the approval gate reads the chain rather than one id. A
+/// `wakeup/fired` is matched to the suspension it ended by position: a turn
+/// stops at most once per attempt, so the fired wake belongs to whichever
+/// suspension was standing when it landed.
+pub fn fold_turn_waits(events: &[SessionEvent], turn_id: &str) -> TurnWaits {
+    let attempts = attempt_chain(events, turn_id);
+    let mut waits = TurnWaits::default();
+    let mut standing: Option<TurnSuspendedEvent> = None;
+    for event in events.iter().filter(|event| {
+        event
+            .turn_id_of_work()
+            .is_some_and(|id| attempts.contains(id))
+    }) {
+        match &event.kind {
+            SessionEventKind::TurnSuspended(suspended) => {
+                waits.taken.push(suspended.wakeup.clone());
+                standing = Some(suspended.clone());
+            }
+            SessionEventKind::WakeupFired(fired) => {
+                if let Some(suspended) = standing.take() {
+                    waits.resumed = Some(ResumedWait {
+                        call_id: suspended.call_id,
+                        wakeup: suspended.wakeup,
+                        cause: fired.cause,
+                        payload: fired.payload.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    waits
 }
 
 /// Project the conversation surface into the messages a later turn replays.

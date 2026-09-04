@@ -32,7 +32,6 @@
 use komo_agent::daemon::DreamSweep;
 use komo_agent::gateway::Channel;
 use komo_agent::interaction::{Answer, ApprovalState, CancelState, GatewayDispatcher};
-use komo_services::clarify::ClarifyState;
 use komo_services::tool_execution::{SessionContext, with_session};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -121,8 +120,6 @@ struct AppState {
     /// loopback interactive HTTP turn (the GUI) surface a pending approval over
     /// `GET /api/interactions/{session}` and resolve it over `POST`.
     approvals: Arc<ApprovalState>,
-    /// Shared with the `ask_user` tool: same, for mid-turn clarify questions.
-    clarify: Arc<ClarifyState>,
     /// Cancellation slots for in-flight interruptible turns, keyed by session.
     /// Owned here (not shared with the gateway dispatcher) because the api
     /// channel is the only surface with a stop affordance.
@@ -185,7 +182,6 @@ impl ApiChannel {
         home: Option<String>,
         models: ModelMenu,
         approvals: Arc<ApprovalState>,
-        clarify: Arc<ClarifyState>,
         workspace_home: PathBuf,
         default_workspace: PathBuf,
     ) -> Self {
@@ -205,7 +201,6 @@ impl ApiChannel {
                 model: Arc::new(models.default_model),
                 models: Arc::new(models.models),
                 approvals,
-                clarify,
                 cancels: Arc::new(CancelState::new()),
                 remote_interactive: config.remote_interactive,
                 workspace_home: Arc::new(workspace_home),
@@ -1693,23 +1688,26 @@ async fn get_interactions(
     Path(session): Path<String>,
 ) -> Json<Value> {
     let approval = state.approvals.pending_info(&session);
-    let question = state.clarify.pending_question(&session);
+    let question = state.dispatcher.pending_question(&session).await;
     Json(json!({ "approval": approval, "question": question }))
 }
 
 /// Stop the session's in-flight turn.
 ///
-/// Order matters: a turn parked on an approval prompt or a clarify question is
-/// not at an await the cancel signal can interrupt, so resolve those first (deny
-/// / a stop answer) and the loop reaches its next cancellation check
-/// immediately, instead of sitting out the 5-minute prompt timeout.
+/// Order matters: a turn suspended on an approval or a question is not running
+/// at all, so the cancel signal has nothing to interrupt — the answer is what
+/// brings it back. Both are resolved first (a denial / a stop answer), and the
+/// continuation then reaches its next cancellation check immediately.
 ///
 /// Cancelling stops further rounds and further tool calls; a tool call already
 /// executing runs to completion (see `domain::cancel`). The turn's reply becomes
 /// `CANCELLED_REPLY`, which is what lands in the transcript.
 async fn cancel_turn(State(state): State<AppState>, Path(session): Path<String>) -> Json<Value> {
     let denied = state.approvals.resolve(&session, Answer::Deny(None));
-    let answered = state.clarify.resolve(&session, CANCELLED_REPLY);
+    let answered = state
+        .dispatcher
+        .answer_question(&session, CANCELLED_REPLY)
+        .await;
     let cancelled = state.cancels.cancel(&session);
     if cancelled {
         info!(%session, denied, answered, "turn cancelled by client");
@@ -1777,7 +1775,7 @@ async fn answer_question(
     Path(session): Path<String>,
     Json(body): Json<AnswerBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let resolved = state.clarify.resolve(&session, &body.text);
+    let resolved = state.dispatcher.answer_question(&session, &body.text).await;
     Ok(Json(json!({ "resolved": resolved })))
 }
 

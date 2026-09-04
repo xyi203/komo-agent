@@ -1,31 +1,37 @@
-//! The `ask_user` sentinel tool (roadmap §7 "clarify"): pause the current turn
-//! on a question to the user and resume with their answer.
+//! The `ask_user` sentinel tool: pause the current turn on a question to the
+//! user and continue with their answer (docs/bot-runtime.md §4.3).
 //!
 //! This is the mid-turn clarification path — unlike ending the turn with a
-//! question, the turn's tool-call context (which lives only in the driver's
-//! memory) survives, so the model doesn't redo completed work after the user
-//! answers. The suspension machinery mirrors chat approvals: the question goes
-//! out through the session's `ReplySink`, the tool awaits a per-session
-//! `oneshot` in [`ClarifyState`], and the dispatcher (or the TUI) resolves it
-//! with the user's next plain message.
+//! question, the work already done stays done: the call that asked is left
+//! unsettled, the turn suspends, and when the answer arrives that same call is
+//! re-dispatched and returns it.
 //!
-//! Degrades instead of erroring: no session / non-interactive context /
-//! timeout / exhausted budget all return guidance text the model can act on
-//! (proceed on stated assumptions, or conclude). `Risk::Safe` — asking is not
-//! a side effect — but each ask is a normal `RunStep`, so the ledger shows
-//! what was asked and answered.
-
-use komo_services::clarify::ClarifyState;
-use std::sync::Arc;
+//! It waits on the log, not in memory. A question used to be a `oneshot` this
+//! tool awaited for ten minutes, which meant the turn held its session slot
+//! while a person thought, and a restart lost both the question and the work
+//! behind it. Now the wait is a `turn/suspended{UserReply}` plus a registration
+//! (seven days), so the answer can arrive in another process — and the user can
+//! say something else in the meantime without queueing behind a turn that is
+//! only waiting for them.
+//!
+//! "The next plain message is the answer" is unchanged; `/skip` declines
+//! explicitly. Every ending that is not an answer — nobody able to answer, the
+//! budget spent, the question undeliverable, seven days of silence — returns
+//! the same guidance text, so the model's recovery is uniform: state the
+//! assumption and continue, or wrap up.
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use komo_core::domain::{
-    context::ToolContext,
+    context::{ToolContext, WaitRefused},
+    session_event::{Wakeup, WakeupCause},
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
+
+/// How many times one turn may ask the user (anti-interrogation cap).
+pub const CLARIFY_BUDGET_PER_TURN: usize = 2;
 
 #[derive(Deserialize)]
 struct AskArgs {
@@ -37,19 +43,18 @@ struct AskArgs {
 }
 
 /// What the model is told when nobody can answer — same wording for the
-/// no-session, non-interactive, and timeout cases so the recovery behavior is
-/// uniform: state the assumption and continue, or wrap up.
+/// no-session, non-interactive, expired and skipped cases so the recovery
+/// behavior is uniform: state the assumption and continue, or wrap up.
 const NO_ANSWER: &str = "No answer from the user (unavailable or did not reply in time). \
      Proceed with your best assumption, stating it explicitly in your reply — \
      or conclude the turn if you cannot proceed safely.";
 
-pub struct AskUserTool {
-    clarify: Arc<ClarifyState>,
-}
+#[derive(Default)]
+pub struct AskUserTool;
 
 impl AskUserTool {
-    pub fn new(clarify: Arc<ClarifyState>) -> Self {
-        Self { clarify }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -88,15 +93,28 @@ impl Tool for AskUserTool {
     async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let args: AskArgs = parse_args(&input)?;
 
+        // Back from the wait: this call is being re-dispatched because the
+        // question was answered, declined, or ran out. Never asked twice — the
+        // arguments are the same ones, so a second prompt would be the same
+        // question again.
+        if let Some(wake) = ctx.resumed_wait() {
+            return Ok(ToolOutput::text(match wake.cause {
+                WakeupCause::Reply if !wake.payload.trim().is_empty() => {
+                    format!("User answered: {}", pick(&args.options, &wake.payload))
+                }
+                _ => NO_ANSWER.to_string(),
+            }));
+        }
+
         // Someone must be able to answer: a real chat session with a human
-        // watching. Sweeps, aux sub-agents, the HTTP API, and detached
-        // contexts are non-interactive and get the degrade text instead of a
-        // dead wait.
+        // watching. Sweeps, aux sub-agents and detached contexts are
+        // non-interactive and get the degrade text instead of a wait nobody
+        // will end.
         let sc = &ctx.session;
         if !sc.interactive {
             return Ok(ToolOutput::text(NO_ANSWER));
         }
-        if !self.clarify.try_claim_budget(&sc.session_id) {
+        if asked(ctx) >= CLARIFY_BUDGET_PER_TURN {
             return Ok(ToolOutput::text(
                 "Clarify budget exhausted for this turn (2 questions max). Proceed with \
                  your best assumption, stating it explicitly, or conclude the turn.",
@@ -111,82 +129,58 @@ impl Tool for AskUserTool {
             prompt.push_str("\n（回复编号或直接输入答案）");
         }
 
-        // One question at a time per session, and the whole thing under one
-        // deadline. The gate wait is *inside* the timeout on purpose: a second
-        // question queued behind a slow first one must still be bounded by
-        // `CLARIFY_TIMEOUT` rather than stacking another full wait on top of it
-        // (which would outlive the tool's advertised `max_duration`).
-        let asked = tokio::time::timeout(self.clarify.timeout, async {
-            let gate = self.clarify.gate(&sc.session_id);
-            let _guard = gate.lock().await;
-
-            // Register BEFORE sending, so an instant reply can't race the window
-            // between the prompt landing and the waiter existing. The prompt text
-            // is stored too, so a non-sink surface (the GUI's interactions poll)
-            // can render the question.
-            let rx = self.clarify.register(&sc.session_id, &prompt);
-            if let Err(error) = sc.sink.send(&prompt).await {
-                self.clarify.forget_pending(&sc.session_id);
-                return Asked::Undeliverable(error.to_string());
-            }
-            match rx.await {
-                Ok(answer) => Asked::Answered(answer),
-                // Superseded or cleared (e.g. `/new`).
-                Err(_) => Asked::NoAnswer,
-            }
-        })
-        .await;
-
-        match asked {
-            Ok(Asked::Answered(answer)) => {
-                // Echo numbered-option picks back as their text so the model
-                // never has to re-map "2" to the option list.
-                let answer = args
-                    .options
-                    .iter()
-                    .enumerate()
-                    .find(|(i, _)| answer.trim() == (i + 1).to_string())
-                    .map(|(_, opt)| opt.clone())
-                    .unwrap_or(answer);
-                Ok(ToolOutput::text(format!("User answered: {answer}")))
-            }
-            Ok(Asked::Undeliverable(error)) => Ok(ToolOutput::text(format!(
-                "Could not deliver the question ({error}). {NO_ANSWER}"
-            ))),
-            Ok(Asked::NoAnswer) => Ok(ToolOutput::text(NO_ANSWER)),
-            // Deadline hit — either waiting on the user, or on the gate ahead
-            // of us. Same degrade either way.
-            Err(_) => {
-                self.clarify.forget_pending(&sc.session_id);
-                Ok(ToolOutput::text(NO_ANSWER))
+        // Registered before the prompt goes out, so an instant reply cannot
+        // land on a wait that does not exist yet.
+        match ctx.wait_for(Wakeup::UserReply, args.question.trim(), None) {
+            Ok(()) => {}
+            // Nothing here can stop the turn, so nobody could ever bring it
+            // back with an answer.
+            Err(WaitRefused::Unsupported | WaitRefused::Superseded) => {
+                return Ok(ToolOutput::text(NO_ANSWER));
             }
         }
-    }
-
-    fn max_duration(&self) -> Option<std::time::Duration> {
-        // Must outlast `CLARIFY_TIMEOUT`, or the executor's default per-call
-        // timeout (120s) aborts the question long before the user's 10 minutes
-        // are up — the same contract approval-gated tools have via
-        // `APPROVAL_BOUND`.
-        Some(komo_services::clarify::CLARIFY_BOUND)
+        if let Err(error) = sc.sink.send(&prompt).await {
+            // The question never reached anyone. The wait stands until it
+            // expires — but the model is told now, so it can proceed on an
+            // assumption rather than sit behind a question nobody saw.
+            return Ok(ToolOutput::text(format!(
+                "Could not deliver the question ({error}). {NO_ANSWER}"
+            )));
+        }
+        // Discarded: the turn ends here and this call comes back with the
+        // answer.
+        Ok(ToolOutput::text("Waiting for the user's answer."))
     }
 }
 
-/// How an `ask_user` wait ended, so the outcome text is chosen after the
-/// deadline wrapper rather than inside it.
-enum Asked {
-    Answered(String),
-    Undeliverable(String),
-    NoAnswer,
+/// How many questions this turn has already asked, counted from the log so a
+/// suspension does not reset it.
+fn asked(ctx: &ToolContext) -> usize {
+    ctx.waits_taken()
+        .iter()
+        .filter(|wakeup| matches!(wakeup, Wakeup::UserReply))
+        .count()
+}
+
+/// Echo a numbered-option pick back as its text, so the model never has to
+/// re-map "2" onto the option list.
+fn pick(options: &[String], answer: &str) -> String {
+    options
+        .iter()
+        .enumerate()
+        .find(|(i, _)| answer.trim() == (i + 1).to_string())
+        .map(|(_, option)| option.clone())
+        .unwrap_or_else(|| answer.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use komo_core::domain::approval::{ApprovalRequest, Approver, Decision};
-    use komo_core::domain::context::{SessionContext, ToolContext};
+    use komo_core::domain::context::{RunContext, SessionContext, ToolContext};
     use komo_core::domain::gateway::ReplySink;
-    use std::sync::Mutex;
+    use komo_core::domain::session_event::{ResumedWait, TurnWaits};
+    use std::sync::{Arc, Mutex};
 
     struct RecordingSink {
         sent: Arc<Mutex<Vec<String>>>,
@@ -201,16 +195,16 @@ mod tests {
     }
 
     struct DenyAll;
+
     #[async_trait]
     impl Approver for DenyAll {
-        async fn decide(&self, _r: &ApprovalRequest) -> Decision {
+        async fn decide(&self, _request: &ApprovalRequest) -> Decision {
             Decision::deny()
         }
     }
 
-    /// An interactive `ToolContext` whose sink records what was sent.
     fn interactive_ctx(session: &str, sent: Arc<Mutex<Vec<String>>>) -> ToolContext {
-        let session = SessionContext {
+        let sc = SessionContext {
             session_id: session.to_string(),
             workspace_root: None,
             sink: Arc::new(RecordingSink { sent }),
@@ -222,7 +216,8 @@ mod tests {
             channel: None,
             origin: Default::default(),
         };
-        ToolContext::new(session, None, Arc::new(DenyAll))
+        ToolContext::new(sc, Some(RunContext::new("t1".into())), Arc::new(DenyAll))
+            .with_call("c1", 0)
     }
 
     fn v(s: &str) -> Value {
@@ -230,136 +225,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_interactive_context_degrades_to_guidance() {
-        let tool = AskUserTool::new(Arc::new(ClarifyState::new()));
-        // A detached context is non-interactive: nobody can answer.
-        let ctx = ToolContext::new(SessionContext::detached("s0"), None, Arc::new(DenyAll));
-        let out = tool
-            .call(v(r#"{"question":"which one?"}"#), &ctx)
-            .await
-            .unwrap();
-        assert!(out.text.contains("No answer from the user"));
-    }
-
-    #[tokio::test]
-    async fn answer_flows_back_and_prompt_reaches_sink() {
-        let clarify = Arc::new(ClarifyState::new());
+    async fn asking_suspends_the_turn_on_the_question() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let ctx = interactive_ctx("s1", sent.clone());
-
-        let tool = AskUserTool::new(clarify.clone());
-        let fut = tool.call(v(r#"{"question":"红的还是蓝的?"}"#), &ctx);
-        let answerer = {
-            let clarify = clarify.clone();
-            tokio::spawn(async move {
-                // Wait until the question is registered, then answer.
-                for _ in 0..100 {
-                    if clarify.has_pending("s1") {
-                        assert!(clarify.resolve("s1", "蓝的"));
-                        return;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                panic!("question never registered");
-            })
-        };
-        let out = fut.await.unwrap();
-        answerer.await.unwrap();
-        assert_eq!(out.text, "User answered: 蓝的");
+        let out = AskUserTool::new()
+            .call(v(r#"{"question":"红的还是蓝的?"}"#), &ctx)
+            .await
+            .unwrap();
+        assert!(out.text.contains("Waiting"), "{}", out.text);
         assert!(sent.lock().unwrap()[0].contains("红的还是蓝的"));
+        let pending = ctx
+            .run
+            .as_ref()
+            .unwrap()
+            .suspension()
+            .expect("the call stopped the turn to wait");
+        assert_eq!(pending.wakeup, Wakeup::UserReply);
+        assert_eq!(pending.call_id, "c1");
     }
 
+    /// The way back: the same call, re-dispatched with the answer, returns it
+    /// instead of asking again.
     #[tokio::test]
-    async fn numbered_option_pick_maps_to_option_text() {
-        let clarify = Arc::new(ClarifyState::new());
+    async fn the_answer_comes_back_through_the_same_call() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let ctx = interactive_ctx("s2", sent.clone());
-        let tool = AskUserTool::new(clarify.clone());
-        let fut = tool.call(
-            v(r#"{"question":"which?","options":["apple","banana"]}"#),
-            &ctx,
-        );
-        let clarify2 = clarify.clone();
-        let answerer = tokio::spawn(async move {
-            for _ in 0..100 {
-                if clarify2.has_pending("s2") {
-                    clarify2.resolve("s2", "2");
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
+        ctx.run.as_ref().unwrap().resumed_with(TurnWaits {
+            taken: vec![Wakeup::UserReply],
+            resumed: Some(ResumedWait {
+                call_id: "c1".into(),
+                wakeup: Wakeup::UserReply,
+                cause: WakeupCause::Reply,
+                payload: "2".into(),
+            }),
         });
-        let out = fut.await.unwrap();
-        answerer.await.unwrap();
+        let out = AskUserTool::new()
+            .call(
+                v(r#"{"question":"which?","options":["apple","banana"]}"#),
+                &ctx,
+            )
+            .await
+            .unwrap();
         assert_eq!(out.text, "User answered: banana");
-        let prompt = &sent.lock().unwrap()[0];
-        assert!(prompt.contains("1. apple") && prompt.contains("2. banana"));
-    }
-
-    /// Two `ask_user` calls in one round — the executor runs a round's calls
-    /// concurrently, and the per-turn budget allows two. They must queue on the
-    /// session gate and both get answered; before the gate the second
-    /// `register` dropped the first waiter's sender, so question one could
-    /// never be answered and the user only ever saw question two.
-    #[tokio::test]
-    async fn concurrent_questions_queue_instead_of_clobbering_each_other() {
-        let clarify = Arc::new(ClarifyState::new());
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let tool = Arc::new(AskUserTool::new(clarify.clone()));
-
-        let spawn_ask = |question: &'static str| {
-            let (tool, sent) = (tool.clone(), sent.clone());
-            tokio::spawn(async move {
-                let ctx = interactive_ctx("s5", sent);
-                tool.call(v(&format!(r#"{{"question":"{question}"}}"#)), &ctx)
-                    .await
-                    .unwrap()
-                    .text
-            })
-        };
-        let (first, second) = (spawn_ask("Q1"), spawn_ask("Q2"));
-
-        // Answer whatever is pending, one at a time: the second asker only gets
-        // its question registered once the first releases the gate.
-        let answerer = {
-            let clarify = clarify.clone();
-            tokio::spawn(async move {
-                let mut served = 0;
-                for _ in 0..600 {
-                    if let Some(question) = clarify.pending_question("s5") {
-                        let answer = if question.contains("Q1") { "A1" } else { "A2" };
-                        assert!(clarify.resolve("s5", answer));
-                        served += 1;
-                        if served == 2 {
-                            return;
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                panic!("only {served} of 2 questions were ever pending");
-            })
-        };
-
-        let (first, second) = (first.await.unwrap(), second.await.unwrap());
-        answerer.await.unwrap();
-
-        // Each asker got *its own* answer — neither was silently superseded.
-        assert_eq!(first, "User answered: A1");
-        assert_eq!(second, "User answered: A2");
-        let asked = sent.lock().unwrap().clone();
-        assert_eq!(asked.len(), 2, "both questions reached the user: {asked:?}");
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a re-dispatched question is not asked again"
+        );
+        assert!(ctx.run.as_ref().unwrap().suspension().is_none());
     }
 
     #[tokio::test]
-    async fn budget_exhaustion_reports_instead_of_asking() {
-        let clarify = Arc::new(ClarifyState::new());
-        clarify.try_claim_budget("s3");
-        clarify.try_claim_budget("s3");
+    async fn an_unanswered_question_comes_back_as_no_answer() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let ctx = interactive_ctx("s3", sent.clone());
-        let tool = AskUserTool::new(clarify);
-        let out = tool.call(v(r#"{"question":"?"}"#), &ctx).await.unwrap();
-        assert!(out.text.contains("budget exhausted"));
+        ctx.run.as_ref().unwrap().resumed_with(TurnWaits {
+            taken: vec![Wakeup::UserReply],
+            resumed: Some(ResumedWait {
+                call_id: "c1".into(),
+                wakeup: Wakeup::UserReply,
+                cause: WakeupCause::Expired,
+                payload: String::new(),
+            }),
+        });
+        let out = AskUserTool::new()
+            .call(v(r#"{"question":"?"}"#), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.text, NO_ANSWER);
+    }
+
+    /// The budget is read from what the log says this turn already asked, so it
+    /// survives the suspension between question and answer.
+    #[tokio::test]
+    async fn budget_exhaustion_reports_instead_of_asking() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let ctx = interactive_ctx("s4", sent.clone());
+        ctx.run.as_ref().unwrap().resumed_with(TurnWaits {
+            taken: vec![Wakeup::UserReply, Wakeup::UserReply],
+            resumed: None,
+        });
+        let out = AskUserTool::new()
+            .call(v(r#"{"question":"?"}"#), &ctx)
+            .await
+            .unwrap();
+        assert!(out.text.contains("budget exhausted"), "{}", out.text);
         assert!(sent.lock().unwrap().is_empty(), "no prompt sent");
+        assert!(ctx.run.as_ref().unwrap().suspension().is_none());
+    }
+
+    #[tokio::test]
+    async fn no_one_to_ask_degrades_instead_of_waiting() {
+        let sc = SessionContext::detached("s5");
+        let ctx = ToolContext::new(sc, Some(RunContext::new("t1".into())), Arc::new(DenyAll))
+            .with_call("c1", 0);
+        let out = AskUserTool::new()
+            .call(v(r#"{"question":"?"}"#), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.text, NO_ANSWER);
+        assert!(ctx.run.as_ref().unwrap().suspension().is_none());
     }
 }

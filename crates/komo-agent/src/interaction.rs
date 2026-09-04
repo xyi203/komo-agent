@@ -19,7 +19,6 @@
 //! The turn's session context (id + reply sink) reaches the approver through
 //! the task-local in `services::tool_execution`.
 
-use komo_services::clarify::ClarifyState;
 use komo_services::tool_execution::{
     SessionContext, SessionOrigin, current_session, with_job_grants, with_session,
 };
@@ -99,7 +98,7 @@ impl PendingApproval {
     }
 }
 
-/// Per-session cancellation, keyed like the approval/clarify state: the api
+/// Per-session cancellation, keyed like the approval state: the api
 /// channel registers a signal when it starts an interruptible turn, the
 /// `/api/interactions/{session}/cancel` endpoint flips it, and the agent loop
 /// (which holds the matching [`CancelSignal`] on its [`SessionContext`]) stops at
@@ -510,6 +509,10 @@ pub enum Command {
     /// Refuse a pending approval, optionally with a reason relayed to the agent,
     /// and optionally naming a wait in another session.
     Deny(Option<String>, Option<String>),
+    /// Decline the question a suspended turn is waiting on: an answer that
+    /// says "I am not going to say", so the turn continues on its own
+    /// assumptions instead of standing for a week.
+    Skip,
     /// Make this chat the home channel for proactive output.
     SetHome,
     /// Provision the WeChat channel by QR (delivered to this chat).
@@ -589,6 +592,7 @@ pub fn classify(text: &str) -> Command {
 
     match lower.as_str() {
         "/new" | "/clear" | "/reset" => Command::New,
+        "/skip" => Command::Skip,
         "/sethome" | "/home" => Command::SetHome,
         "/wechat" | "/wechat login" | "/weixin" => Command::WechatLogin,
         _ => Command::Plain(text.to_string()),
@@ -675,9 +679,6 @@ pub struct GatewayDispatcher {
     /// fixtures, which have no store behind them).
     waits: Option<WaitParts>,
     approvals: Arc<ApprovalState>,
-    /// Pending `ask_user` questions (mirrors `approvals`): a plain inbound
-    /// message resolves a pending question instead of starting a new turn.
-    clarify: Arc<ClarifyState>,
     sessions: Arc<dyn SessionRepository>,
     home: Arc<dyn HomeRepository>,
     todos: Arc<dyn SessionTodoRepository>,
@@ -726,6 +727,94 @@ impl WakeupDispatch for TurnWaker {
     }
 }
 
+/// The two kinds of wait a person can answer, told apart so a surface never
+/// resolves the other one: `/approve` is not an answer to a question, and a
+/// question's answer is not an approval.
+fn is_approval(wakeup: &Wakeup) -> bool {
+    matches!(wakeup, Wakeup::Approval { .. })
+}
+
+/// Whether this wait is a question to the user — the one a plain message, the
+/// GUI's inline reply or `/skip` may answer. Public because the TUI's local
+/// mode drives its own turns and has to find the same wait.
+pub fn is_user_reply(wakeup: &Wakeup) -> bool {
+    matches!(wakeup, Wakeup::UserReply)
+}
+
+/// Write down that a wait ended, and retire what was watching it.
+///
+/// Three records, in this order, because each makes the next honest:
+///
+/// 1. A wait that **ran out** is written as such (`approval/expired`) before
+///    the turn sees it — the gate then reads it as a refusal instead of asking
+///    the same question again and parking the turn forever.
+/// 2. `wakeup/fired`, durably, carrying whatever the wake brought: the log has
+///    to answer "what ended the wait, and what was it handed" long after.
+/// 3. Every other wait that turn was holding is retired — an approval answered
+///    by a person must not be woken a second time by the timer watching it.
+///
+/// Continuing the turn is deliberately **not** here: the gateway claims a
+/// session slot and spawns, the TUI drives the turn itself. What must not fork
+/// is this — two writers of `wakeup/fired` would be two chances to forget it.
+pub async fn record_wake(
+    waits: &WaitParts,
+    registration: &WakeupRegistration,
+    turn_id: &str,
+    cause: WakeupCause,
+    payload: &str,
+) -> anyhow::Result<()> {
+    let session_id = registration.session_id.clone();
+    let mut closing = Vec::new();
+    if cause == WakeupCause::Expired
+        && let Wakeup::Approval { call_id } = &registration.wakeup
+    {
+        closing.push(SessionEventKind::ApprovalExpired {
+            turn_id: turn_id.to_string(),
+            call_id: call_id.clone(),
+            call_index: requested_call_index(waits, &session_id, turn_id, call_id).await,
+        });
+    }
+    closing.push(SessionEventKind::WakeupFired(WakeupFiredEvent {
+        turn_id: turn_id.to_string(),
+        wakeup_id: registration.id.clone(),
+        cause,
+        payload: payload.to_string(),
+    }));
+    waits.events.append(&session_id, closing).await?;
+    waits.events.durable_flush(&session_id).await?;
+
+    if let Err(error) = waits.wakeups.take_for_turn(&session_id, turn_id).await {
+        warn!(%error, turn = %turn_id, "failed to retire a woken turn's other waits");
+    }
+    Ok(())
+}
+
+/// The `call_index` the gate recorded when it asked. Read back rather than
+/// assumed: an expiry has to name the same call the request did, and only the
+/// request knows where in its round it sat.
+async fn requested_call_index(
+    waits: &WaitParts,
+    session_id: &str,
+    turn_id: &str,
+    call_id: &str,
+) -> u32 {
+    let Ok(events) = waits.events.events(session_id).await else {
+        return 0;
+    };
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            SessionEventKind::ApprovalRequested(requested)
+                if requested.turn_id == turn_id && requested.call_id == call_id =>
+            {
+                Some(requested.call_index)
+            }
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
 /// How many mid-turn messages a session may queue before further ones are
 /// rejected. Small on purpose: it absorbs a rapid follow-up without letting a
 /// spamming sender build an unbounded backlog.
@@ -742,7 +831,6 @@ impl GatewayDispatcher {
     pub fn new(
         handler: Arc<dyn MessageHandler>,
         approvals: Arc<ApprovalState>,
-        clarify: Arc<ClarifyState>,
         sessions: Arc<dyn SessionRepository>,
         home: Arc<dyn HomeRepository>,
         todos: Arc<dyn SessionTodoRepository>,
@@ -753,7 +841,6 @@ impl GatewayDispatcher {
         Self {
             handler,
             approvals,
-            clarify,
             sessions,
             home,
             todos,
@@ -849,6 +936,19 @@ impl GatewayDispatcher {
         registration: &WakeupRegistration,
         cause: WakeupCause,
     ) -> anyhow::Result<()> {
+        self.continue_turn_with(registration, cause, "").await
+    }
+
+    /// The same, carrying what the wake brought — the user's answer to an
+    /// `ask_user` question, a webhook's body. It rides on `wakeup/fired`, which
+    /// is where the call that stopped reads it when it is re-dispatched: one
+    /// record, so what woke the turn and what it was handed cannot disagree.
+    pub async fn continue_turn_with(
+        self: &Arc<Self>,
+        registration: &WakeupRegistration,
+        cause: WakeupCause,
+        payload: &str,
+    ) -> anyhow::Result<()> {
         let Some(waits) = self.waits.clone() else {
             anyhow::bail!("this dispatcher has no store to continue a turn from");
         };
@@ -862,31 +962,7 @@ impl GatewayDispatcher {
             anyhow::bail!("no run `{turn_id}` to continue");
         };
         let session_id = registration.session_id.clone();
-
-        let mut closing = Vec::new();
-        if cause == WakeupCause::Expired
-            && let Wakeup::Approval { call_id } = &registration.wakeup
-        {
-            closing.push(SessionEventKind::ApprovalExpired {
-                turn_id: turn_id.clone(),
-                call_id: call_id.clone(),
-                call_index: self
-                    .requested_call_index(&waits, &session_id, &turn_id, call_id)
-                    .await,
-            });
-        }
-        closing.push(SessionEventKind::WakeupFired(WakeupFiredEvent {
-            turn_id: turn_id.clone(),
-            wakeup_id: registration.id.clone(),
-            cause,
-            payload: String::new(),
-        }));
-        waits.events.append(&session_id, closing).await?;
-        waits.events.durable_flush(&session_id).await?;
-
-        if let Err(error) = waits.wakeups.take_for_turn(&session_id, &turn_id).await {
-            warn!(%error, turn = %turn_id, "failed to retire a woken turn's other waits");
-        }
+        record_wake(&waits, registration, &turn_id, cause, payload).await?;
 
         // What the turn was is what it comes back as. A routine that stopped to
         // ask is still a routine: the permission engine reads `origin` to know
@@ -957,7 +1033,10 @@ impl GatewayDispatcher {
         let Some(waits) = self.waits.clone() else {
             return false;
         };
-        let Some(registration) = self.pending_wait(&waits, session_id, None).await else {
+        let Some(registration) = self
+            .pending_wait(&waits, session_id, None, is_approval)
+            .await
+        else {
             return false;
         };
         let Some(turn_id) = registration.turn_id.clone() else {
@@ -1027,7 +1106,8 @@ impl GatewayDispatcher {
         let Some(waits) = self.waits.clone() else {
             return Answered::Nothing;
         };
-        let Some(registration) = self.pending_wait(&waits, session_id, id).await else {
+        let Some(registration) = self.pending_wait(&waits, session_id, id, is_approval).await
+        else {
             return Answered::Nothing;
         };
         let Some(turn_id) = registration.turn_id.clone() else {
@@ -1105,25 +1185,92 @@ impl GatewayDispatcher {
         }
     }
 
-    /// The approval wait an answer is for: named by id, or this chat's own.
+    /// The wait an answer is for: named by id, or this chat's own.
     ///
     /// An id is how a routine's approval is answered from the home chat — the
     /// wait belongs to another session entirely. A prefix is enough, because
     /// nobody is going to type a UUIDv7 in full.
+    ///
+    /// `wanted` narrows it to the kind of wait the caller can actually answer:
+    /// `/approve` answers an approval, a plain message answers a question, and
+    /// neither may resolve the other.
     async fn pending_wait(
         &self,
         waits: &WaitParts,
         session_id: &str,
         id: Option<&str>,
+        wanted: fn(&Wakeup) -> bool,
     ) -> Option<WakeupRegistration> {
         let registrations = waits.wakeups.list().await.ok()?;
-        let approvals = registrations
+        let matching = registrations
             .into_iter()
-            .filter(|r| matches!(r.wakeup, Wakeup::Approval { .. }));
+            .filter(|r| wanted(&r.wakeup) && r.turn_id.is_some());
         match id {
-            Some(id) => approvals.filter(|r| r.id.starts_with(id)).next(),
-            None => approvals.filter(|r| r.session_id == session_id).next(),
+            Some(id) => matching.filter(|r| r.id.starts_with(id)).next(),
+            None => matching.filter(|r| r.session_id == session_id).next(),
         }
+    }
+
+    /// The question this session's suspended turn is waiting on, if any.
+    ///
+    /// Read from the log (`turn/suspended`'s summary), not from memory: the
+    /// turn that asked may have been in a process that is gone, and the
+    /// question outlives it. Backs the GUI's interactions poll.
+    pub async fn pending_question(&self, session_id: &str) -> Option<String> {
+        let waits = self.waits.clone()?;
+        let registration = self
+            .pending_wait(&waits, session_id, None, is_user_reply)
+            .await?;
+        let turn_id = registration.turn_id.clone()?;
+        let events = waits.events.events(&registration.session_id).await.ok()?;
+        events.iter().rev().find_map(|event| match &event.kind {
+            SessionEventKind::TurnSuspended(suspended)
+                if suspended.turn_id == turn_id && !suspended.summary.is_empty() =>
+            {
+                Some(suspended.summary.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// Answer the question a suspended turn asked, and continue it.
+    ///
+    /// The single entry for every surface that can carry an answer: the next
+    /// plain chat message, the GUI's inline reply, `/skip` (an empty answer,
+    /// which the tool reads as "nobody answered"). Answers whether anything was
+    /// waiting.
+    pub async fn answer_question(self: &Arc<Self>, session_id: &str, text: &str) -> bool {
+        let Some(waits) = self.waits.clone() else {
+            return false;
+        };
+        let Some(registration) = self
+            .pending_wait(&waits, session_id, None, is_user_reply)
+            .await
+        else {
+            return false;
+        };
+        // Claim it first — a sweep may be reaching for the same wait with an
+        // expiry — and only then wake the turn.
+        match waits.wakeups.take(&registration.id).await {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                warn!(%error, "failed to claim an answered question");
+                return false;
+            }
+        }
+        // An answer and a decline are the same event with different contents:
+        // `moved-on` says the user was asked and chose not to say, which the
+        // tool degrades on exactly as it does on an expiry.
+        let cause = match text.trim().is_empty() {
+            true => WakeupCause::MovedOn,
+            false => WakeupCause::Reply,
+        };
+        if let Err(error) = self.continue_turn_with(&registration, cause, text).await {
+            warn!(%error, "failed to continue an answered turn");
+            return false;
+        }
+        true
     }
 
     /// The scope key the gate recorded when it asked, if it had one.
@@ -1147,9 +1294,7 @@ impl GatewayDispatcher {
         })
     }
 
-    /// The `call_index` the gate recorded when it asked. Read back rather than
-    /// assumed: an expiry has to name the same call the request did, and only
-    /// the request knows where in its round it sat.
+    /// The `call_index` the gate recorded when it asked.
     async fn requested_call_index(
         &self,
         waits: &WaitParts,
@@ -1157,21 +1302,7 @@ impl GatewayDispatcher {
         turn_id: &str,
         call_id: &str,
     ) -> u32 {
-        let Ok(events) = waits.events.events(session_id).await else {
-            return 0;
-        };
-        events
-            .iter()
-            .rev()
-            .find_map(|event| match &event.kind {
-                SessionEventKind::ApprovalRequested(requested)
-                    if requested.turn_id == turn_id && requested.call_id == call_id =>
-                {
-                    Some(requested.call_index)
-                }
-                _ => None,
-            })
-            .unwrap_or(0)
+        requested_call_index(waits, session_id, turn_id, call_id).await
     }
 
     /// Handle one inbound message. Returns promptly: a plain message spawns its
@@ -1314,11 +1445,18 @@ impl GatewayDispatcher {
                 };
                 let _ = sink.send(reply).await;
             }
+            Command::Skip => {
+                let reply = match self.answer_question(session_id, "").await {
+                    true => "已跳过，这一轮正在继续。",
+                    false => "当前没有待回答的问题。",
+                };
+                let _ = sink.send(reply).await;
+            }
             Command::New => {
                 self.approvals.clear(session_id);
-                // A pending clarify question belongs to the old conversation;
-                // its waiter reads the dropped sender as "no answer".
-                self.clarify.clear(session_id);
+                // A suspended turn deliberately survives `/new` (its question
+                // can still be answered, its approval still granted) — the
+                // rotate only ends the *conversation*.
                 // The working todo list is session-scoped; a fresh conversation
                 // starts with an empty one. (The session id is reused across the
                 // rotate, so the row must be cleared explicitly.)
@@ -1361,7 +1499,7 @@ impl GatewayDispatcher {
                 // turn starts. Control commands above keep priority (`/deny`
                 // etc. never reach here), and a second message while the turn
                 // keeps running queues as usual via `spawn_turn`.
-                if self.clarify.resolve(session_id, &input) {
+                if self.answer_question(session_id, &input).await {
                     return;
                 }
                 // Same rule for an approval this session is parked on: the user
@@ -1543,8 +1681,6 @@ impl GatewayDispatcher {
                 session: session.clone(),
                 armed: true,
             };
-            // Fresh clarify budget for this turn (and drop any stale question).
-            this.clarify.begin_turn(&session);
             // Catch a panic in the turn (LLM client, a repository, etc.) so a
             // single bad turn neither wedges the session nor loses the queued
             // follow-ups: the session is advanced normally below either way.
@@ -1580,8 +1716,6 @@ impl GatewayDispatcher {
         // "approved for session" set stays until `/new`).
         self.approvals.forget_pending(session);
         self.approvals.release_gate(session);
-        // Same for a clarify question the turn never resolved (+ its budget).
-        self.clarify.clear(session);
         let next = {
             let mut inflight = self.inflight.lock().unwrap();
             let Some(queue) = inflight.get_mut(session) else {
@@ -1702,7 +1836,6 @@ impl Drop for TurnGuard {
         if self.armed {
             self.dispatcher.approvals.forget_pending(&self.session);
             self.dispatcher.approvals.release_gate(&self.session);
-            self.dispatcher.clarify.clear(&self.session);
             let dropped: Vec<Arc<dyn ReplySink>> = {
                 let mut inflight = self.dispatcher.inflight.lock().unwrap();
                 let dropped = inflight
@@ -2067,34 +2200,24 @@ mod tests {
     }
 
     fn dispatcher_with(handler: Arc<GateHandler>) -> Arc<GatewayDispatcher> {
-        dispatcher_with_clarify(handler, Arc::new(ClarifyState::new()))
-    }
-
-    fn dispatcher_with_clarify(
-        handler: Arc<GateHandler>,
-        clarify: Arc<ClarifyState>,
-    ) -> Arc<GatewayDispatcher> {
-        dispatcher_with_parts(handler, clarify, Arc::new(AlwaysFreshInbox))
+        dispatcher_with_parts(handler, Arc::new(AlwaysFreshInbox))
     }
 
     fn dispatcher_with_parts(
         handler: Arc<GateHandler>,
-        clarify: Arc<ClarifyState>,
         inbox: Arc<dyn InboxRepository>,
     ) -> Arc<GatewayDispatcher> {
-        dispatcher_with_sessions(handler, clarify, inbox, Arc::new(MemorySessions::default()))
+        dispatcher_with_sessions(handler, inbox, Arc::new(MemorySessions::default()))
     }
 
     fn dispatcher_with_sessions(
         handler: Arc<GateHandler>,
-        clarify: Arc<ClarifyState>,
         inbox: Arc<dyn InboxRepository>,
         sessions: Arc<dyn SessionRepository>,
     ) -> Arc<GatewayDispatcher> {
         Arc::new(GatewayDispatcher::new(
             handler,
             Arc::new(ApprovalState::new()),
-            clarify,
             sessions,
             Arc::new(UnusedHome),
             Arc::new(UnusedTodos),
@@ -2169,7 +2292,6 @@ mod tests {
                 entered: entered_tx,
                 permits: Arc::new(Semaphore::new(10)),
             }),
-            Arc::new(ClarifyState::new()),
             Arc::new(AlwaysFreshInbox),
             sessions.clone(),
         );
@@ -2309,7 +2431,6 @@ mod tests {
             GatewayDispatcher::new(
                 handler.clone(),
                 Arc::new(ApprovalState::new()),
-                Arc::new(ClarifyState::new()),
                 Arc::new(MemorySessions::default()),
                 Arc::new(UnusedHome),
                 Arc::new(UnusedTodos),
@@ -2442,7 +2563,6 @@ mod tests {
                     permits: Arc::new(Semaphore::new(1)),
                 }),
                 Arc::new(ApprovalState::new()),
-                Arc::new(ClarifyState::new()),
                 Arc::new(MemorySessions::default()),
                 Arc::new(UnusedHome),
                 Arc::new(UnusedTodos),
@@ -2572,7 +2692,6 @@ mod tests {
             GatewayDispatcher::new(
                 handler.clone(),
                 Arc::new(ApprovalState::new()),
-                Arc::new(ClarifyState::new()),
                 Arc::new(MemorySessions::default()),
                 Arc::new(UnusedHome),
                 Arc::new(UnusedTodos),
@@ -2680,79 +2799,6 @@ mod tests {
         assert_eq!(next_entered(&mut entered_rx).await, "看下 A");
     }
 
-    // A plain message answers a pending clarify question instead of starting a
-    // new turn; once nothing is pending, plain messages dispatch normally.
-    #[tokio::test]
-    async fn plain_message_resolves_pending_clarify_not_a_new_turn() {
-        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
-        let permits = Arc::new(Semaphore::new(0));
-        let handler = Arc::new(GateHandler {
-            entered: entered_tx,
-            permits: permits.clone(),
-        });
-        let clarify = Arc::new(ClarifyState::new());
-        let dispatcher = dispatcher_with_sessions(
-            handler,
-            clarify.clone(),
-            Arc::new(AlwaysFreshInbox),
-            MemorySessions::seeded("s1", &peer()),
-        );
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
-
-        // A turn is suspended on a question.
-        let rx = clarify.register("s1", "什么颜色？");
-        dispatcher
-            .handle(
-                &peer(),
-                InboundOrigin::local(),
-                "蓝色的".into(),
-                sink.clone(),
-            )
-            .await;
-        assert_eq!(rx.await.unwrap(), "蓝色的", "message became the answer");
-        assert!(
-            entered_rx.try_recv().is_err(),
-            "the answer must not start a new turn"
-        );
-
-        // With nothing pending, the next message dispatches a turn as usual.
-        dispatcher
-            .handle(&peer(), InboundOrigin::local(), "next".into(), sink.clone())
-            .await;
-        assert_eq!(next_entered(&mut entered_rx).await, "next");
-        permits.add_permits(1);
-    }
-
-    // Control commands keep priority over a pending clarify: `/deny` resolves
-    // the approval path and is never eaten as the question's answer.
-    #[tokio::test]
-    async fn commands_keep_priority_over_pending_clarify() {
-        let (entered_tx, _entered_rx) = mpsc::unbounded_channel();
-        let handler = Arc::new(GateHandler {
-            entered: entered_tx,
-            permits: Arc::new(Semaphore::new(0)),
-        });
-        let clarify = Arc::new(ClarifyState::new());
-        let dispatcher = dispatcher_with_clarify(handler, clarify.clone());
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
-
-        let _rx = clarify.register("s1", "问题？");
-        dispatcher
-            .handle(
-                &peer(),
-                InboundOrigin::local(),
-                "/deny".into(),
-                sink.clone(),
-            )
-            .await;
-        assert!(
-            clarify.has_pending("s1"),
-            "/deny must not consume the clarify question"
-        );
-    }
-
     /// Wait for the next entered input, failing the test on timeout so a wedge
     /// surfaces as a failure rather than a hang.
     async fn next_entered(rx: &mut mpsc::UnboundedReceiver<String>) -> String {
@@ -2824,7 +2870,6 @@ mod tests {
                 entered: entered_tx,
                 permits: Arc::new(Semaphore::new(8)),
             }),
-            Arc::new(ClarifyState::new()),
             Arc::new(DedupingInbox::default()),
         );
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -2916,7 +2961,6 @@ mod tests {
                 entered: entered_tx,
                 permits: permits.clone(),
             }),
-            Arc::new(ClarifyState::new()),
             Arc::new(AlwaysFreshInbox),
             MemorySessions::seeded("s7", &peer()),
         );

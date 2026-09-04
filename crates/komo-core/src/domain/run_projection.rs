@@ -631,6 +631,7 @@ mod tests {
                     wakeup: crate::domain::session_event::Wakeup::Approval {
                         call_id: "c1".into(),
                     },
+                    call_id: "c1".into(),
                     summary: "run shell command: git push".into(),
                     expires_at: None,
                 }),
@@ -788,6 +789,7 @@ mod tests {
                     wakeup: Wakeup::Approval {
                         call_id: "c1".into(),
                     },
+                    call_id: "c1".into(),
                     summary: "waiting for approval to run: rm -rf build".into(),
                     expires_at: Some(200 + 86_400),
                 }),
@@ -832,6 +834,7 @@ mod tests {
                 SessionEventKind::TurnSuspended(TurnSuspendedEvent {
                     turn_id: "t1".into(),
                     wakeup: Wakeup::UserReply,
+                    call_id: "c1".into(),
                     summary: "asked the user which environment".into(),
                     expires_at: None,
                 }),

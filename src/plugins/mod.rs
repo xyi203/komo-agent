@@ -47,7 +47,6 @@ use komo_core::domain::hooks::{StepHook, ToolHook, TurnHook};
 use komo_core::domain::tool::Tool;
 use komo_infra::persistence::db::Db;
 use komo_infra::skills::FsSkillStore;
-use komo_services::clarify::ClarifyState;
 use komo_services::memory_query::MemoryQueryService;
 use komo_services::skill_registry::SkillRegistry;
 use komo_services::tool_execution::ToolExecutor;
@@ -328,7 +327,6 @@ pub struct ToolCx<'a> {
     pub kanban: Arc<dyn TaskRepository>,
     pub cron_jobs: Arc<dyn CronJobRepository>,
     pub workspace: Arc<Workspace>,
-    pub clarify: Arc<ClarifyState>,
     pub memory_repo: Arc<dyn MemoryRepository>,
     pub memory_query: Arc<MemoryQueryService>,
     /// Hybrid search over stored transcripts. `None` = no embedding backend (or
@@ -715,7 +713,6 @@ mod tests {
             kanban: db.clone(),
             cron_jobs: db.clone(),
             workspace: Arc::new(Workspace::current_dir().unwrap()),
-            clarify: Arc::new(ClarifyState::new()),
             memory_query: Arc::new(MemoryQueryService::new(memory_repo.clone())),
             memory_repo,
             episodic: None,
@@ -854,6 +851,9 @@ mod tests {
             "task",
             "time",
             "todo",
+            // Everywhere an agent turn runs, unattended ones included: a
+            // routine that waits two hours and checks again is the point.
+            "wait",
             "web_fetch",
             "web_search",
             "write",
@@ -873,7 +873,7 @@ mod tests {
         // The briefing runtime's second, hand-copied list.
         assert_eq!(
             sorted(Scope::BRIEFING),
-            vec!["skill", "time", "web_fetch", "web_search"],
+            vec!["skill", "time", "wait", "web_fetch", "web_search"],
         );
     }
 

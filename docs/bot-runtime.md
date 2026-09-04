@@ -558,9 +558,35 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 
 ### 第二批 · `wait` 与后台任务
 
-- **5.7 `wait` 工具**：三种参数 → 三种 Wakeup；预算；无人值守可用。验证：routine 里
-  `wait 2h` 后 gateway 重启，到点仍恢复；预算耗尽返回引导文案。
-- **5.8 `ask_user` 持久化**：换到挂起原语，行为不变。验证：提问后重启，回答仍被接上。
+- **5.7 `wait` 工具** —— **已完成**：三种参数 → 三种 Wakeup（`until` 走 reminder 的
+  `parse_after` 与 cron 的 `@at` 解析，所以「已经过去的时间」和 DST 空洞在这里也被拒）；
+  `WAIT_BUDGET_PER_TURN = 4`；`Scope::ALL`，无人值守 turn 也能调。
+  **工具触发挂起的通道就是审批那条**：`ToolContext::wait_for` 填的是审批 gate 填的同一个
+  `PendingSuspension`，所以 executor（不结算）、loop（`Suspended` 收尾）、runtime
+  （写 `turn/suspended` + 登记）一行都不用改。不同的只有回来的路：
+  `turn/suspended` 多带一个 **`call_id`**（停下来等的那次调用），
+  `rebuild_from_events` 因此把它并进 `gated` 集合无条件重放；runtime 在续跑打开时把整条
+  `attempt_chain` 的等待 fold 到 `RunContext` 上（`fold_turn_waits`），于是
+  `ctx.resumed_wait()` 交给该调用它自己的那次唤醒、`ctx.waits_taken()` 是**从日志数**的
+  每 turn 预算——内存里的计数会被它正在计的那次挂起清掉。
+  `for_task` / `for_event` 只做登记形状：5.9 / 5.12 还不存在，今天没有东西 fire 它们，
+  `Event` 靠 30 天过期回来说「没等到」，`TaskDone` 按 §3.2 不设第二个时钟。
+  验证：`a_wait_stops_the_turn_and_says_when_to_come_back`（`turn/suspended{at, call_id}`、
+  登记 `expires_at` 为 None、无 step）、
+  `a_timer_that_came_due_after_a_restart_continues_the_turn`（**新 runtime 实例**接手，
+  `fire_due_wakeups` 到点 fire，续跑里那次调用只有一个 step 且返回「时间到了」，
+  登记已退休）、`a_spent_budget_reports_instead_of_stopping_the_turn`。
+- **5.8 `ask_user` 持久化** —— **已完成**：`turn/suspended{UserReply}` + 登记（7d），
+  内存里的 `ClarifyState`（oneshot、`CLARIFY_TIMEOUT`、`CLARIFY_BOUND`、per-turn 计数）
+  整个删掉，不留兼容层。「下一条用户消息即答案」变成
+  `GatewayDispatcher::answer_question`——聊天里的普通消息、GUI 的 inline reply、api 的
+  cancel 走同一个入口，答案落在 `wakeup/fired{reply, payload}` 上，工具重放时读它；
+  `/skip` 以 `moved-on` + 空 payload 显式跳过，过期以 `expired` 回来，两者都返回原来的降级文案。
+  TUI 本地模式没有 dispatcher，但它本来就自己驱动 turn：日志那一半共用
+  `interaction::record_wake`，续跑用 `resume_interrupted`，所以「问 → 答」在没有 gateway 的
+  `komo chat` 里照常工作（没有 sweep，所以本地模式等不到 `wait 2h`——那要等 gateway 起来）。
+  验证：`a_question_answered_after_a_restart_comes_back_as_the_answer`、
+  `a_question_nobody_answered_comes_back_saying_so`（日志有 `wakeup/fired{expired}`）。
 - **5.9 后台 shell / delegate**：`task/spawned|settled`，结算唤醒或开新 turn；重启后 running 判 uncertain。
   验证：turn 结束后任务完成，session 收到带结果的新 turn；父 turn 挂起在 TaskDone 时精确恢复。
 - **5.10 kanban Task ↔ Wakeup**：`waiting_on_peer` / `wakeup_id` 列（kanban.db 加列，`ensure_columns`）；

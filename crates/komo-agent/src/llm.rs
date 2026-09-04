@@ -686,6 +686,13 @@ fn rebuild_from_events(
             SessionEventKind::ApprovalRequested(approval) => {
                 gated.insert(approval.call_id.clone());
             }
+            // A call that stopped to wait did not happen either — the tool
+            // asked to be woken instead of running (`wait`, `ask_user`). Same
+            // reading, same unconditional re-dispatch: idempotency has nothing
+            // to say about a body that never ran.
+            SessionEventKind::TurnSuspended(suspended) if !suspended.call_id.is_empty() => {
+                gated.insert(suspended.call_id.clone());
+            }
             SessionEventKind::AssistantRound(round) => rounds.push(Round {
                 id: round.response_id.clone(),
                 blocks: serde_json::from_value(round.blocks.clone())

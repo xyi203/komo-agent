@@ -14,7 +14,7 @@ use komo_core::domain::{
     session::Session,
     session_event::{
         AssistantMessageEvent, MessageSource, SessionEvent, SessionEventKind, SurfacePlacement,
-        TurnRecorder, TurnSuspendedEvent, UserMessageEvent,
+        TurnRecorder, TurnSuspendedEvent, UserMessageEvent, fold_turn_waits,
     },
     wakeup::{Suspended, WakeupRegistration, WakeupRepository, is_suspended},
 };
@@ -398,6 +398,12 @@ impl AgentRuntime {
                 // their own. A resume is rare; a full fold there is the cheap
                 // way to keep the claim honest.
                 self.open_in_ledger(session_id, &opening).await;
+                // What the chain has waited for, and what ended the wait that
+                // brought this attempt back. Read here, where the events are
+                // already in hand, and carried on the run: the call that
+                // stopped is about to be re-dispatched and has to recognise its
+                // own wake instead of registering a second one.
+                run.resumed_with(fold_turn_waits(&events, &turn_id));
                 Some((events, turn_id))
             }
         };
@@ -443,6 +449,7 @@ impl AgentRuntime {
                     vec![SessionEventKind::TurnSuspended(TurnSuspendedEvent {
                         turn_id: probe.run_id.clone(),
                         wakeup: pending.wakeup.clone(),
+                        call_id: pending.call_id.clone(),
                         summary: pending.summary.clone(),
                         expires_at,
                     })],
@@ -933,7 +940,8 @@ impl AgentRuntime {
                         .await?
                     };
 
-                    // A gated call that stopped to wait ends the turn here.
+                    // A call that stopped to wait — for an approval, or because
+                    // the tool asked to be woken — ends the turn here.
                     // Checked between rounds rather than inside the round: the
                     // round's other calls have already run and settled, and
                     // their results are on record for the continuation to
@@ -1140,7 +1148,9 @@ pub(crate) mod tests {
     }
     use super::*;
     use komo_infra::persistence::db::Db;
+    use komo_tools::ask_user::AskUserTool;
     use komo_tools::time::TimeTool;
+    use komo_tools::wait::WaitTool;
 
     use crate::interaction::{CancelState, CancelTicket};
     use async_trait::async_trait;
@@ -1151,6 +1161,7 @@ pub(crate) mod tests {
         repository::SessionRepository,
         run::RunStatus,
         session::Session,
+        session_event::Wakeup,
         tool::{Tool, ToolError, ToolOutput},
     };
     use std::collections::VecDeque;
@@ -2173,6 +2184,392 @@ pub(crate) mod tests {
             steps[0].result
         );
         assert_ne!(steps[0].result, "acted", "and the call did not run");
+    }
+
+    // ── the model's own waits (docs/bot-runtime.md §5.7 / §5.8) ──────────────
+
+    /// A runtime whose turn calls one sentinel tool with `args`, then answers.
+    /// Rebuilt per "process" in the tests below, which is what a restart is.
+    fn waiting_runtime(db: Arc<Db>, tool: Arc<dyn Tool>, args: &str) -> AgentRuntime {
+        let name = tool.name();
+        let (mut rt, _) = scripted_runtime(
+            db.clone(),
+            vec![
+                tool_calls(vec![call(name, args)]),
+                Step::Final("done".into()),
+            ],
+            vec![],
+            30,
+        );
+        let mut executor =
+            ToolExecutor::new(komo_services::tool_execution::ToolExecutionConfig::default());
+        executor.register(tool);
+        rt.tool_executor = executor.with_events(db.clone());
+        rt.wakeups = Some(db.clone());
+        rt
+    }
+
+    /// A session context somebody is watching, so `ask_user` has an addressee.
+    fn watched(session_id: &str, sent: Arc<Mutex<Vec<String>>>) -> SessionContext {
+        struct Recording(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait]
+        impl komo_core::domain::gateway::ReplySink for Recording {
+            async fn send(&self, text: &str) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(text.to_string());
+                Ok(())
+            }
+        }
+
+        SessionContext {
+            sink: Arc::new(Recording(sent)),
+            interactive: true,
+            ..SessionContext::detached(session_id)
+        }
+    }
+
+    /// What the sweep does when a wait comes due, minus the session slot the
+    /// gateway holds: record the wake through the one writer of
+    /// `wakeup/fired`, then continue the turn.
+    struct TestWaker {
+        runtime: Arc<AgentRuntime>,
+        waits: crate::interaction::WaitParts,
+    }
+
+    #[async_trait]
+    impl komo_core::domain::wakeup::WakeupDispatch for TestWaker {
+        async fn fire(
+            &self,
+            registration: &WakeupRegistration,
+            cause: komo_core::domain::session_event::WakeupCause,
+        ) -> anyhow::Result<()> {
+            let turn_id = registration.turn_id.clone().expect("a continuation");
+            crate::interaction::record_wake(&self.waits, registration, &turn_id, cause, "").await?;
+            let run = self
+                .waits
+                .runs
+                .get(&turn_id)
+                .await?
+                .expect("the suspended run");
+            self.runtime.resume_interrupted(&run).await?;
+            Ok(())
+        }
+    }
+
+    fn wait_parts(db: &Arc<Db>) -> crate::interaction::WaitParts {
+        crate::interaction::WaitParts {
+            runs: db.clone(),
+            events: db.clone(),
+            wakeups: db.clone(),
+        }
+    }
+
+    /// `wait` stops the turn and leaves behind the two records a continuation
+    /// needs: the log saying which call is waiting and for what, and a
+    /// registration saying when to come back.
+    #[tokio::test]
+    async fn a_wait_stops_the_turn_and_says_when_to_come_back() {
+        let db = Arc::new(Db::connect(&sqlite_url("komo_rt_wait.db")).await.unwrap());
+        let rt = waiting_runtime(db.clone(), Arc::new(WaitTool), r#"{"until":"2h"}"#);
+
+        let outcome = rt
+            .handle_input("cli:timer", "check back in two hours".into())
+            .await;
+        assert!(
+            komo_core::domain::wakeup::is_suspended(&outcome.unwrap_err()),
+            "waiting is not failing"
+        );
+
+        let run = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+        assert_eq!(run.status, RunStatus::Suspended);
+        assert!(
+            RunRepository::steps(&*db, &run.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a call that stopped to wait did not happen"
+        );
+
+        let events = SessionEventRepository::events(&*db, "cli:timer")
+            .await
+            .unwrap();
+        let suspended = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::TurnSuspended(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("the log says the turn is waiting");
+        assert_eq!(suspended.call_id, "id-wait", "and which call is");
+        assert!(matches!(suspended.wakeup, Wakeup::At { .. }));
+        assert_eq!(suspended.expires_at, None);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, SessionEventKind::AssistantMessage(_))),
+            "a suspended turn has not answered"
+        );
+
+        let waits = komo_core::domain::wakeup::WakeupRepository::list(&*db)
+            .await
+            .unwrap();
+        assert_eq!(waits.len(), 1);
+        assert_eq!(waits[0].turn_id.as_deref(), Some(run.id.as_str()));
+        assert_eq!(
+            waits[0].expires_at, None,
+            "a timer needs no second deadline"
+        );
+        let Wakeup::At { at } = waits[0].wakeup else {
+            panic!("a delay is a timer: {:?}", waits[0].wakeup)
+        };
+        let now = now();
+        assert!(
+            (at - now - 7_200).abs() <= 5,
+            "two hours from now, give or take the test's own clock"
+        );
+    }
+
+    /// The headline of `wait`: the process that stopped is gone, the clock
+    /// reaches the moment anyway, and the same call comes back — once — with
+    /// the wake as its result.
+    #[tokio::test]
+    async fn a_timer_that_came_due_after_a_restart_continues_the_turn() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_wait_fired.db"))
+                .await
+                .unwrap(),
+        );
+
+        // 1. A turn stops on a timer, and the process ends.
+        let rt = waiting_runtime(db.clone(), Arc::new(WaitTool), r#"{"until":"2h"}"#);
+        assert!(
+            rt.handle_input("cli:fired", "wait for it".into())
+                .await
+                .is_err()
+        );
+        drop(rt);
+        let suspended = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+        assert_eq!(suspended.status, RunStatus::Suspended);
+
+        // 2. A new process, and the clock reaches the moment. The sweep claims
+        //    the registration, checks the log still says "waiting", and fires.
+        let rt = Arc::new(waiting_runtime(
+            db.clone(),
+            Arc::new(WaitTool),
+            r#"{"until":"2h"}"#,
+        ));
+        let sweep = crate::daemon::CronJobSweep {
+            jobs: db.clone(),
+            notifier: Arc::new(SilentNotifier),
+            wakeups: Some(crate::daemon::WakeupWiring {
+                registrations: db.clone(),
+                events: db.clone(),
+                dispatch: Arc::new(TestWaker {
+                    runtime: rt.clone(),
+                    waits: wait_parts(&db),
+                }),
+            }),
+            runtime: None,
+        };
+        let wiring = sweep.wakeups.as_ref().unwrap();
+        assert_eq!(
+            sweep.fire_due_wakeups(wiring, now() + 7_200).await,
+            1,
+            "the moment arrived"
+        );
+
+        // 3. The continuation ran the call exactly once, and what it returned
+        //    is the wake — not another wait.
+        let continuation = RunRepository::list(&*db, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.resumed_from.as_deref() == Some(suspended.id.as_str()))
+            .expect("the continuation links back");
+        assert_eq!(continuation.status, RunStatus::Done);
+        let steps = RunRepository::steps(&*db, &continuation.id).await.unwrap();
+        assert_eq!(steps.len(), 1, "the wait ran once, on the way back");
+        assert!(
+            steps[0].result.contains("The wait is over"),
+            "the model is told the moment arrived: {}",
+            steps[0].result
+        );
+        assert!(
+            RunRepository::steps(&*db, &suspended.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "and the attempt that stopped still has no step"
+        );
+        assert!(
+            komo_core::domain::wakeup::WakeupRepository::list(&*db)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a fired wait is retired, not left to fire again"
+        );
+    }
+
+    /// `ask_user` is the same primitive with a person on the other end: the
+    /// question goes out, the turn stops, and the answer — arriving in another
+    /// process — comes back as that call's result.
+    #[tokio::test]
+    async fn a_question_answered_after_a_restart_comes_back_as_the_answer() {
+        let db = Arc::new(Db::connect(&sqlite_url("komo_rt_ask.db")).await.unwrap());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+
+        let rt = waiting_runtime(
+            db.clone(),
+            Arc::new(AskUserTool::new()),
+            r#"{"question":"红的还是蓝的?"}"#,
+        );
+        let outcome = with_session(
+            watched("cli:ask", asked.clone()),
+            rt.handle_input("cli:ask", "买一个".into()),
+        )
+        .await;
+        assert!(komo_core::domain::wakeup::is_suspended(
+            &outcome.unwrap_err()
+        ));
+        assert!(asked.lock().unwrap()[0].contains("红的还是蓝的"));
+        drop(rt);
+
+        let suspended = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+        assert_eq!(suspended.status, RunStatus::Suspended);
+        let waits = komo_core::domain::wakeup::WakeupRepository::list(&*db)
+            .await
+            .unwrap();
+        assert_eq!(waits.len(), 1);
+        assert_eq!(waits[0].wakeup, Wakeup::UserReply);
+        assert!(
+            waits[0].expires_at.is_some(),
+            "a question nobody answers has to come back and say so"
+        );
+
+        // The user answers — in a process that never asked.
+        let parts = wait_parts(&db);
+        crate::interaction::record_wake(
+            &parts,
+            &waits[0],
+            &suspended.id,
+            komo_core::domain::session_event::WakeupCause::Reply,
+            "蓝的",
+        )
+        .await
+        .unwrap();
+        let rt = waiting_runtime(
+            db.clone(),
+            Arc::new(AskUserTool::new()),
+            r#"{"question":"红的还是蓝的?"}"#,
+        );
+        let reply = with_session(
+            watched("cli:ask", asked.clone()),
+            rt.resume_interrupted(&suspended),
+        )
+        .await
+        .unwrap()
+        .expect("a suspended turn ends on the user message, so it is continuable");
+        assert_eq!(reply, "done");
+
+        let continuation = RunRepository::list(&*db, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.resumed_from.as_deref() == Some(suspended.id.as_str()))
+            .unwrap();
+        let steps = RunRepository::steps(&*db, &continuation.id).await.unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].result, "User answered: 蓝的");
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            1,
+            "and the question was not asked a second time"
+        );
+    }
+
+    /// Seven days of silence. The turn still comes back, and is told nobody
+    /// answered — a question that simply vanished would leave the model
+    /// waiting on an answer that is never coming.
+    #[tokio::test]
+    async fn a_question_nobody_answered_comes_back_saying_so() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_ask_expired.db"))
+                .await
+                .unwrap(),
+        );
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let rt = waiting_runtime(
+            db.clone(),
+            Arc::new(AskUserTool::new()),
+            r#"{"question":"哪一个?"}"#,
+        );
+        assert!(
+            with_session(
+                watched("cli:silent", asked.clone()),
+                rt.handle_input("cli:silent", "帮我改一下".into()),
+            )
+            .await
+            .is_err()
+        );
+        drop(rt);
+        let suspended = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+
+        // The deadline passes: the sweep fires it as expired rather than
+        // dropping the row.
+        let rt = Arc::new(waiting_runtime(
+            db.clone(),
+            Arc::new(AskUserTool::new()),
+            r#"{"question":"哪一个?"}"#,
+        ));
+        let sweep = crate::daemon::CronJobSweep {
+            jobs: db.clone(),
+            notifier: Arc::new(SilentNotifier),
+            wakeups: Some(crate::daemon::WakeupWiring {
+                registrations: db.clone(),
+                events: db.clone(),
+                dispatch: Arc::new(TestWaker {
+                    runtime: rt.clone(),
+                    waits: wait_parts(&db),
+                }),
+            }),
+            runtime: None,
+        };
+        let wiring = sweep.wakeups.as_ref().unwrap();
+        assert_eq!(sweep.fire_due_wakeups(wiring, now() + 8 * 86_400).await, 1);
+
+        let events = SessionEventRepository::events(&*db, "cli:silent")
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::WakeupFired(fired)
+                    if fired.cause == komo_core::domain::session_event::WakeupCause::Expired
+            )),
+            "the expiry is on record, not silent"
+        );
+        let continuation = RunRepository::list(&*db, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.resumed_from.as_deref() == Some(suspended.id.as_str()))
+            .unwrap();
+        let steps = RunRepository::steps(&*db, &continuation.id).await.unwrap();
+        assert_eq!(steps.len(), 1);
+        assert!(
+            steps[0].result.starts_with("No answer from the user"),
+            "the model is told to proceed on an assumption: {}",
+            steps[0].result
+        );
+    }
+
+    struct SilentNotifier;
+
+    #[async_trait]
+    impl komo_core::domain::notify::Notifier for SilentNotifier {
+        async fn notify(&self, _title: &str, _body: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     /// The turn has to be in the ledger *before* it ends, or a crash leaves

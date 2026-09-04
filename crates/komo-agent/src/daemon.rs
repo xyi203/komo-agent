@@ -660,7 +660,7 @@ impl CronJobSweep {
     ///    doing: one pointing at a turn that already resumed (or ended) is
     ///    stale, and firing it would run the same work twice. It is dropped —
     ///    the claim above already removed it — and named in the log.
-    async fn fire_due_wakeups(&self, wiring: &WakeupWiring, now: i64) -> usize {
+    pub(crate) async fn fire_due_wakeups(&self, wiring: &WakeupWiring, now: i64) -> usize {
         let registrations = match wiring.registrations.list().await {
             Ok(rows) => rows,
             Err(error) => {
@@ -1679,6 +1679,7 @@ mod tests {
                 SessionEventKind::TurnSuspended(TurnSuspendedEvent {
                     turn_id: turn.into(),
                     wakeup: Wakeup::UserReply,
+                    call_id: "c1".into(),
                     summary: "waiting for an answer".into(),
                     expires_at: None,
                 }),
@@ -2536,7 +2537,6 @@ mod tests {
         use crate::runtime::tests::{gated_runtime, sqlite_url};
         use crate::unattended::UnattendedSuspend;
         use komo_core::domain::policy::Policy;
-        use komo_services::clarify::ClarifyState;
 
         let db = Arc::new(
             komo_infra::persistence::db::Db::connect(&sqlite_url(name))
@@ -2555,7 +2555,6 @@ mod tests {
             GatewayDispatcher::new(
                 Arc::new(continuing),
                 Arc::new(ApprovalState::new()),
-                Arc::new(ClarifyState::new()),
                 db.clone(),
                 db.clone(),
                 db.clone(),

@@ -22,7 +22,8 @@ use crate::domain::repository::SessionEventRepository;
 use crate::domain::run::RunStep;
 use crate::domain::session::ChannelPeer;
 use crate::domain::session_event::{
-    ApprovalRequestedEvent, ApprovalResolvedEvent, SessionEvent, SessionEventKind, Wakeup,
+    ApprovalRequestedEvent, ApprovalResolvedEvent, ResumedWait, SessionEvent, SessionEventKind,
+    TurnWaits, Wakeup,
 };
 
 /// What is driving a turn, as far as **approval** is concerned.
@@ -309,11 +310,16 @@ impl ReplySink for NoopSink {
     }
 }
 
-/// The wait a gated call raised instead of running.
+/// The wait a call raised instead of running.
 ///
 /// Carried on the turn rather than returned from the call, because it is not
 /// the *call's* outcome — the call did not happen. The executor reads it to
 /// leave that call unsettled, and the loop reads it to stop the turn.
+///
+/// Raised by the approval gate when nobody has answered yet, and by a tool that
+/// asked to wait ([`ToolContext::wait_for`]) — one channel, because from the
+/// executor's and the loop's side those are the same event: this call stopped,
+/// the turn is over for now, and the call comes back when the wake arrives.
 #[derive(Debug, Clone)]
 pub struct PendingSuspension {
     pub call_id: String,
@@ -347,6 +353,12 @@ pub struct RunContext {
     /// One per turn: the first call to raise one stops the turn, and a round's
     /// other calls settle normally around it.
     suspend: Arc<Mutex<Option<PendingSuspension>>>,
+    /// The other direction: what this turn's chain has already waited for, and
+    /// what ended the wait that brought this attempt back. Folded out of the
+    /// log by the runtime when a continuation opens, so a tool can read its own
+    /// wake without a log handle of its own — which is what makes waiting work
+    /// in a runtime whose executor keeps no transcript (a routine's).
+    waits: Arc<Mutex<TurnWaits>>,
     /// Monotonic step counter, shared across clones so steps within a run get a
     /// stable order even when tool calls run concurrently.
     seq: Arc<AtomicI64>,
@@ -364,6 +376,7 @@ impl RunContext {
             run_id,
             steps: Arc::new(Mutex::new(Vec::new())),
             suspend: Arc::new(Mutex::new(None)),
+            waits: Arc::new(Mutex::new(TurnWaits::default())),
             seq: Arc::new(AtomicI64::new(0)),
             checkpoint: None,
         }
@@ -421,6 +434,17 @@ impl RunContext {
         self.suspend.lock().unwrap().clone()
     }
 
+    /// Install what the log says this turn has waited for. Called once, as a
+    /// continuation opens: the runtime holds the events, the tool does not.
+    pub fn resumed_with(&self, waits: TurnWaits) {
+        *self.waits.lock().unwrap() = waits;
+    }
+
+    /// What this turn's chain has waited for so far.
+    pub fn waits(&self) -> TurnWaits {
+        self.waits.lock().unwrap().clone()
+    }
+
     /// Whether *this call* is the one that stopped the turn — the executor's
     /// question, because a suspended call has no outcome to record.
     pub fn suspended_call(&self, call_id: &str) -> bool {
@@ -445,6 +469,32 @@ pub struct ToolContext {
     /// Makes this call's approval a durable fact. `None` for a turn with no
     /// event log (aux runtimes), which simply loses the not-started proof.
     approval: Option<ApprovalGate>,
+    /// Which call in the round this is. Installed by the executor for every
+    /// ledgered call — separately from the approval gate, which additionally
+    /// needs an event log: a tool may stop to wait in a runtime that keeps no
+    /// transcript of its tool calls, and the identity is all that stopping
+    /// takes.
+    call: Option<CallRef>,
+}
+
+/// One call's place in its round: what a wait has to name to be re-dispatched
+/// as the same call it stopped as.
+#[derive(Debug, Clone)]
+struct CallRef {
+    call_id: String,
+    call_index: u32,
+}
+
+/// Why a tool's request to wait was turned down. Both are the tool's to report
+/// to the model — neither is an error, and neither stops the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitRefused {
+    /// This runtime cannot stop a turn and come back for it (no ledger, no
+    /// call identity — an aux completion, a sub-agent, a test).
+    Unsupported,
+    /// Another call in the same round stopped the turn first. One suspension
+    /// per turn: this call settles normally and the model may ask again.
+    Superseded,
 }
 
 /// What one call needs to record its approval durably.
@@ -546,6 +596,7 @@ impl ToolContext {
             run,
             approver,
             approval: None,
+            call: None,
         }
     }
 
@@ -554,6 +605,73 @@ impl ToolContext {
     pub fn with_approval_gate(mut self, gate: ApprovalGate) -> Self {
         self.approval = Some(gate);
         self
+    }
+
+    /// Name this call, so it can stop to wait and come back as itself.
+    pub fn with_call(mut self, call_id: &str, call_index: u32) -> Self {
+        self.call = Some(CallRef {
+            call_id: call_id.to_string(),
+            call_index,
+        });
+        self
+    }
+
+    /// Stop the turn here and come back when `wakeup` fires.
+    ///
+    /// The tool's half of the suspension primitive (docs/bot-runtime.md §3.4):
+    /// the call is left unsettled — a call that stopped to wait **did not
+    /// happen** — the loop ends the turn as suspended, and the runtime writes
+    /// `turn/suspended` plus the registration that brings it back. What the
+    /// tool returns after this is discarded, so it may be anything.
+    ///
+    /// The way back is [`resumed_wait`](Self::resumed_wait): the same call is
+    /// re-dispatched with the wake attached, and returns *that* to the model.
+    pub fn wait_for(
+        &self,
+        wakeup: Wakeup,
+        summary: impl Into<String>,
+        expires_at: Option<i64>,
+    ) -> Result<(), WaitRefused> {
+        let (Some(run), Some(call)) = (&self.run, &self.call) else {
+            return Err(WaitRefused::Unsupported);
+        };
+        run.suspend(PendingSuspension {
+            call_id: call.call_id.clone(),
+            call_index: call.call_index,
+            wakeup,
+            summary: summary.into(),
+            expires_at,
+        });
+        match run.suspended_call(&call.call_id) {
+            true => Ok(()),
+            false => Err(WaitRefused::Superseded),
+        }
+    }
+
+    /// The wake that ended **this call's** wait, if this call is the
+    /// re-dispatch of one that stopped.
+    ///
+    /// Matched on the call id the suspension recorded, so a turn that waited
+    /// twice never hands one call the other's answer — and a tool that reads
+    /// `Some` here must return it rather than wait again, which is what keeps
+    /// a wait from re-arming itself forever.
+    pub fn resumed_wait(&self) -> Option<ResumedWait> {
+        let call = self.call.as_ref()?;
+        self.run
+            .as_ref()?
+            .waits()
+            .resumed
+            .filter(|wake| wake.call_id == call.call_id)
+    }
+
+    /// Every wait this turn has already taken — the per-turn budget's counter,
+    /// read from the log rather than from memory so it survives the suspension
+    /// it is counting.
+    pub fn waits_taken(&self) -> Vec<Wakeup> {
+        self.run
+            .as_ref()
+            .map(|run| run.waits().taken)
+            .unwrap_or_default()
     }
 
     /// Ask the wired approver to allow `request`, keeping only the yes/no. The

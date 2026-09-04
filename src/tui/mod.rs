@@ -35,12 +35,13 @@ mod markdown;
 mod paste;
 mod ui;
 
-use komo_agent::interaction::CancelState;
+use komo_agent::interaction::{CancelState, CancelTicket, WaitParts, is_user_reply, record_wake};
 use komo_agent::runtime::AgentRuntime;
 use komo_core::domain::awaiting::Awaiting;
 use komo_core::domain::cancel::{CANCELLED_REPLY, is_cancelled};
+use komo_core::domain::session_event::WakeupCause;
+use komo_core::domain::wakeup::is_suspended;
 use komo_infra::persistence::db::Db;
-use komo_services::clarify::ClarifyState;
 use komo_services::tool_execution::{SessionContext, SessionOrigin, with_session};
 use std::{io, path::PathBuf, sync::Arc};
 
@@ -158,8 +159,6 @@ impl ReplySink for ChannelSink {
 /// wait for it.
 struct Boot {
     backend: Backend,
-    /// Mid-turn clarify state (local mode only) — see [`Connected::clarify`].
-    clarify: Option<Arc<ClarifyState>>,
     /// The session to drive: the fresh id, or the resolved one on resume.
     session: String,
     /// The resumed transcript; empty for a fresh session.
@@ -193,7 +192,6 @@ pub async fn run(config: ConfigSnapshot) -> anyhow::Result<()> {
             }
             Ok(Boot {
                 backend: connected.backend,
-                clarify: connected.clarify,
                 session,
                 history: Vec::new(),
                 workspace,
@@ -223,7 +221,6 @@ pub async fn resume(config: ConfigSnapshot, id: &str) -> anyhow::Result<()> {
             let awaiting = resume_awaiting(&connected.backend, &session).await?;
             Ok(Boot {
                 backend: connected.backend,
-                clarify: connected.clarify,
                 session,
                 history,
                 workspace,
@@ -320,10 +317,6 @@ async fn resume_workspace(
 
 struct Connected {
     backend: Backend,
-    /// Mid-turn clarify state (local mode only): the `ask_user` tool waits on
-    /// it, the event loop resolves the user's answer into it. Remote turns
-    /// clarify server-side (where the gateway dispatcher owns routing).
-    clarify: Option<Arc<ClarifyState>>,
 }
 
 /// Connect to whatever backend is available. `approval_tx` feeds the event
@@ -340,7 +333,6 @@ async fn connect(
                 gateway: Arc::new(gw),
                 workspace: folder_workspace_id(workspace)?,
             },
-            clarify: None,
         });
     }
     // No gateway is running (we'd have taken the remote path above), so opening
@@ -354,7 +346,6 @@ async fn connect(
             runtime: Arc::new(wired.runtime),
             db,
         },
-        clarify: Some(wired.clarify),
     })
 }
 
@@ -431,7 +422,6 @@ async fn event_loop(
     // that needs the backend — dispatch, `/new`, resume history — waits.
     let mut boot = Some(boot);
     let mut backend: Option<Backend> = None;
-    let mut clarify: Option<Arc<ClarifyState>> = None;
     let mut pending: Option<String> = None;
     let mut workspace = workspace;
 
@@ -450,7 +440,7 @@ async fn event_loop(
         },
     );
 
-    let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<Result<String, String>>();
+    let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnEnd>();
     // Terminal input arrives over a channel rather than being awaited inline: a
     // paste that a terminal delivers as keystrokes has to be *collected* (see
     // `paste::extend_for_paste`), which needs the receiver free while the batch
@@ -519,12 +509,11 @@ async fn event_loop(
                         mode.to_string()
                     },
                 );
-                clarify = ready.clarify;
                 backend = Some(ready.backend);
                 if let Some(text) = pending.take() {
                     spawn_turn(
                         backend.as_ref().expect("installed above"),
-                        &clarify, &cancels, &app.session_id, text,
+                        &cancels, &app.session_id, text,
                         &turn_tx, &event_tx, &sink_tx,
                     );
                 }
@@ -562,25 +551,25 @@ async fn event_loop(
             }
             Some(result) = turn_rx.recv() => {
                 app.finish_turn();
-                // A question the turn never resolved dies with it.
-                app.awaiting_answer = false;
                 // No tool is running once the turn is done.
                 app.active_tool = None;
+                // A turn that stopped on a question is not over: the input is
+                // unlocked as its answer, and nothing is rendered — the
+                // question itself already came through the sink.
+                app.awaiting_answer = matches!(result, TurnEnd::Waiting);
                 match result {
                     // The final round streamed this same text, so settle that
                     // live entry on the reply rather than appending a duplicate.
-                    Ok(reply) => app.finish_stream(reply),
-                    Err(error) => app.push(Role::Error, error),
+                    TurnEnd::Reply(reply) => app.finish_stream(reply),
+                    TurnEnd::Waiting => {}
+                    TurnEnd::Failed(error) => app.push(Role::Error, error),
                 }
             }
-            // Mid-turn agent message (local mode): render it, and if the turn
-            // is now waiting on `ask_user`, unlock the input as its answer.
-            // The tool registers before sending, so this check can't race.
+            // Mid-turn agent message (local mode): the `ask_user` question, or
+            // an approval prompt. Rendered as it arrives; whether the turn is
+            // now waiting is answered by how it *ends* (above), not by this.
             Some(text) = sink_rx.recv() => {
                 app.push(Role::Agent, text);
-                app.awaiting_answer = clarify
-                    .as_ref()
-                    .is_some_and(|cl| cl.has_pending(&app.session_id));
             }
             // Show one approval at a time; further prompts wait in the channel
             // until the current modal is answered.
@@ -627,7 +616,6 @@ async fn event_loop(
                     match &backend {
                         Some(backend) => spawn_turn(
                             backend,
-                            &clarify,
                             &cancels,
                             &app.session_id,
                             text,
@@ -649,11 +637,9 @@ async fn event_loop(
                         continue;
                     };
                     // Turns are keyed by session id, so an in-flight turn
-                    // for the old id can finish and render harmlessly.
-                    if let Some(cl) = &clarify {
-                        // A pending question belongs to the old session.
-                        cl.clear(&app.session_id);
-                    }
+                    // for the old id can finish and render harmlessly. A
+                    // question left standing stays answerable on its own
+                    // session — `/new` ends the conversation, not the turn.
                     app.awaiting_answer = false;
                     app.session_id = new_session_id();
                     if let Backend::Local { db, .. } = backend {
@@ -665,20 +651,34 @@ async fn event_loop(
                     );
                 }
                 Some(Action::Answer { text, shown }) => {
-                    if let Some(cl) = &clarify
-                        && cl.resolve(&app.session_id, &text)
-                    {
+                    let answered = match &backend {
+                        Some(backend) => {
+                            answer_question(
+                                backend,
+                                &cancels,
+                                &app.session_id,
+                                text,
+                                &turn_tx,
+                                &event_tx,
+                                &sink_tx,
+                            )
+                            .await
+                        }
+                        None => false,
+                    };
+                    if answered {
                         app.push(Role::You, shown);
+                        app.start_turn();
+                        app.begin_tools();
                     } else {
-                        app.push(Role::Info, "问题已失效（超时或会话已重置）。".to_string());
+                        app.push(Role::Info, "问题已失效（已被回答或已过期）。".to_string());
                     }
                 }
                 Some(Action::Interrupt) => {
-                    // Three ways a turn can be stuck, and the signal alone only
-                    // covers one: a turn parked in `ask_user` never reaches
-                    // another await, so the question has to be resolved first or
-                    // Esc looks inert until the clarify timeout. Same order the
-                    // api channel's `cancel_turn` uses.
+                    // A turn suspended on a question is not running, so the
+                    // cancel signal has nothing to interrupt: answering it with
+                    // the stop text is what ends it. Same order the api
+                    // channel's `cancel_turn` uses.
                     // Still booting: the only thing running is the queued
                     // draft, so Esc takes that back.
                     let Some(backend) = &backend else {
@@ -696,11 +696,19 @@ async fn event_loop(
                             gateway.cancel_turn(&app.session_id).await.unwrap_or(false)
                         }
                         Backend::Local { .. } => {
-                            if let Some(cl) = &clarify {
-                                cl.resolve(&app.session_id, CANCELLED_REPLY);
-                            }
+                            let answered = app.awaiting_answer
+                                && answer_question(
+                                    backend,
+                                    &cancels,
+                                    &app.session_id,
+                                    CANCELLED_REPLY.to_string(),
+                                    &turn_tx,
+                                    &event_tx,
+                                    &sink_tx,
+                                )
+                                .await;
                             app.awaiting_answer = false;
-                            cancels.cancel(&app.session_id)
+                            cancels.cancel(&app.session_id) || answered
                         }
                     };
                     // Said out loud either way: "nothing happened" and "stopping,
@@ -724,62 +732,160 @@ async fn event_loop(
     Ok(backend.is_some().then_some(app.session_id))
 }
 
+/// How a turn ended, as the loop has to render it.
+enum TurnEnd {
+    Reply(String),
+    /// It stopped to wait for the user's answer (`ask_user`). Neither an answer
+    /// nor a failure: the input unlocks, and what is typed continues this same
+    /// turn.
+    Waiting,
+    Failed(String),
+}
+
+/// The interactive context a locally driven turn runs under: its sink carries
+/// mid-turn messages (the `ask_user` question, an approval prompt) into the
+/// transcript, and its cancel signal is what Esc flips.
+fn local_ctx(
+    session_id: &str,
+    ticket: Option<&CancelTicket>,
+    event_tx: &mpsc::UnboundedSender<TurnEvent>,
+    sink_tx: &mpsc::UnboundedSender<String>,
+) -> SessionContext {
+    SessionContext {
+        session_id: session_id.to_string(),
+        workspace_root: None,
+        sink: Arc::new(ChannelSink {
+            tx: sink_tx.clone(),
+        }),
+        interactive: true,
+        auto_approve: false,
+        event_sink: Some(Arc::new(TuiEventSink {
+            tx: event_tx.clone(),
+        })),
+        // Esc stops the turn: the loop flips this signal and the agent loop
+        // gives up at its next await.
+        cancel: ticket.map(|ticket| ticket.signal()),
+        interject: None,
+        channel: None,
+        origin: SessionOrigin::User,
+    }
+}
+
 /// Dispatch one turn onto its own task so the loop keeps handling keys. The
 /// result lands on `turn_tx`, live tool events on `event_tx`, and — local mode
-/// only — an interactive context whose sink feeds mid-turn messages (the
-/// `ask_user` question) onto `sink_tx`, with a fresh clarify budget per turn.
-#[allow(clippy::too_many_arguments)]
+/// only — mid-turn agent messages on `sink_tx`.
 fn spawn_turn(
     backend: &Backend,
-    clarify: &Option<Arc<ClarifyState>>,
     cancels: &Arc<CancelState>,
     session_id: &str,
     text: String,
-    turn_tx: &mpsc::UnboundedSender<Result<String, String>>,
+    turn_tx: &mpsc::UnboundedSender<TurnEnd>,
     event_tx: &mpsc::UnboundedSender<TurnEvent>,
     sink_tx: &mpsc::UnboundedSender<String>,
 ) {
-    let backend = backend.clone();
     let session_id = session_id.to_string();
     let turn_tx = turn_tx.clone();
     let events = event_tx.clone();
     // One registration per local turn, retired when the turn's task ends —
     // taken only where the context is, so an Esc still reports "nothing to
     // stop" on a backend that has no interruptible turn.
-    let ticket = clarify.as_ref().map(|_| cancels.register(&session_id));
-    let ctx = clarify.as_ref().map(|cl| {
-        cl.begin_turn(&session_id);
-        SessionContext {
-            session_id: session_id.clone(),
-            workspace_root: None,
-            sink: Arc::new(ChannelSink {
-                tx: sink_tx.clone(),
-            }),
-            interactive: true,
-            auto_approve: false,
-            event_sink: Some(Arc::new(TuiEventSink { tx: events.clone() })),
-            // Esc stops the turn: the loop flips this signal and the agent
-            // loop gives up at its next await.
-            cancel: ticket.as_ref().map(|ticket| ticket.signal()),
-            interject: None,
-            channel: None,
-            origin: SessionOrigin::User,
-        }
-    });
+    let local = matches!(backend, Backend::Local { .. });
+    let ticket = local.then(|| cancels.register(&session_id));
+    let ctx = local.then(|| local_ctx(&session_id, ticket.as_ref(), event_tx, sink_tx));
+    let backend = backend.clone();
     tokio::spawn(async move {
-        let result = match backend.turn(&session_id, text, ctx, events).await {
-            Ok(reply) => Ok(reply),
-            // Classified **before** the error is stringified: `is_cancelled`
-            // downcasts, and `{e:#}` would leave a deliberate stop looking
-            // like a failure. The remote arm never lands here — the gateway
-            // already answers a cancelled turn with this same text.
-            Err(error) if is_cancelled(&error) => Ok(CANCELLED_REPLY.to_string()),
-            Err(error) => Err(format!("{error:#}")),
-        };
+        let result = classify_end(backend.turn(&session_id, text, ctx, events).await);
         // Retire the slot so a later Esc can't hit a finished turn.
         drop(ticket);
         let _ = turn_tx.send(result);
     });
+}
+
+/// Answer the question a locally suspended turn is waiting on, and continue it.
+///
+/// The TUI drives its own turns, so it continues them itself — but the log
+/// writes go through [`record_wake`], the one writer of `wakeup/fired`.
+/// Without a gateway there is no sweep either, so this is the only wake a local
+/// session can get: a question can be answered here and now, while a `wait 2h`
+/// comes back whenever a gateway next runs.
+///
+/// Answers whether anything was actually waiting.
+async fn answer_question(
+    backend: &Backend,
+    cancels: &Arc<CancelState>,
+    session_id: &str,
+    text: String,
+    turn_tx: &mpsc::UnboundedSender<TurnEnd>,
+    event_tx: &mpsc::UnboundedSender<TurnEvent>,
+    sink_tx: &mpsc::UnboundedSender<String>,
+) -> bool {
+    let Backend::Local { runtime, db } = backend else {
+        return false;
+    };
+    let waits = WaitParts {
+        runs: db.clone(),
+        events: db.clone(),
+        wakeups: db.clone(),
+    };
+    let Ok(registrations) = waits.wakeups.list().await else {
+        return false;
+    };
+    let Some(registration) = registrations
+        .into_iter()
+        .find(|r| r.session_id == session_id && r.turn_id.is_some() && is_user_reply(&r.wakeup))
+    else {
+        return false;
+    };
+    let turn_id = registration.turn_id.clone().expect("filtered above");
+    // Claim it before writing anything: a gateway started meanwhile could be
+    // reaching for the same wait with an expiry.
+    if !matches!(waits.wakeups.take(&registration.id).await, Ok(true)) {
+        return false;
+    }
+    let cause = match text.trim().is_empty() {
+        true => WakeupCause::MovedOn,
+        false => WakeupCause::Reply,
+    };
+    if let Err(error) = record_wake(&waits, &registration, &turn_id, cause, &text).await {
+        tracing::warn!(%error, "failed to record the answer to a question");
+        return false;
+    }
+    let Ok(Some(run)) = waits.runs.get(&turn_id).await else {
+        return false;
+    };
+
+    let runtime = runtime.clone();
+    let session_id = session_id.to_string();
+    let turn_tx = turn_tx.clone();
+    let ticket = cancels.register(&session_id);
+    let ctx = local_ctx(&session_id, Some(&ticket), event_tx, sink_tx);
+    tokio::spawn(async move {
+        let outcome = with_session(ctx, runtime.resume_interrupted(&run)).await;
+        drop(ticket);
+        let result = match outcome {
+            Ok(Some(reply)) => TurnEnd::Reply(reply),
+            // Not continuable: its transcript already ends in a reply, or the
+            // log has nothing for it.
+            Ok(None) => TurnEnd::Failed("那一轮已经结束了，无法继续。".to_string()),
+            Err(error) => classify_end(Err(error)),
+        };
+        let _ = turn_tx.send(result);
+    });
+    true
+}
+
+/// Read a turn's outcome. Classified **before** the error is stringified:
+/// `is_cancelled` / `is_suspended` downcast, and `{e:#}` would leave a
+/// deliberate stop — or a turn that is merely waiting — looking like a failure.
+fn classify_end(outcome: anyhow::Result<String>) -> TurnEnd {
+    match outcome {
+        Ok(reply) => TurnEnd::Reply(reply),
+        // The remote arm never lands here — the gateway already answers a
+        // cancelled turn with this same text.
+        Err(error) if is_cancelled(&error) => TurnEnd::Reply(CANCELLED_REPLY.to_string()),
+        Err(error) if is_suspended(&error) => TurnEnd::Waiting,
+        Err(error) => TurnEnd::Failed(format!("{error:#}")),
+    }
 }
 
 async fn ensure_session(db: &Db, session_id: &str, workspace: &PathBuf) -> anyhow::Result<()> {

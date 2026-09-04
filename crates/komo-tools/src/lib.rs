@@ -33,6 +33,7 @@ pub mod skill;
 pub mod task;
 pub mod time;
 pub mod todo;
+pub mod wait;
 pub mod web_fetch;
 pub mod web_search;
 pub mod wiki_index;
