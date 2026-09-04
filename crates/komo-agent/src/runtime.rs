@@ -2023,6 +2023,74 @@ mod tests {
         );
     }
 
+    /// Nobody answered. The turn still comes back — and is told so, rather
+    /// than being asked the same question again and parking itself forever.
+    #[tokio::test]
+    async fn an_approval_that_expired_comes_back_as_a_refusal() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_expired.db"))
+                .await
+                .unwrap(),
+        );
+
+        let rt = gated_runtime(db.clone(), Arc::new(Suspending));
+        assert!(
+            rt.handle_input("cli:expired", "delete it".into())
+                .await
+                .is_err()
+        );
+        drop(rt);
+        let suspended = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
+
+        // What the wake writes when the deadline passes.
+        SessionEventRepository::append(
+            &*db,
+            "cli:expired",
+            vec![SessionEventKind::ApprovalExpired {
+                turn_id: suspended.id.clone(),
+                call_id: "id-gated".into(),
+                call_index: 0,
+            }],
+        )
+        .await
+        .unwrap();
+        SessionEventRepository::durable_flush(&*db, "cli:expired")
+            .await
+            .unwrap();
+
+        let asked = Arc::new(Mutex::new(0usize));
+        let rt = gated_runtime(db.clone(), Arc::new(NeverAsked(asked.clone())));
+        let reply = rt
+            .resume_interrupted(&suspended)
+            .await
+            .unwrap()
+            .expect("the turn is continuable");
+
+        assert_eq!(reply, "done");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            0,
+            "an expiry is an answer; asking again would park the turn forever"
+        );
+        let continuation = RunRepository::list(&*db, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.resumed_from.as_deref() == Some(suspended.id.as_str()))
+            .unwrap();
+        let steps = RunRepository::steps(&*db, &continuation.id).await.unwrap();
+        assert_eq!(steps.len(), 1);
+        // A refusal is a *recoverable, terminal* outcome, so it rides back as
+        // the model-facing text rather than as a tool failure — but it must say
+        // the action did not happen, and why.
+        assert!(
+            steps[0].result.contains("expired"),
+            "the model is told nobody answered: {}",
+            steps[0].result
+        );
+        assert_ne!(steps[0].result, "acted", "and the call did not run");
+    }
+
     /// The turn has to be in the ledger *before* it ends, or a crash leaves
     /// nothing for `run list` to show and nothing for `run resume` to pick up.
     /// The rows are a projection now, and this is the one commit that happens

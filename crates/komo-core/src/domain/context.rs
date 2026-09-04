@@ -22,7 +22,7 @@ use crate::domain::repository::SessionEventRepository;
 use crate::domain::run::RunStep;
 use crate::domain::session::ChannelPeer;
 use crate::domain::session_event::{
-    ApprovalRequestedEvent, ApprovalResolvedEvent, SessionEventKind, Wakeup,
+    ApprovalRequestedEvent, ApprovalResolvedEvent, SessionEvent, SessionEventKind, Wakeup,
 };
 
 /// What is driving a turn, as far as **approval** is concerned.
@@ -499,6 +499,23 @@ impl ApprovalGate {
     ///
     /// The newest resolution wins, and a log that cannot be read means "no
     /// answer yet": the gate then asks, which is the safe direction.
+    /// Whether this call's approval **ran out** while the turn was suspended.
+    ///
+    /// A wait nobody answered comes back as a refusal, not as another prompt:
+    /// asking again would park the turn on the same question forever, and the
+    /// model needs to be told it was never answered so it can say so or take
+    /// another route.
+    async fn expired_earlier(&self, events: &[SessionEvent]) -> bool {
+        let attempts = crate::domain::session_event::attempt_chain(events, &self.turn_id);
+        events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::ApprovalExpired { turn_id, call_id, .. }
+                    if attempts.contains(turn_id.as_str()) && *call_id == self.call_id
+            )
+        })
+    }
+
     async fn resolved_earlier(&self) -> Option<ApprovalResolvedEvent> {
         let events = self.events.events(&self.session_id).await.ok()?;
         // Across the whole chain of attempts, not just this turn: the answer was
@@ -569,6 +586,15 @@ impl ToolContext {
                     false => Decision::deny_because(resolved.reason),
                 },
             };
+        }
+        // Nobody answered in time. Also an answer, and the turn is told so
+        // rather than asked again.
+        if let Ok(events) = gate.events.events(&gate.session_id).await
+            && gate.expired_earlier(&events).await
+        {
+            return Decision::deny_because(
+                "the approval request expired without an answer; the action was not taken",
+            );
         }
         let scope_key = request.scope_key.clone().unwrap_or_default();
 

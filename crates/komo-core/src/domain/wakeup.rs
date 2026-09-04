@@ -65,6 +65,11 @@ pub fn is_suspended(error: &anyhow::Error) -> bool {
     error.downcast_ref::<Suspended>().is_some()
 }
 
+/// What every registration id starts with. Named because a chat command has to
+/// tell an id from free text (`/deny wk-0199… too risky` vs `/deny too risky`),
+/// and nothing else in that position looks like this.
+pub const WAIT_ID_PREFIX: &str = "wk-";
+
 /// One standing instruction to wake something up.
 #[derive(Debug, Clone)]
 pub struct WakeupRegistration {
@@ -91,7 +96,7 @@ impl WakeupRegistration {
     pub fn new(session_id: impl Into<String>, wakeup: Wakeup, now: i64) -> Self {
         let expires_at = default_expiry_secs(&wakeup).map(|secs| now + secs);
         Self {
-            id: format!("wk-{}", uuid::Uuid::now_v7()),
+            id: format!("{WAIT_ID_PREFIX}{}", uuid::Uuid::now_v7()),
             session_id: session_id.into(),
             turn_id: None,
             wakeup,

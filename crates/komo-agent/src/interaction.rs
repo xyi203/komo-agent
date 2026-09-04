@@ -42,9 +42,11 @@ use komo_core::domain::{
     repository::{SessionEventRepository, SessionRepository},
     run::RunRepository,
     session::{ChannelPeer, Session},
-    session_event::{SessionEventKind, WakeupCause, WakeupFiredEvent},
+    session_event::{
+        ApprovalResolvedEvent, SessionEventKind, Wakeup, WakeupCause, WakeupFiredEvent,
+    },
     todo::SessionTodoRepository,
-    wakeup::{WakeupDispatch, WakeupRegistration, WakeupRepository},
+    wakeup::{WAIT_ID_PREFIX, WakeupDispatch, WakeupRegistration, WakeupRepository},
 };
 
 /// How long an approval prompt waits for a reply before auto-denying.
@@ -527,10 +529,12 @@ fn prompt(request: &ApprovalRequest, channel: &str) -> String {
 pub enum Command {
     /// Start a fresh session (clear context + approval state).
     New,
-    /// Resolve a pending approval.
-    Approve(Answer),
-    /// Refuse a pending approval, optionally with a reason relayed to the agent.
-    Deny(Option<String>),
+    /// Resolve a pending approval. The id names a wait in **another** session
+    /// (a routine's, prompted into the home chat); `None` means this chat's own.
+    Approve(Answer, Option<String>),
+    /// Refuse a pending approval, optionally with a reason relayed to the agent,
+    /// and optionally naming a wait in another session.
+    Deny(Option<String>, Option<String>),
     /// Make this chat the home channel for proactive output.
     SetHome,
     /// Provision the WeChat channel by QR (delivered to this chat).
@@ -581,17 +585,91 @@ pub fn classify(text: &str) -> Command {
         None => (trimmed, ""),
     };
     if matches!(verb.to_lowercase().as_str(), "/deny" | "/no" | "/n") {
-        return Command::Deny((!rest.is_empty()).then(|| rest.to_string()));
+        let (id, reason) = split_wait_id(rest);
+        return Command::Deny((!reason.is_empty()).then(|| reason.to_string()), id);
+    }
+    if matches!(
+        verb.to_lowercase().as_str(),
+        "/approve" | "/yes" | "/y" | "/ok"
+    ) {
+        let (id, scope) = split_wait_id(rest);
+        // Only a *recognised* argument makes this a command: "/approve the
+        // budget" is somebody talking, not approving, and reading it as an
+        // approval would grant something nobody was asked about.
+        let answer = match scope.to_lowercase().as_str() {
+            "" => Some(Answer::Once),
+            "session" | "all" => Some(Answer::Session),
+            "always" => Some(Answer::Always),
+            _ => None,
+        };
+        if let Some(answer) = answer {
+            return Command::Approve(answer, id);
+        }
+        if id.is_some() {
+            // An id with an unrecognised scope word is still an approval —
+            // nobody types a wait id by accident.
+            return Command::Approve(Answer::Once, id);
+        }
     }
 
     match lower.as_str() {
         "/new" | "/clear" | "/reset" => Command::New,
-        "/approve" | "/yes" | "/y" | "/ok" => Command::Approve(Answer::Once),
-        "/approve session" | "/approve all" => Command::Approve(Answer::Session),
-        "/approve always" => Command::Approve(Answer::Always),
         "/sethome" | "/home" => Command::SetHome,
         "/wechat" | "/wechat login" | "/weixin" => Command::WechatLogin,
         _ => Command::Plain(text.to_string()),
+    }
+}
+
+/// What answering an approval reached.
+#[derive(Debug, PartialEq, Eq)]
+enum Answered {
+    /// Nothing durable was waiting.
+    Nothing,
+    /// A wait in this chat's own session.
+    Here,
+    /// A wait belonging to another session — a routine's, answered from the
+    /// home chat.
+    Elsewhere(String),
+}
+
+fn answered_elsewhere(answered: &Answered) -> &'static str {
+    match answered {
+        Answered::Elsewhere(_) => "✅ 已答复，那个任务正在继续。",
+        _ => "✅ 已答复，这一轮正在继续。",
+    }
+}
+
+/// Narrow an answer given without knowing what was asked.
+///
+/// A restart loses the in-memory prompt, and with it the action's risk. "For
+/// this session" and "always" widen an approval to *later* calls nobody has
+/// seen; granting that on an action we can no longer read the risk of is the
+/// one direction that cannot be taken back, so an answer with no context is
+/// worth exactly the call it was given for.
+fn narrow_unknown(answer: Answer) -> Answer {
+    match answer {
+        Answer::Session | Answer::Always => Answer::Once,
+        other => other,
+    }
+}
+
+fn now_secs() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// Split a leading wait id off an approval command's arguments.
+///
+/// An id is recognised by the prefix every registration carries, so
+/// `/deny 太危险了` stays a reason and `/deny wk-0199 太危险了` names a wait in
+/// another session and *then* gives a reason. Nothing else disambiguates them:
+/// a reason is free text, and a chat cannot ask a follow-up question.
+fn split_wait_id(rest: &str) -> (Option<String>, &str) {
+    match rest.split_once(char::is_whitespace) {
+        Some((first, tail)) if first.starts_with(WAIT_ID_PREFIX) => {
+            (Some(first.to_string()), tail.trim())
+        }
+        None if rest.starts_with(WAIT_ID_PREFIX) => (Some(rest.to_string()), ""),
+        _ => (None, rest),
     }
 }
 
@@ -602,8 +680,25 @@ pub fn classify(text: &str) -> Command {
 /// Channels build a [`ReplySink`] for the conversation and call
 /// [`GatewayDispatcher::handle`]; the dispatcher owns replying (including the
 /// turn's eventual answer), so channels no longer send agent replies directly.
+/// What the dispatcher needs to bring a suspended turn back: the ledger row to
+/// continue, the log to record why, and the waits to retire.
+///
+/// Held together because continuing a turn without any of the three is not a
+/// partial feature: a continuation with no `wakeup/fired` leaves the log unable
+/// to say what ended the wait, and one that does not retire the turn's other
+/// waits gets woken again by them.
+#[derive(Clone)]
+pub struct WaitParts {
+    pub runs: Arc<dyn RunRepository>,
+    pub events: Arc<dyn SessionEventRepository>,
+    pub wakeups: Arc<dyn WakeupRepository>,
+}
+
 pub struct GatewayDispatcher {
     handler: Arc<dyn MessageHandler>,
+    /// `None` = this dispatcher cannot continue suspended turns (the test
+    /// fixtures, which have no store behind them).
+    waits: Option<WaitParts>,
     approvals: Arc<ApprovalState>,
     /// Pending `ask_user` questions (mirrors `approvals`): a plain inbound
     /// message resolves a pending question instead of starting a new turn.
@@ -631,35 +726,17 @@ pub struct GatewayDispatcher {
 /// Waking a suspended turn: the scheduler's side of `turn/suspended`
 /// (docs/bot-runtime.md §4.1).
 ///
-/// Everything about the continuation itself is already built — a wake is
-/// `resume_interrupted` on the suspended run, which replays the turn's rounds
-/// and re-dispatches the call that stopped at the gate. What this adds is the
-/// three things that have to happen around it: record *why* the turn came back,
-/// retire the other waits it was holding, and take the session's turn slot so
-/// the continuation does not run beside a live turn.
+/// A thin adapter, because the continuation itself belongs to whoever owns
+/// turns: `/approve` has to do exactly the same thing without going through a
+/// sweep, and two copies of "bring a turn back" would be two chances to forget
+/// the `wakeup/fired`.
 pub struct TurnWaker {
     dispatcher: Arc<GatewayDispatcher>,
-    handler: Arc<dyn MessageHandler>,
-    runs: Arc<dyn RunRepository>,
-    events: Arc<dyn SessionEventRepository>,
-    wakeups: Arc<dyn WakeupRepository>,
 }
 
 impl TurnWaker {
-    pub fn new(
-        dispatcher: Arc<GatewayDispatcher>,
-        handler: Arc<dyn MessageHandler>,
-        runs: Arc<dyn RunRepository>,
-        events: Arc<dyn SessionEventRepository>,
-        wakeups: Arc<dyn WakeupRepository>,
-    ) -> Self {
-        Self {
-            dispatcher,
-            handler,
-            runs,
-            events,
-            wakeups,
-        }
+    pub fn new(dispatcher: Arc<GatewayDispatcher>) -> Self {
+        Self { dispatcher }
     }
 }
 
@@ -670,67 +747,7 @@ impl WakeupDispatch for TurnWaker {
         registration: &WakeupRegistration,
         cause: WakeupCause,
     ) -> anyhow::Result<()> {
-        let Some(turn_id) = registration.turn_id.clone() else {
-            // A wake that *starts* a turn is a trigger, not a continuation —
-            // nothing writes one yet (docs/bot-runtime.md §3.3).
-            warn!(id = %registration.id, "a wakeup with no turn to continue is not dispatchable yet");
-            return Ok(());
-        };
-        let Some(run) = self.runs.get(&turn_id).await? else {
-            anyhow::bail!("no run `{turn_id}` to continue");
-        };
-
-        // Why it came back, durably, before it comes back: without this the log
-        // cannot answer "what ended the wait", and a crash mid-continuation
-        // would read as a turn that woke for no reason.
-        self.events
-            .append(
-                &registration.session_id,
-                vec![SessionEventKind::WakeupFired(WakeupFiredEvent {
-                    turn_id: turn_id.clone(),
-                    wakeup_id: registration.id.clone(),
-                    cause,
-                    payload: String::new(),
-                })],
-            )
-            .await?;
-        self.events.durable_flush(&registration.session_id).await?;
-
-        // Everything else this turn was waiting on goes with it: a turn woken
-        // by an approval must not be woken again by the timer that was watching
-        // the same wait.
-        if let Err(error) = self
-            .wakeups
-            .take_for_turn(&registration.session_id, &turn_id)
-            .await
-        {
-            warn!(%error, turn = %turn_id, "failed to retire a woken turn's other waits");
-        }
-
-        // The continuation is a turn like any other: it queues behind whatever
-        // the session is already doing. Spawned so the sweep's tick is not held
-        // for however long the turn takes — the wake itself is already durable.
-        let dispatcher = self.dispatcher.clone();
-        let handler = self.handler.clone();
-        let session_id = registration.session_id.clone();
-        tokio::spawn(async move {
-            let claim = dispatcher.claim_session(&session_id).await;
-            let ctx = SessionContext::detached(&session_id);
-            let outcome = with_session(ctx, handler.resume_interrupted(&run)).await;
-            claim.release();
-            match outcome {
-                Ok(Some(_)) => {
-                    info!(turn = %run.id, cause = cause.as_str(), "continued a woken turn")
-                }
-                // The continuation declined — the transcript already ends in a
-                // reply, or the log has nothing for the turn. Not an error, and
-                // not something to retry: the wait is gone and the turn is
-                // whatever the log says it is.
-                Ok(None) => warn!(turn = %run.id, "a woken turn was not continuable"),
-                Err(error) => warn!(%error, turn = %run.id, "a woken turn failed"),
-            }
-        });
-        Ok(())
+        self.dispatcher.continue_turn(registration, cause).await
     }
 }
 
@@ -768,6 +785,7 @@ impl GatewayDispatcher {
             wechat_login,
             pairings,
             inbox,
+            waits: None,
             inflight: Mutex::new(HashMap::new()),
             idle: Notify::new(),
         }
@@ -823,6 +841,227 @@ impl GatewayDispatcher {
             }
             idle.await;
         }
+    }
+
+    /// Give the dispatcher what it needs to continue suspended turns.
+    ///
+    /// Separate from `new` because it is the one capability a dispatcher can
+    /// coherently lack: the test fixtures have no store behind them, and a
+    /// dispatcher without it simply reports nothing to answer.
+    pub fn with_waits(mut self, waits: WaitParts) -> Self {
+        self.waits = Some(waits);
+        self
+    }
+
+    /// Bring a suspended turn back.
+    ///
+    /// Four things, in this order, because each one is what makes the next
+    /// honest:
+    ///
+    /// 1. A wait that **ran out** is written down as such (`approval/expired`)
+    ///    before the turn sees it. The gate reads it as a refusal, so the turn
+    ///    comes back and is told nobody answered — rather than asking again and
+    ///    parking itself forever.
+    /// 2. `wakeup/fired`, durably: the log has to be able to answer "what ended
+    ///    the wait" long after the fact.
+    /// 3. Every other wait that turn was holding is retired — an approval must
+    ///    not be woken a second time by the timer that was watching it.
+    /// 4. The continuation takes the session's turn slot like any other turn,
+    ///    and runs spawned: the caller (a sweep tick, a `/approve` reply) must
+    ///    not be held for however long the turn takes.
+    pub async fn continue_turn(
+        self: &Arc<Self>,
+        registration: &WakeupRegistration,
+        cause: WakeupCause,
+    ) -> anyhow::Result<()> {
+        let Some(waits) = self.waits.clone() else {
+            anyhow::bail!("this dispatcher has no store to continue a turn from");
+        };
+        let Some(turn_id) = registration.turn_id.clone() else {
+            // A wake that *starts* a turn is a trigger, not a continuation —
+            // nothing writes one yet (docs/bot-runtime.md §3.3).
+            warn!(id = %registration.id, "a wakeup with no turn to continue is not dispatchable yet");
+            return Ok(());
+        };
+        let Some(run) = waits.runs.get(&turn_id).await? else {
+            anyhow::bail!("no run `{turn_id}` to continue");
+        };
+        let session_id = registration.session_id.clone();
+
+        let mut closing = Vec::new();
+        if cause == WakeupCause::Expired
+            && let Wakeup::Approval { call_id } = &registration.wakeup
+        {
+            closing.push(SessionEventKind::ApprovalExpired {
+                turn_id: turn_id.clone(),
+                call_id: call_id.clone(),
+                call_index: self
+                    .requested_call_index(&waits, &session_id, &turn_id, call_id)
+                    .await,
+            });
+        }
+        closing.push(SessionEventKind::WakeupFired(WakeupFiredEvent {
+            turn_id: turn_id.clone(),
+            wakeup_id: registration.id.clone(),
+            cause,
+            payload: String::new(),
+        }));
+        waits.events.append(&session_id, closing).await?;
+        waits.events.durable_flush(&session_id).await?;
+
+        if let Err(error) = waits.wakeups.take_for_turn(&session_id, &turn_id).await {
+            warn!(%error, turn = %turn_id, "failed to retire a woken turn's other waits");
+        }
+
+        let dispatcher = self.clone();
+        tokio::spawn(async move {
+            let claim = dispatcher.claim_session(&session_id).await;
+            let ctx = SessionContext::detached(&session_id);
+            let outcome = with_session(ctx, dispatcher.handler.resume_interrupted(&run)).await;
+            claim.release();
+            match outcome {
+                Ok(Some(_)) => {
+                    info!(turn = %run.id, cause = cause.as_str(), "continued a woken turn")
+                }
+                // The continuation declined — the transcript already ends in a
+                // reply, or the log has nothing for the turn. Not an error, and
+                // not something to retry: the wait is gone and the turn is
+                // whatever the log says it is.
+                Ok(None) => warn!(turn = %run.id, "a woken turn was not continuable"),
+                Err(error) => warn!(%error, turn = %run.id, "a woken turn failed"),
+            }
+        });
+        Ok(())
+    }
+
+    /// Write the answer to a **suspended** turn's approval, and bring the turn
+    /// back.
+    ///
+    /// The durable half of `/approve` and `/deny`: the turn is not waiting on
+    /// anything in this process — it gave up its slot and may well have been
+    /// asked by a process that has since restarted — so the answer goes into
+    /// the log, where the gate reads it when the call is re-dispatched.
+    async fn answer_suspended(
+        self: &Arc<Self>,
+        session_id: &str,
+        id: Option<&str>,
+        answer: &Answer,
+    ) -> Answered {
+        let Some(waits) = self.waits.clone() else {
+            return Answered::Nothing;
+        };
+        let Some(registration) = self.pending_wait(&waits, session_id, id).await else {
+            return Answered::Nothing;
+        };
+        let Some(turn_id) = registration.turn_id.clone() else {
+            return Answered::Nothing;
+        };
+        let Wakeup::Approval { call_id } = registration.wakeup.clone() else {
+            return Answered::Nothing;
+        };
+
+        let (allowed, reason) = match answer {
+            Answer::Deny(reason) => (false, reason.clone().unwrap_or_default()),
+            _ => (true, String::new()),
+        };
+        let resolved = SessionEventKind::ApprovalResolved(ApprovalResolvedEvent {
+            turn_id: turn_id.clone(),
+            call_id: call_id.clone(),
+            call_index: self
+                .requested_call_index(&waits, &registration.session_id, &turn_id, &call_id)
+                .await,
+            allowed,
+            decided_by: DECIDED_BY_HUMAN.to_string(),
+            reason,
+            // How long the person took, from the wait being registered. The
+            // question is "did somebody think about this", and the registration
+            // is when it was put in front of them.
+            waited_ms: (now_secs() - registration.created_at).max(0) * 1_000,
+        });
+        if let Err(error) = waits
+            .events
+            .append(&registration.session_id, vec![resolved])
+            .await
+        {
+            warn!(%error, turn = %turn_id, "failed to record an approval answer");
+            return Answered::Nothing;
+        }
+        // Durable before the turn acts on it: an allow the log would forget is
+        // an action nobody approved.
+        if let Err(error) = waits.events.durable_flush(&registration.session_id).await {
+            warn!(%error, turn = %turn_id, "an approval answer is not durable; not continuing");
+            return Answered::Nothing;
+        }
+
+        // Claim it — the sweep may be reaching for the same wait — and only
+        // then continue.
+        match waits.wakeups.take(&registration.id).await {
+            Ok(true) => {}
+            Ok(false) => return Answered::Nothing,
+            Err(error) => {
+                warn!(%error, "failed to claim an answered wait");
+                return Answered::Nothing;
+            }
+        }
+        let cause = match allowed {
+            true => WakeupCause::Approve,
+            false => WakeupCause::Deny,
+        };
+        if let Err(error) = self.continue_turn(&registration, cause).await {
+            warn!(%error, turn = %turn_id, "failed to continue an answered turn");
+        }
+        match registration.session_id == session_id {
+            true => Answered::Here,
+            false => Answered::Elsewhere(registration.session_id),
+        }
+    }
+
+    /// The approval wait an answer is for: named by id, or this chat's own.
+    ///
+    /// An id is how a routine's approval is answered from the home chat — the
+    /// wait belongs to another session entirely. A prefix is enough, because
+    /// nobody is going to type a UUIDv7 in full.
+    async fn pending_wait(
+        &self,
+        waits: &WaitParts,
+        session_id: &str,
+        id: Option<&str>,
+    ) -> Option<WakeupRegistration> {
+        let registrations = waits.wakeups.list().await.ok()?;
+        let approvals = registrations
+            .into_iter()
+            .filter(|r| matches!(r.wakeup, Wakeup::Approval { .. }));
+        match id {
+            Some(id) => approvals.filter(|r| r.id.starts_with(id)).next(),
+            None => approvals.filter(|r| r.session_id == session_id).next(),
+        }
+    }
+
+    /// The `call_index` the gate recorded when it asked. Read back rather than
+    /// assumed: an expiry has to name the same call the request did, and only
+    /// the request knows where in its round it sat.
+    async fn requested_call_index(
+        &self,
+        waits: &WaitParts,
+        session_id: &str,
+        turn_id: &str,
+        call_id: &str,
+    ) -> u32 {
+        let Ok(events) = waits.events.events(session_id).await else {
+            return 0;
+        };
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ApprovalRequested(requested)
+                    if requested.turn_id == turn_id && requested.call_id == call_id =>
+                {
+                    Some(requested.call_index)
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
     }
 
     /// Handle one inbound message. Returns promptly: a plain message spawns its
@@ -911,9 +1150,21 @@ impl GatewayDispatcher {
         sink: Arc<dyn ReplySink>,
     ) {
         match classify(&text) {
-            Command::Approve(answer) => {
+            Command::Approve(answer, id) => {
                 let asked = answer.clone();
-                let granted = self.approvals.resolve_scoped(session_id, answer);
+                // Two halves of one answer: the in-memory prompt (what the GUI
+                // polls, and what knows the action's risk) and the durable wait
+                // a suspended turn is parked on. Either may be absent — after a
+                // restart only the second survives.
+                let granted = self.approvals.resolve_scoped(session_id, answer.clone());
+                let narrowed = granted.clone().unwrap_or_else(|| narrow_unknown(answer));
+                let woken = self
+                    .answer_suspended(session_id, id.as_deref(), &narrowed)
+                    .await;
+                if granted.is_none() && woken != Answered::Nothing {
+                    let _ = sink.send(answered_elsewhere(&woken)).await;
+                    return;
+                }
                 let reply = match (&granted, asked) {
                     (Some(Answer::Session), _) => "✅ 已批准（本会话内同类操作将自动放行）",
                     (Some(Answer::Always), _) => {
@@ -931,9 +1182,18 @@ impl GatewayDispatcher {
                 };
                 let _ = sink.send(reply).await;
             }
-            Command::Deny(reason) => {
+            Command::Deny(reason, id) => {
                 let explained = reason.is_some();
-                let reply = if self.approvals.resolve(session_id, Answer::Deny(reason)) {
+                let answer = Answer::Deny(reason);
+                let in_memory = self.approvals.resolve(session_id, answer.clone());
+                let woken = self
+                    .answer_suspended(session_id, id.as_deref(), &answer)
+                    .await;
+                if !in_memory && woken != Answered::Nothing {
+                    let _ = sink.send(answered_elsewhere(&woken)).await;
+                    return;
+                }
+                let reply = if in_memory {
                     if explained {
                         "已拒绝，理由已转达。"
                     } else {
@@ -1369,12 +1629,12 @@ mod tests {
     fn classify_matches_commands_case_insensitively() {
         assert_eq!(classify("/new"), Command::New);
         assert_eq!(classify("  /CLEAR "), Command::New);
-        assert_eq!(classify("/approve"), Command::Approve(Answer::Once));
+        assert_eq!(classify("/approve"), Command::Approve(Answer::Once, None));
         assert_eq!(
             classify("/approve session"),
-            Command::Approve(Answer::Session)
+            Command::Approve(Answer::Session, None)
         );
-        assert_eq!(classify("/deny"), Command::Deny(None));
+        assert_eq!(classify("/deny"), Command::Deny(None, None));
         assert_eq!(classify("/sethome"), Command::SetHome);
         assert_eq!(classify(" /SetHome "), Command::SetHome);
         assert_eq!(classify("/wechat login"), Command::WechatLogin);
@@ -1391,15 +1651,39 @@ mod tests {
     fn deny_takes_a_free_text_reason_for_the_model() {
         assert_eq!(
             classify("/deny 用 trash 代替 rm"),
-            Command::Deny(Some("用 trash 代替 rm".to_string()))
+            Command::Deny(Some("用 trash 代替 rm".to_string()), None)
         );
         // The verb is case-insensitive; the reason keeps its case.
         assert_eq!(
             classify("/DENY Use Trash"),
-            Command::Deny(Some("Use Trash".to_string()))
+            Command::Deny(Some("Use Trash".to_string()), None)
         );
         // Whitespace-only argument is the same as a bare `/deny`.
-        assert_eq!(classify("/deny    "), Command::Deny(None));
+        assert_eq!(classify("/deny    "), Command::Deny(None, None));
+    }
+
+    /// A routine's approval is answered from the home chat, so the command has
+    /// to be able to name a wait that belongs to another session — while
+    /// `/deny <reason>` keeps taking free text.
+    #[test]
+    fn an_approval_command_can_name_the_wait_it_answers() {
+        assert_eq!(
+            classify("/approve wk-0199abc"),
+            Command::Approve(Answer::Once, Some("wk-0199abc".to_string()))
+        );
+        assert_eq!(
+            classify("/approve wk-0199abc session"),
+            Command::Approve(Answer::Session, Some("wk-0199abc".to_string()))
+        );
+        assert_eq!(
+            classify("/deny wk-0199abc 太危险了"),
+            Command::Deny(Some("太危险了".to_string()), Some("wk-0199abc".to_string()))
+        );
+        // Without the prefix it is a reason, not an id.
+        assert_eq!(
+            classify("/deny 太危险了"),
+            Command::Deny(Some("太危险了".to_string()), None)
+        );
     }
 
     #[test]
@@ -1833,20 +2117,6 @@ mod tests {
         use komo_core::domain::run::Run;
         use komo_core::domain::session_event::Wakeup;
 
-        /// Records the run it was asked to continue.
-        struct RecordingResume(Mutex<Vec<String>>);
-
-        #[async_trait]
-        impl MessageHandler for RecordingResume {
-            async fn handle(&self, _session_id: &str, input: String) -> anyhow::Result<String> {
-                Ok(input)
-            }
-            async fn resume_interrupted(&self, run: &Run) -> anyhow::Result<Option<String>> {
-                self.0.lock().unwrap().push(run.id.clone());
-                Ok(Some("continued".to_string()))
-            }
-        }
-
         let home = std::env::temp_dir().join("komo-waker-fire");
         std::fs::remove_dir_all(&home).ok();
         std::fs::create_dir_all(&home).expect("test home");
@@ -1893,18 +2163,25 @@ mod tests {
         }
 
         let handler = Arc::new(RecordingResume(Mutex::new(Vec::new())));
-        let (entered_tx, _entered_rx) = mpsc::unbounded_channel();
-        let dispatcher = dispatcher_with(Arc::new(GateHandler {
-            entered: entered_tx,
-            permits: Arc::new(Semaphore::new(0)),
-        }));
-        let waker = TurnWaker::new(
-            dispatcher,
-            handler.clone(),
-            db.clone(),
-            db.clone(),
-            db.clone(),
+        let dispatcher = Arc::new(
+            GatewayDispatcher::new(
+                handler.clone(),
+                Arc::new(ApprovalState::new()),
+                Arc::new(ClarifyState::new()),
+                Arc::new(MemorySessions::default()),
+                Arc::new(UnusedHome),
+                Arc::new(UnusedTodos),
+                None,
+                Arc::new(UnusedPairings),
+                Arc::new(AlwaysFreshInbox),
+            )
+            .with_waits(WaitParts {
+                runs: db.clone(),
+                events: db.clone(),
+                wakeups: db.clone(),
+            }),
         );
+        let waker = TurnWaker::new(dispatcher);
 
         waker
             .fire(&approval, WakeupCause::Approve)
@@ -1948,6 +2225,133 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(*handler.0.lock().unwrap(), vec![run.id.clone()]);
+    }
+
+    /// Records the run it was asked to continue.
+    struct RecordingResume(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl MessageHandler for RecordingResume {
+        async fn handle(&self, _session_id: &str, input: String) -> anyhow::Result<String> {
+            Ok(input)
+        }
+        async fn resume_interrupted(
+            &self,
+            run: &komo_core::domain::run::Run,
+        ) -> anyhow::Result<Option<String>> {
+            self.0.lock().unwrap().push(run.id.clone());
+            Ok(Some("continued".to_string()))
+        }
+    }
+
+    /// A wait that ran out is written down as such *before* the turn comes
+    /// back, so the gate reads it as a refusal instead of asking again.
+    #[tokio::test]
+    async fn an_expired_wait_records_the_expiry_before_continuing() {
+        use komo_core::domain::run::Run;
+
+        let home = std::env::temp_dir().join("komo-waker-expired");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        let db = Arc::new(
+            komo_infra::persistence::db::Db::connect(&format!(
+                "turso:{}",
+                home.join("komo.db").display()
+            ))
+            .await
+            .unwrap(),
+        );
+
+        // The gate asked, and recorded where in its round the call sat.
+        let mut run = Run::start("s1", "delete it");
+        run.status = komo_core::domain::run::RunStatus::Suspended;
+        komo_core::domain::run_projection::RunProjectionStore::commit(
+            db.as_ref(),
+            "s1",
+            &[komo_core::domain::run_projection::ProjectedRun {
+                run: run.clone(),
+                steps: Vec::new(),
+                start_seq: 0,
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+        SessionEventRepository::append(
+            db.as_ref(),
+            "s1",
+            vec![SessionEventKind::ApprovalRequested(
+                komo_core::domain::session_event::ApprovalRequestedEvent {
+                    turn_id: run.id.clone(),
+                    call_id: "c1".into(),
+                    call_index: 2,
+                    scope_key: String::new(),
+                },
+            )],
+        )
+        .await
+        .unwrap();
+        SessionEventRepository::durable_flush(db.as_ref(), "s1")
+            .await
+            .unwrap();
+
+        let registration = WakeupRegistration::new(
+            "s1",
+            Wakeup::Approval {
+                call_id: "c1".into(),
+            },
+            1_000,
+        )
+        .continuing(&run.id);
+        WakeupRepository::save(db.as_ref(), &registration)
+            .await
+            .unwrap();
+
+        let handler = Arc::new(RecordingResume(Mutex::new(Vec::new())));
+        let dispatcher = Arc::new(
+            GatewayDispatcher::new(
+                handler.clone(),
+                Arc::new(ApprovalState::new()),
+                Arc::new(ClarifyState::new()),
+                Arc::new(MemorySessions::default()),
+                Arc::new(UnusedHome),
+                Arc::new(UnusedTodos),
+                None,
+                Arc::new(UnusedPairings),
+                Arc::new(AlwaysFreshInbox),
+            )
+            .with_waits(WaitParts {
+                runs: db.clone(),
+                events: db.clone(),
+                wakeups: db.clone(),
+            }),
+        );
+
+        TurnWaker::new(dispatcher)
+            .fire(&registration, WakeupCause::Expired)
+            .await
+            .unwrap();
+
+        let events = SessionEventRepository::events(db.as_ref(), "s1")
+            .await
+            .unwrap();
+        let expired = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ApprovalExpired {
+                    turn_id,
+                    call_id,
+                    call_index,
+                } => Some((turn_id, call_id, *call_index)),
+                _ => None,
+            })
+            .expect("an expiry the turn can read as a refusal");
+        assert_eq!(expired.0, &run.id);
+        assert_eq!(expired.1, "c1");
+        assert_eq!(
+            expired.2, 2,
+            "it names the same call the request did, read back from the request"
+        );
     }
 
     /// Stop is pressed on a conversation, so it has to reach the caller *queued*

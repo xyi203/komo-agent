@@ -1,6 +1,8 @@
 use komo_agent::daemon::{Schedule, WakeupWiring};
 use komo_agent::gateway::Gateway;
-use komo_agent::interaction::{ApprovalState, ChatApprover, GatewayDispatcher, TurnWaker};
+use komo_agent::interaction::{
+    ApprovalState, ChatApprover, GatewayDispatcher, TurnWaker, WaitParts,
+};
 use komo_infra::persistence::db::Db;
 use std::sync::Arc;
 
@@ -140,28 +142,31 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     let handler: Arc<dyn MessageHandler> = Arc::new(wired.runtime);
     let sessions: Arc<dyn SessionRepository> = db.clone();
     let todos: Arc<dyn SessionTodoRepository> = db.clone();
-    let dispatcher = Arc::new(GatewayDispatcher::new(
-        handler.clone(),
-        approvals.clone(),
-        wired.clarify.clone(),
-        sessions,
-        home_repo,
-        todos,
-        channel_reg.wechat_login.clone(),
-        db.clone(),
-        db.clone(),
-    ));
+    let dispatcher = Arc::new(
+        GatewayDispatcher::new(
+            handler.clone(),
+            approvals.clone(),
+            wired.clarify.clone(),
+            sessions,
+            home_repo,
+            todos,
+            channel_reg.wechat_login.clone(),
+            db.clone(),
+            db.clone(),
+        )
+        // What lets it bring a suspended turn back — for a sweep's wake and for
+        // an arriving `/approve` alike.
+        .with_waits(WaitParts {
+            runs: db.clone(),
+            events: db.clone(),
+            wakeups: db.clone(),
+        }),
+    );
 
     // Waking a suspended turn: the scheduler fires, this continues the turn.
     // Built here because it needs the dispatcher (for the session slot) and the
     // handler (for the continuation) — the two things only the gateway holds.
-    let waker: Arc<dyn WakeupDispatch> = Arc::new(TurnWaker::new(
-        dispatcher.clone(),
-        handler.clone(),
-        db.clone(),
-        db.clone(),
-        db.clone(),
-    ));
+    let waker: Arc<dyn WakeupDispatch> = Arc::new(TurnWaker::new(dispatcher.clone()));
 
     // ── Plugin phase 3: scheduled sweeps ─────────────────────────────────────
     let mut sweep_reg = SweepRegistry::default();

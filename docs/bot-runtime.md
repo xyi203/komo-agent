@@ -474,9 +474,25 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   `an_approval_answered_after_a_restart_resumes_the_turn_and_runs_the_call`（**新进程**
   接手挂起的 turn，审批器一次都没被问，续跑跑了那个调用，挂起的那次尝试始终没有 step）、
   `waking_a_turn_records_the_cause_and_retires_its_other_waits`。
-  还没接：`ChatApprover` / TUI approver 仍在等 oneshot（还没有人会答 `Suspend`）、
-  `/approve <id>` 跨 session、挂起期间普通消息算放弃（moved-on）、24h 过期把「没等到」
-  告诉模型。`Risk::Dangerous` 仍 `Once`（策略梯子没动）。
+  **答复侧也已完成**：`/approve [wk-id] [session|always]` 和 `/deny [wk-id] [理由]`
+  除了原来的内存路径，还会把答案**写进日志**（`approval/resolved`，durable 之后才继续）
+  并唤醒那个 turn——挂起的 turn 不在这个进程里等，问它的那个进程可能已经重启了。
+  id 用 `wk-` 前缀识别，所以 `/deny 太危险了` 还是理由、`/deny wk-0199 太危险了`
+  是「答另一个 session 的那个等待」（routine 的审批在 home chat 里答，就是这条路）；
+  `/approve the budget` 仍然是普通消息——只有认得的参数才当命令，否则会批准一件没人问过的事。
+  重启后内存里的 prompt 没了、风险等级也就无从得知，这时 `session`/`always` 一律**收窄成
+  只此一次**：放宽是唯一收不回来的方向。
+  续跑逻辑收在 `GatewayDispatcher::continue_turn` 一处（`TurnWaker` 变成薄适配器），
+  因为 sweep 的唤醒和到达的 `/approve` 要做的是同一件事，两份实现就是两次忘记写
+  `wakeup/fired` 的机会。
+  **过期路径**：`cause: expired` 的唤醒先写 `approval/expired`（call_index 从当初的
+  `approval/requested` 读回来，而不是猜 0），gate 把它读成拒绝——再问一遍会把 turn
+  永远停在同一个问题上。
+  验证：`an_approval_that_expired_comes_back_as_a_refusal`（续跑收到「没等到答案」、
+  调用没执行）、`an_expired_wait_records_the_expiry_before_continuing`、
+  `an_approval_command_can_name_the_wait_it_answers`。
+  还没接：`ChatApprover` / TUI approver 仍在等 oneshot（还没有人会答 `Suspend`），
+  以及挂起期间普通消息算放弃（moved-on）。`Risk::Dangerous` 仍 `Once`（策略梯子没动）。
 - **5.4 无人值守审批**：cron turn 的 deny-all 改为挂起 + HomeNotifier。验证：一个没有 grants 的
   routine 在 home chat 收到提示，`/approve` 后动作执行，`/deny` 后 routine 以 error 结算。
 - **5.5 `awaiting` 投影**：session 列表与 TUI 显示。验证：挂起/恢复/过期三态各一测。
