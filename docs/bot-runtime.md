@@ -256,7 +256,8 @@ struct RoutineRun {
 schedule/config 问题，不是 run 结果。
 
 **`Cron` / `At` 是「有槽位」的，事件类三种不是**：`next_slot` 只对前者答得出时刻，
-`next_run_at = 0` 就是「没有时刻」，sweep 于是跳过纯事件 routine（5.12–5.14 接上它们的 fire）。
+`next_run_at = 0` 就是「没有时刻」，sweep 于是跳过纯事件 routine——它们由自己的入口 fire
+（5.12–5.14，汇合在 `RoutineEventSource::on_event`）。
 `Any` 取成员里最近的那个槽位；一次 firing 只产生一条 `RoutineRun`，`event` 写的是
 **命中的那个成员**（`owner_of`），不是整个集合——事件触发的 routine 不记 `event` 就说不清
 「这次为什么跑」（Grok 每条 run 都带 `event`：`routines/controller.ts`）。`Any` 里的 `At`
@@ -423,11 +424,13 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 
 ### 4.4 事件触发
 
-- Webhook：`POST /api/hooks/{name}`，bearer key 校验，body 有界；命中 routine → 开 turn；
-  命中登记 → 唤醒。
-- Feishu：channel 已收全部消息；在 `GatewayDispatcher::handle` 入口前加一个 `TriggerMatcher`，
-  按 `FeishuMatch` 匹配，命中即投递给 sweep（不进聊天路径）。
-- FileChanged：`notify` crate 监听 `root`，防抖 2s，glob 过滤。
+三个入口一个汇合点 `RoutineEventSource::on_event`（§5.12–5.14 已完成）：命中的 routine 各开一条
+`origin = cron` 的 turn（走 routine 的 grants），命中的唤醒登记被 fire。
+
+- Webhook：`POST /api/hooks/{name}`，bearer key 校验（loopback 也不免），body 有界。
+- Feishu：channel 收到的每条消息都先过 routine 匹配（与 `allow_from`、`require_mention` 无关），
+  聊天路径照旧受它们约束；reaction 走 `im.message.reaction.created_v1`，chat 反查后同样进 `on_event`。
+- FileChanged：`notify` crate 监听 `root`，防抖 2s，glob 由 `Trigger::matched_by` 过滤。
 
 ---
 
@@ -777,10 +780,86 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   读出正确的 `Trigger` 与那条 run，且再连一次不重复）、`an_any_trigger_fires_once_and_names_what_hit`
   （两个成员同一槽位 → 一条 run，`event` 说出是哪个）、`a_slot_two_members_share_is_owned_by_one_of_them`、
   `event_triggers_have_no_occurrence`、`history_keeps_the_newest_runs_only`。
-- **5.12 Webhook**：`/api/hooks/{name}`。验证：无 key 401；命中登记唤醒；命中 routine 开 turn 且 `event` 记录 body 摘要。
-- **5.13 Feishu match**：`TriggerMatcher`（与 5.10 的 `FromPeer` 共用）；命中不进聊天路径。
-  验证：非 `allow_from` 的群成员 reaction 能触发 routine 但 turn 的 grants 是 routine 的，不是发送者的。
-- **5.14 FileChanged**：`notify` + 防抖。验证：批量写 50 个文件只触发一次。
+**5.12–5.14 共用的那条路** —— **已完成**：三个入口汇到一个
+`RoutineEventSource::on_event(&ExternalEvent)`（`komo-agent` 的 `daemon.rs`，与
+`CronJobSweep` 并列——后者现在只持有 `Arc<RoutineEventSource>`，是它的**时钟入口**）。
+`on_event` 做两件事：
+
+1. **命中的 routine 各开一条 turn**。匹配是纯函数 `Trigger::matched_by(&ExternalEvent)`
+   （`komo-core` 的 `domain::cron`），`Any` 至多答一个成员——**一次到达一条
+   `RoutineRun`**（判据 5），`event` 由 `Trigger::event_line` 写成「命中的成员 ·
+   事件摘要」。执行走的是 sweep 一直在用的那个 `fire` / `execute` /
+   `execute_cron_agent`，不复制一份：claim 成 `running` run、跑、按 `notify` 策略投递、
+   settle。所以事件触发的 turn 与槽位触发的 turn 完全同构——`SessionOrigin::Cron`、
+   `with_job_grants(job.granted_rules())`、cron runtime。**触发者身份不进授权**（判据 6）。
+2. **命中的登记被唤醒**。`domain::trigger` 的 `InboundEvent` 从结构体变成枚举
+   （`Message` / `Webhook`），`matches` 认 `EventFilter::Webhook`，`TriggerMatcher`
+   多一个 `on_event(&InboundEvent, payload)`——`on_inbound` 现在是它的薄壳，claim-before-fire
+   一套代码。飞书消息**不**走这一半（`ExternalEvent::as_inbound()` 答 `None`）：peer 唤醒由
+   每个 channel 共用的聊天入口 `GatewayDispatcher::handle` 负责，两边都发就把同一个承诺唤醒两次。
+
+事件内容进 prompt 时**打包成数据**：`cron_agent_prompt` 把 `ExternalEvent::detail()`
+（上限 `EVENT_DETAIL_CAP = 2000` 字符）放在任务之后、`<event>` 围栏里，并复述
+`system_prompt::TRUST_BOUNDARY_GUIDANCE` 的那条规则。command 模式的 routine 拿不到事件内容
+（它的 argv 是固定的，webhook body 由调用方书写），只记在 run 上。
+
+三个入口都经 `GatewayDispatcher::on_external_event` 转发（channel 手里只有 dispatcher），
+`attach_routines` 是后绑的——source 要 waker，waker 要 dispatcher。
+
+`on_event` 自己是**等到跑完**的（返回的是实际发生了什么，而不是派发了什么；同一 routine 的两个
+事件也就不会互相踩 `runs`）；等不起的入口自己 spawn——飞书消费循环（挡住它就挡住了用户正在打的
+`/approve`）和文件 watcher（还要继续防抖后面的写入）都 spawn，webhook 因为要把 `{routines,
+wakeups}` 答给调用方而直接 await。
+
+- **5.12 Webhook** —— **已完成**：`POST /api/hooks/{name}`，并进 api channel 的
+  `protected`（bearer key 网关），**不**进 `operator_writes`——那层 loopback 限制会把
+  webhook 的真正调用方（CI、监控）挡在外面；反过来 loopback 也不免鉴权，key 就是全部的门。
+  body 上限 `HOOK_BODY_LIMIT = 64 KB`（`DefaultBodyLimit`），内容类型不限、按文本读（lossy），
+  只取摘要进 `event`。响应 `{ "routines": n, "wakeups": m }`。
+  验证：`a_webhook_without_the_key_is_refused`（无 key / 错 key → 401）、
+  `an_oversized_webhook_body_is_refused`、`a_webhook_fires_the_routine_that_named_it`
+  （一条 run、`event` 含 body 摘要、turn 是 `origin=Cron` 且带 routine 的 grants）、
+  `a_webhook_wakes_the_turn_that_was_waiting_for_it`（`wait { for_event }` 的 turn 被唤醒，
+  工具返回事件描述，重复投递不再唤醒）、`a_webhook_nobody_named_wakes_nothing`。
+- **5.13 Feishu match** —— **已完成**：`admit` 不再丢掉「群里没 @ 机器人」的消息，而是把
+  它标成 `admitted: false` 带出来——routine 触发跟「有没有跟机器人说话」无关，群里一个关键词正是
+  §5.13 存在的理由。channel 的消费循环先无条件调 `on_external_event`（routine 路径），
+  再按 `admitted` + pairing 决定聊天路径走不走：**一条消息既是聊天又命中 routine 时，两条 turn 各走各的**；
+  只命中 routine 时聊天路径本来就不收它。
+  reaction 是新订阅的事件（`im.message.reaction.created_v1`）——它只带 `message_id` 不带
+  `chat_id`，所以要 `FeishuSender::message_chat_id` 反查；这是一次 API 调用，
+  因此先问 `wants_feishu_reactions()`（有没有 active 的 reaction routine），没有就一分钱不花。
+  bot 自己的 reaction（`operator_type != "user"`）不触发。
+  验证：`a_strangers_reaction_runs_the_routine_on_the_routines_authority`
+  （非 allow_from 的群成员 → routine turn 跑了、`origin=Cron`、grants 是 routine 的、
+  prompt 是 routine 的、别的群同一个 emoji 不触发）、
+  `an_any_of_event_triggers_runs_once_per_arrival_and_names_the_member`、
+  `a_reaction_and_a_message_never_stand_in_for_each_other`（core）、
+  `admit_requires_mention_in_groups_only` / `admit_ignores_a_group_mention_of_someone_else`
+  （改成断言 `admitted`）、`a_users_reaction_becomes_an_arrival_and_a_bots_does_not`。
+- **5.14 FileChanged** —— **已完成**：`notify = "8"`（默认 features；防抖是自己的
+  tokio 计时器，不引 `notify-debouncer-mini`），`src/infra/file_watcher.rs` 里的
+  `FileWatcher` 实现 `Channel`——它要的正是 `serve` 给的两样东西：一个长活的循环和一个
+  shutdown。宿主直挂（同 api channel），不做 plugin。
+  三条性质：**防抖 2s**（`DEBOUNCE`，每来一个路径就重置，静下来才合成一个
+  `ExternalEvent::FileChanged { paths }`，最多 `MAX_BATCH_PATHS = 500` 条）；
+  **按 root 去重**（glob 完全不参与 watch，过滤交给 `Trigger::matched_by`，
+  于是哪条 routine 命中由同一段代码决定）；**每 `RESCAN = 60s` 对照一次 jobs**
+  （只加不减：两条 routine 共用一个 root 时撤 watch 会把另一条弄哑；多余的 watch 只是一个闲置句柄）。
+  root 在**创建时**就 canonicalize + 证明存在（`normalize_event_trigger`，与 agent job 的
+  workspace 同一条理由），glob 也在那时编译一次；读路径上编译不出来的 glob 匹配空集而不是全集。
+  验证：`fifty_writes_in_one_window_fire_the_routine_once`（真实临时目录 + 真实 watcher，
+  50 个 `.md` 一条 run，`.png` 不触发）、`a_batch_of_file_writes_fires_a_routine_exactly_once`
+  （`on_event` 层）、`a_file_trigger_matches_its_glob_under_its_root`（core）、
+  `every_watched_root_is_collected_once`、`a_watched_directory_is_proven_and_canonicalized_at_creation`。
+
+**两个入口都能建这三种 routine**：`cron_actions::parse_schedule` 这个唯一的
+「字符串 → `Trigger`」解析点认了事件写法——`@webhook <name>`、
+`@feishu <chat> mention|keyword a,b|reaction <emoji>`、`@file <root> [glob]`，
+以及用 ` | ` 连成 `Any`（`|` 不出现在任何一种写法里，所以切分无歧义）。
+`komo cron add|add-agent <schedule>` 与 `cron` 工具的 `schedule` 因此同时拿到，
+二者的说明都写了这些形状。`komo cron list` 显示 trigger 描述（5.11 已做）。
+验证：`every_event_trigger_is_writable_as_a_string`。
 
 ### 第四批 · 收口
 

@@ -237,6 +237,12 @@ fork — add new operator actions there, not in the CLI or api handlers.
   `remote_interactive = true` lets keyed remote callers run interactive turns
   (`X-Komo-Trusted` stays loopback-only regardless). CORS grants loopback
   origins + Electron's `null` origin; bearer key remains the gate.
+  `POST /api/hooks/{name}` (docs/bot-runtime.md §5.12) is the one route whose
+  caller is *not* the operator: an external system firing a routine. It sits in
+  `protected` (bearer key) and deliberately **not** in `operator_writes`, whose
+  loopback layer would shut out its real callers — and by the same token
+  loopback earns it no exemption. Its body is capped at `HOOK_BODY_LIMIT` and
+  read as text, never parsed.
 
 ## Config
 
@@ -814,7 +820,10 @@ call the same functions, which is what keeps validation from forking.
   straight into croner, which silently shifts every schedule by the UTC offset.
   Sweeps: `ReviewSweep` (via the shared `LearningCoordinator`, which
   also serves the post-run trigger — the per-run watermark + in-flight guard
-  prevent duplicate extraction), `ReminderSweep`, `CronJobSweep` (claim-before-run: a
+  prevent duplicate extraction), `ReminderSweep`, `CronJobSweep` (the **clock
+  ingress** for routines: it holds an `Arc<RoutineEventSource>` — everything a
+  firing needs, whatever set it off — and adds only "which slot has come".
+  Claim-before-run: a
   crash never re-fires a slot; a slot missed by more than the job's **own
   interval** is abandoned rather than fired at the wrong hour — `is_due` has no
   upper bound on lateness, and the host is a laptop. `--skip-missed` opts a job
@@ -836,6 +845,27 @@ call the same functions, which is what keeps validation from forking.
   evidence, skill proposals lapse by age — previewed together by `komo dream`).
   `WorkdayGated` decorator gates a sweep to Chinese working days
   (`komo-infra`'s `workday`, cached per-year).
+- `komo-agent`'s `daemon::RoutineEventSource` — the **other** ingress for the
+  same routines (docs/bot-runtime.md §5.12–5.14): `on_event(&ExternalEvent)`,
+  where the event is an inbound webhook, a feishu message or reaction, or a
+  debounced batch of changed files. It does two things — start every routine
+  whose `Trigger::matched_by` answers, and fire every standing wait the event
+  matches (through `TriggerMatcher`, the same claim-before-fire shell an inbound
+  message uses; a feishu message deliberately skips that half, since the chat
+  ingress already fires peer waits and doing both would answer one commitment
+  twice). **One arrival is one `RoutineRun`** even when two `Any` members match,
+  and the run's `event` names the member that owns it. Execution is the sweep's
+  own `fire`/`execute`, not a second copy, so an event-fired turn is
+  indistinguishable from a slot-fired one: `SessionOrigin::Cron`, the job's
+  `with_job_grants`, the cron runtime — **who set it off never enters
+  authorization**. The event's content reaches the turn fenced in `<event>` under
+  `TRUST_BOUNDARY_GUIDANCE`'s rule and capped at `EVENT_DETAIL_CAP`; a *command*
+  routine never sees it at all (its argv is fixed, and a hook body is written by
+  the caller). Every ingress reaches it through
+  `GatewayDispatcher::on_external_event`, because the dispatcher is the one
+  thing a `Channel` is handed — `attach_routines` is late-bound for the same
+  reason `TriggerMatcher`'s dispatch is (the source needs the waker, the waker
+  needs the dispatcher).
 - `komo-agent`'s `gateway` + `interaction` — gateway hosts channels +
   sweeps. `GatewayDispatcher` owns turns (spawned per turn so `/approve` can
   arrive mid-turn; one turn per session). **`handle` is the only entry a channel
@@ -887,6 +917,29 @@ call the same functions, which is what keeps validation from forking.
   demand); recurring device reactions belong in an HA automation written via
   the tool's `save_automation`, not in an event stream that costs an LLM turn
   per sensor tick.
+  **feishu carries a second traffic besides the conversation**: routine triggers
+  (docs/bot-runtime.md §5.13). Every parsed message goes to
+  `on_external_event` unconditionally — a keyword in a group nobody @s is the
+  case the feature exists for — so `admit` no longer *drops* an unmentioned
+  group message, it marks it `admitted: false` and the chat path alone honours
+  that (and pairing). Both may fire for one message; they are two turns, not a
+  redirect. Reactions come from a second subscription
+  (`im.message.reaction.created_v1`), which names a message and not a chat, so
+  the chat is looked up (`message_chat_id`) — and only after
+  `wants_feishu_reactions()` says some routine could care, since that lookup is
+  an API call per emoji in every visible chat.
+- `infra/file_watcher.rs` — the third routine ingress (§5.14), a `Channel`
+  beside `messaging/` rather than in it: it carries no messages and opens no
+  conversation, but `serve` is exactly the shape it needs (a long-lived loop and
+  a shutdown). `notify` (FSEvents/inotify) → a **2s trailing debounce** (ours, a
+  tokio timer — saving fifty files is one thing happening, so it becomes one
+  `ExternalEvent::FileChanged` carrying the batch) → `on_event`. Watches are
+  **per root, deduplicated, add-only** (two routines sharing a directory need
+  one watch, and unwatching would silence the other); globs never enter the
+  watch at all, so which routine a change belongs to is decided by
+  `Trigger::matched_by` whichever ingress the event came from. The watched set
+  is reconciled against the jobs every 60s, so a routine added or paused takes
+  effect without a restart.
 - `cli/wiring.rs` — shared `AgentRuntime` construction (chat vs gateway differ
   only in `Approver`); register new tools here. Each runtime is a
   **`CapabilityProfile`** — scope, llm, tools, `max_turns`, `learns`,
@@ -927,14 +980,23 @@ call the same functions, which is what keeps validation from forking.
   operator answers `/approve wk-<id>` in the home chat — the run's status is
   then `waiting`, which is neither ran nor failed).
   **`Trigger` is what makes it fire** (docs/bot-runtime.md §3.3), replacing the
-  schedule string: `Cron`/`At` name a moment `next_run_at` holds, and
-  `Feishu`/`Webhook`/`FileChanged` are defined but not yet fired (5.12–5.14) —
-  they have no occurrence, so `next_run_at = 0` and the sweep passes over them.
-  `Any` (≤ 8) schedules to its soonest member and **fires once**, with the run's
+  schedule string: `Cron`/`At` name a moment `next_run_at` holds and the sweep
+  finds due, while `Feishu`/`Webhook`/`FileChanged` name no moment at all
+  (`next_run_at = 0`, the sweep passes over them) and fire from their own
+  ingresses through `Trigger::matched_by` — the pure matcher beside `next_slot`,
+  which also compiles a `FileChanged` glob (`globset`, the same syntax
+  `glob`/`grep` take) and reads a `FeishuMatch` against a message or a reaction,
+  never one as the other.
+  `Any` (≤ 8) schedules to its soonest member and **fires once** — for an arrival
+  as for a slot — with the run's
   `event` naming the member that hit; a spent `At` inside it simply stops
-  appearing in `next_slot`. A schedule *string* becomes a `Trigger` in exactly
+  appearing in `next_slot`. A trigger *string* becomes a `Trigger` in exactly
   one place, `cron_actions::parse_schedule` — the CLI and the `cron` tool both
-  call it, and structured triggers never round-trip through a string.
+  call it, so both write every shape: a cron expression, `@at …`,
+  `@webhook <name>`, `@feishu <chat> mention|keyword a,b|reaction <emoji>`,
+  `@file <root> [glob]`, and ` | ` between any of them for an `Any`. A watched
+  directory is canonicalized and proven to exist **there**, at creation, for the
+  same reason an agent job's `workspace` is.
   **One firing is one `RoutineRun`**, claimed `running` in the same write as the
   slot (a crash mid-run leaves the record of what was in flight) and settled
   `ok`/`error`/`waiting` after; `runs` keeps the newest 20 and `runs.last()` is
@@ -1021,7 +1083,15 @@ call the same functions, which is what keeps validation from forking.
   stopped for an approval.
 - **Scheduled action**: implement `Maintenance`, construct in `cli/gateway.rs`.
 - **Gateway ingress**: implement `Channel`, `add_channel` in `cli/gateway.rs`,
-  gate behind a `[channels.*]` declaration — feishu is the reference.
+  gate behind a `[channels.*]` declaration — feishu is the reference. A `Channel`
+  need not carry messages: `infra/file_watcher.rs` is one because "a long-lived
+  loop with a shutdown" is exactly what `serve` gives it.
+- **Routine trigger**: a variant on `Trigger` plus an arm in
+  `Trigger::matched_by` (`komo-core`'s `domain::cron`), a shape on
+  `ExternalEvent` (`domain::trigger`), a written form in
+  `cron_actions::parse_schedule`, and an ingress that calls
+  `GatewayDispatcher::on_external_event`. Nothing about *running* the routine
+  changes — that is `RoutineEventSource`'s, and there is one of it.
 
 ## Testing
 

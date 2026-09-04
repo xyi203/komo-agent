@@ -8,34 +8,128 @@
 
 use komo_core::domain::cron::{
     CronAction, CronJob, CronJobRepository, CronJobSpec, CronJobStatus,
-    DEFAULT_CRON_JOB_TIMEOUT_SECS, MAX_ANY_TRIGGERS, MAX_CRON_JOB_NAME_LEN, Trigger,
-    next_occurrence_local, schedule_is_once, valid_cron_job_name,
+    DEFAULT_CRON_JOB_TIMEOUT_SECS, FeishuMatch, MAX_ANY_TRIGGERS, MAX_CRON_JOB_NAME_LEN, Trigger,
+    compile_glob, next_occurrence_local, schedule_is_once, valid_cron_job_name,
 };
 use komo_core::domain::policy::{Matcher, RuleSpec};
 
-/// The one place a schedule *string* becomes a [`Trigger`]: a 5-field cron
-/// expression, or `@at YYYY-MM-DD HH:MM` resolved to the local moment it names.
-/// The `komo cron` CLI and the agent's `cron` tool both hold strings and both
-/// call this; structured triggers (`Any`, and the event-shaped ones) are passed
-/// as themselves and never round-trip through a string at all.
+/// The one place a trigger *string* becomes a [`Trigger`]. Both string-holding
+/// callers — the `komo cron` CLI and the agent's `cron` tool — go through it,
+/// so every written form is accepted identically on both.
 ///
-/// Parsing here also proves the expression schedulable — a past `@at` is
-/// refused while the person who typed it is still there.
+/// - `0 8 * * *` — a 5-field cron expression, local time.
+/// - `@at YYYY-MM-DD HH:MM` — one local moment; the job completes after it.
+/// - `@webhook <name>` — `POST /api/hooks/<name>`.
+/// - `@feishu <chat> mention` / `keyword a,b` / `reaction <emoji>`.
+/// - `@file <root> [glob]` — a file under `root` matching `glob` changed.
+/// - `a | b` — any of them fires it (an [`Trigger::Any`], at most
+///   [`MAX_ANY_TRIGGERS`] members). `|` appears in none of the forms above, so
+///   splitting on it is unambiguous.
+///
+/// Parsing here also proves the trigger actionable — a past `@at`, an unknown
+/// feishu match, a glob that does not compile are all refused while the person
+/// who typed them is still there.
 pub fn parse_schedule(schedule: &str, now: i64) -> anyhow::Result<Trigger> {
     let schedule = schedule.trim();
     if schedule.is_empty() {
         anyhow::bail!("a cron job needs a schedule");
     }
-    let at = next_occurrence_local(schedule, now)?;
-    Ok(match schedule_is_once(schedule) {
-        true => Trigger::At { at },
-        false => Trigger::cron(schedule),
-    })
+    if schedule.contains('|') {
+        let triggers = schedule
+            .split('|')
+            .map(|member| parse_one_trigger(member.trim(), now))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        return Ok(Trigger::Any { triggers });
+    }
+    parse_one_trigger(schedule, now)
 }
 
-/// Reject a trigger nothing could act on, before it reaches the store.
-fn validate_trigger(trigger: &Trigger, now: i64) -> anyhow::Result<()> {
-    if let Trigger::Any { triggers } = trigger {
+fn parse_one_trigger(schedule: &str, now: i64) -> anyhow::Result<Trigger> {
+    if schedule.is_empty() {
+        anyhow::bail!("a cron job needs a schedule");
+    }
+    let event = match schedule.split_once(char::is_whitespace) {
+        Some((word, rest)) if word.starts_with('@') && word != "@at" => Some((word, rest.trim())),
+        _ => None,
+    };
+    let Some((word, rest)) = event else {
+        let at = next_occurrence_local(schedule, now)?;
+        return Ok(match schedule_is_once(schedule) {
+            true => Trigger::At { at },
+            false => Trigger::cron(schedule),
+        });
+    };
+    match word {
+        "@webhook" => {
+            if rest.is_empty() {
+                anyhow::bail!("`@webhook` needs a name, e.g. `@webhook ci-done`");
+            }
+            Ok(Trigger::Webhook {
+                name: rest.to_string(),
+            })
+        }
+        "@feishu" => {
+            let (chat, rule) = rest
+                .split_once(char::is_whitespace)
+                .ok_or_else(|| anyhow::anyhow!("`@feishu` needs a chat id and a match rule"))?;
+            let (kind, argument) = match rule.trim().split_once(char::is_whitespace) {
+                Some((kind, argument)) => (kind, argument.trim()),
+                None => (rule.trim(), ""),
+            };
+            let matcher = match kind {
+                "mention" => FeishuMatch::Mention,
+                "keyword" => {
+                    let keywords: Vec<String> = argument
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|k| !k.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    if keywords.is_empty() {
+                        anyhow::bail!("`@feishu <chat> keyword` needs at least one keyword");
+                    }
+                    FeishuMatch::Keyword { keywords }
+                }
+                "reaction" => {
+                    if argument.is_empty() {
+                        anyhow::bail!("`@feishu <chat> reaction` needs an emoji name");
+                    }
+                    FeishuMatch::Reaction {
+                        emoji: argument.to_string(),
+                    }
+                }
+                other => anyhow::bail!(
+                    "unknown feishu match `{other}` (mention | keyword <a,b> | reaction <emoji>)"
+                ),
+            };
+            Ok(Trigger::Feishu {
+                chat: chat.to_string(),
+                matcher,
+            })
+        }
+        "@file" => {
+            let (root, glob) = match rest.split_once(char::is_whitespace) {
+                Some((root, glob)) => (root, glob.trim()),
+                None => (rest, ""),
+            };
+            if root.is_empty() {
+                anyhow::bail!("`@file` needs a directory, e.g. `@file /srv/notes **/*.md`");
+            }
+            Ok(Trigger::FileChanged {
+                root: std::path::PathBuf::from(root),
+                glob: glob.to_string(),
+            })
+        }
+        other => anyhow::bail!(
+            "unknown trigger `{other}` (@at | @webhook | @feishu | @file, or a cron expression)"
+        ),
+    }
+}
+
+/// Reject a trigger nothing could act on, and resolve what has to be resolved
+/// at creation time, before it reaches the store.
+fn validate_trigger(trigger: Trigger, now: i64) -> anyhow::Result<Trigger> {
+    if let Trigger::Any { triggers } = &trigger {
         if triggers.is_empty() {
             anyhow::bail!("an `any` trigger needs at least one listener");
         }
@@ -46,12 +140,79 @@ fn validate_trigger(trigger: &Trigger, now: i64) -> anyhow::Result<()> {
             anyhow::bail!("`any` triggers do not nest");
         }
     }
+    let trigger = normalize_event_trigger(trigger)?;
     // Proves every cron member parses, and that a schedule-shaped trigger still
     // has a future — a `@at` moment that has passed schedules nothing.
     if trigger.next_slot(now)?.is_none() && trigger.is_scheduled() {
         anyhow::bail!("`{}` is already past", trigger.describe());
     }
-    Ok(())
+    Ok(trigger)
+}
+
+/// The event-shaped triggers' own creation-time proofs, and the one thing that
+/// has to be resolved rather than checked.
+///
+/// A watched directory is canonicalized **now**, while the person who typed it
+/// is still there — the same reason an agent job's workspace is. A path
+/// resolved late would fail at the gateway's next start, and a routine that
+/// never fires looks exactly like one nothing ever happened for; a symlinked
+/// root would also fail to prefix-match the paths the watcher reports.
+fn normalize_event_trigger(trigger: Trigger) -> anyhow::Result<Trigger> {
+    match trigger {
+        Trigger::Webhook { name } => {
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                anyhow::bail!("a webhook trigger needs a name");
+            }
+            if name.contains('/') {
+                anyhow::bail!("`{name}` is not a webhook name: it is one path segment");
+            }
+            Ok(Trigger::Webhook { name })
+        }
+        Trigger::Feishu { chat, matcher } => {
+            let chat = chat.trim().to_string();
+            if chat.is_empty() {
+                anyhow::bail!("a feishu trigger needs a chat id");
+            }
+            let matcher = match matcher {
+                FeishuMatch::Keyword { keywords } => {
+                    let keywords: Vec<String> = keywords
+                        .into_iter()
+                        .map(|k| k.trim().to_string())
+                        .filter(|k| !k.is_empty())
+                        .collect();
+                    if keywords.is_empty() {
+                        anyhow::bail!("a feishu keyword trigger needs at least one keyword");
+                    }
+                    FeishuMatch::Keyword { keywords }
+                }
+                other => other,
+            };
+            Ok(Trigger::Feishu { chat, matcher })
+        }
+        Trigger::FileChanged { root, glob } => {
+            let glob = glob.trim().to_string();
+            compile_glob(&glob).map_err(|e| anyhow::anyhow!("invalid glob `{glob}`: {e}"))?;
+            let raw = root.to_string_lossy().into_owned();
+            let resolved = komo_config::expand_home(&raw)
+                .canonicalize()
+                .map_err(|e| anyhow::anyhow!("watched directory `{raw}` cannot be used: {e}"))?;
+            if !resolved.is_dir() {
+                anyhow::bail!("watched path `{raw}` is not a directory");
+            }
+            Ok(Trigger::FileChanged {
+                root: resolved,
+                glob,
+            })
+        }
+        Trigger::Any { triggers } => Ok(Trigger::Any {
+            triggers: triggers
+                .into_iter()
+                .map(normalize_event_trigger)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        }),
+        clock => Ok(clock),
+    }
 }
 
 /// Validate a job spec and create it — schedule parsed with the same cron
@@ -120,15 +281,14 @@ pub async fn add_cron_job(
     if jobs.find_by_name(name).await?.is_some() {
         anyhow::bail!("a cron job named `{name}` already exists");
     }
-    validate_trigger(&spec.trigger, now)?;
+    let trigger = validate_trigger(spec.trigger, now)?;
     // An event-only trigger has no moment to wait for: `0` is what keeps the
     // sweep from reading "due since the epoch".
-    let next_run_at = spec
-        .trigger
+    let next_run_at = trigger
         .next_slot(now)?
         .map(|(at, _)| at)
         .unwrap_or_default();
-    let mut job = CronJob::new(name, spec.trigger, action, next_run_at)
+    let mut job = CronJob::new(name, trigger, action, next_run_at)
         .with_grants(normalize_grants(spec.grants)?);
     job.catch_up = spec.catch_up;
     job.notify = spec.notify;
@@ -435,6 +595,138 @@ mod tests {
         assert!(at > now);
         assert!(parse_schedule("not a cron", now).is_err());
         assert!(parse_schedule("  ", now).is_err());
+    }
+
+    /// Both string-holding callers — the CLI and the agent's `cron` tool — go
+    /// through this one parse, so every trigger shape has to be writable in it
+    /// or half of §5.12–5.14 is unreachable from the surfaces people use.
+    #[test]
+    fn every_event_trigger_is_writable_as_a_string() {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        assert_eq!(
+            parse_schedule("@webhook ci-done", now).unwrap(),
+            Trigger::Webhook {
+                name: "ci-done".into()
+            }
+        );
+        assert_eq!(
+            parse_schedule("@feishu oc_team mention", now).unwrap(),
+            Trigger::Feishu {
+                chat: "oc_team".into(),
+                matcher: FeishuMatch::Mention
+            }
+        );
+        assert_eq!(
+            parse_schedule("@feishu oc_team keyword 值班, oncall", now).unwrap(),
+            Trigger::Feishu {
+                chat: "oc_team".into(),
+                matcher: FeishuMatch::Keyword {
+                    keywords: vec!["值班".into(), "oncall".into()]
+                }
+            }
+        );
+        assert_eq!(
+            parse_schedule("@feishu oc_team reaction THUMBSUP", now).unwrap(),
+            Trigger::Feishu {
+                chat: "oc_team".into(),
+                matcher: FeishuMatch::Reaction {
+                    emoji: "THUMBSUP".into()
+                }
+            }
+        );
+        assert_eq!(
+            parse_schedule("@file /srv/notes **/*.md", now).unwrap(),
+            Trigger::FileChanged {
+                root: "/srv/notes".into(),
+                glob: "**/*.md".into()
+            }
+        );
+        // No glob is "anything under the root".
+        assert_eq!(
+            parse_schedule("@file /srv/notes", now).unwrap(),
+            Trigger::FileChanged {
+                root: "/srv/notes".into(),
+                glob: String::new()
+            }
+        );
+        // `|` appears in none of the written forms, so it can only mean "any".
+        assert_eq!(
+            parse_schedule("0 8 * * * | @webhook ci", now).unwrap(),
+            Trigger::Any {
+                triggers: vec![
+                    Trigger::cron("0 8 * * *"),
+                    Trigger::Webhook { name: "ci".into() }
+                ]
+            }
+        );
+
+        for bad in [
+            "@webhook",
+            "@feishu oc_team",
+            "@feishu oc_team shouted",
+            "@feishu oc_team keyword",
+            "@feishu oc_team reaction",
+            "@file",
+            "@nonsense x",
+        ] {
+            assert!(parse_schedule(bad, now).is_err(), "`{bad}` must be refused");
+        }
+    }
+
+    /// A watched directory is resolved when the routine is created, like an
+    /// agent job's workspace and for the same reason: a typo has to fail while
+    /// the person who typed it is still there, not silently at the next start.
+    #[tokio::test]
+    async fn a_watched_directory_is_proven_and_canonicalized_at_creation() {
+        let jobs = FakeJobs::default();
+        let missing = add_cron_job(
+            &jobs,
+            command_spec(
+                "watch-nowhere",
+                Trigger::FileChanged {
+                    root: "/definitely/not/here".into(),
+                    glob: "**/*".into(),
+                },
+            ),
+            1000,
+        )
+        .await;
+        assert!(missing.is_err(), "a directory that is not there is refused");
+
+        let bad_glob = add_cron_job(
+            &jobs,
+            command_spec(
+                "watch-badglob",
+                Trigger::FileChanged {
+                    root: std::env::temp_dir(),
+                    glob: "[".into(),
+                },
+            ),
+            1000,
+        )
+        .await;
+        assert!(
+            bad_glob.is_err(),
+            "a glob that will never compile is refused"
+        );
+
+        let job = add_cron_job(
+            &jobs,
+            command_spec(
+                "watch-temp",
+                Trigger::FileChanged {
+                    root: std::env::temp_dir(),
+                    glob: "**/*.md".into(),
+                },
+            ),
+            1000,
+        )
+        .await
+        .unwrap();
+        let Trigger::FileChanged { root, .. } = &job.trigger else {
+            panic!("stored as written");
+        };
+        assert_eq!(root, &std::env::temp_dir().canonicalize().unwrap());
     }
 
     /// An event-only routine is stored with no moment at all, so the sweep

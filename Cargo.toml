@@ -117,6 +117,11 @@ grep-searcher = "0.1.17"
 grep-regex = "0.1.14"
 # Unified diffs + line-level add/remove counts for `edit` / `apply_patch`.
 similar = "3.1.2"
+# Filesystem notifications for `Trigger::FileChanged` (docs/bot-runtime.md
+# §5.14) — FSEvents on macOS, inotify on Linux. Default features only: the
+# debounce is ours (a tokio timer over the raw stream), so no second channel
+# implementation and no debouncer crate ride along.
+notify = "8.2.0"
 
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) enables `#[tokio::test(start_paused)]`,

@@ -9,8 +9,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use komo_agent::daemon::{
-    BriefingSweep, CronJobSweep, DreamSweep, Maintenance, MemoryMonitorSweep, ReminderSweep,
-    ReviewSweep, Schedule, TaskSweep, WakeupWiring, WorkdayGated,
+    BriefingSweep, DreamSweep, Maintenance, MemoryMonitorSweep, ReminderSweep, ReviewSweep,
+    Schedule, TaskSweep, WorkdayGated,
 };
 use komo_agent::gateway::MaintenanceService;
 use komo_infra::workday::HolidayCalendar;
@@ -176,9 +176,15 @@ impl Plugin for BriefingPlugin {
     }
 }
 
-/// Cron jobs (`komo cron add`, stored in cron.db): one every-minute sweep
-/// reads the store and executes due jobs, so jobs added/removed/toggled while
-/// the gateway runs take effect on the next tick — no restart.
+/// Routines (`komo cron add`, stored in `cron_job_records`): one every-minute
+/// sweep reads the store and executes the ones whose slot has come, so jobs
+/// added/removed/toggled while the gateway runs take effect on the next tick —
+/// no restart.
+///
+/// It is the *clock* half only: the event-triggered routines (§5.12–5.14) fire
+/// from their own ingresses, through the same shared
+/// [`RoutineEventSource`](komo_agent::daemon::RoutineEventSource) the host
+/// built and handed here.
 pub struct CronJobsPlugin;
 
 #[async_trait]
@@ -191,20 +197,7 @@ impl Plugin for CronJobsPlugin {
         reg.sweep(MaintenanceService {
             name: "cron-jobs".to_string(),
             schedule: Schedule::parse("* * * * *")?,
-            maintenance: Arc::new(CronJobSweep {
-                jobs: cx.cron_jobs.clone(),
-                notifier: cx.notifier.clone(),
-                // Agent-mode jobs run on the unattended full-tool cron runtime.
-                runtime: Some(cx.cron_runtime.clone()),
-                // Standing waits ride the same tick (docs/bot-runtime.md §3.3):
-                // one scheduler for routines and for the turns waiting on an
-                // answer.
-                wakeups: Some(WakeupWiring {
-                    registrations: cx.wakeups.registrations.clone(),
-                    events: cx.wakeups.events.clone(),
-                    dispatch: cx.wakeups.dispatch.clone(),
-                }),
-            }),
+            maintenance: Arc::new(cx.routines.sweep()),
             alert: Some(cx.notifier.clone()),
         });
         Ok(())

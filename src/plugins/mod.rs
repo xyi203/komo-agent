@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use komo_agent::daemon::{Schedule, WakeupWiring};
+use komo_agent::daemon::{RoutineEventSource, Schedule};
 use komo_agent::gateway::{Channel, MaintenanceService};
 use komo_agent::learning_coordinator::LearningCoordinator;
 use komo_agent::runtime::AgentRuntime;
@@ -501,7 +501,6 @@ pub struct SweepCx<'a> {
     pub config: &'a ConfigSnapshot,
     pub db: Arc<Db>,
     pub kanban: Arc<dyn TaskRepository>,
-    pub cron_jobs: Arc<dyn CronJobRepository>,
     pub notifier: Arc<dyn Notifier>,
     pub review: Arc<LearningCoordinator>,
     pub memories: Arc<dyn MemoryRepository>,
@@ -510,16 +509,17 @@ pub struct SweepCx<'a> {
     pub skill_store: Arc<FsSkillStore>,
     pub aux_llm: Arc<dyn LlmClient>,
     pub briefing_runtime: Arc<AgentRuntime>,
-    pub cron_runtime: Arc<AgentRuntime>,
     pub maintenance_schedule: Schedule,
     /// `None` = the opt-in sweep is off (unset or a typo'd cron, already
     /// warned about by the host).
     pub briefing_schedule: Option<Schedule>,
     pub briefing_expr: Option<String>,
     pub dream_schedule: Option<Schedule>,
-    /// What the cron sweep needs to fire a standing wait — the registrations,
-    /// the log to check them against, and the waker that continues the turn.
-    pub wakeups: WakeupWiring,
+    /// Everything a routine firing needs, whatever set it off — the job store,
+    /// the unattended runtime, the notifier, and the standing waits that ride
+    /// the same tick. Host-built and shared, because the three event ingresses
+    /// (§5.12–5.14) fire routines through the very same source.
+    pub routines: Arc<RoutineEventSource>,
 }
 
 #[derive(Default)]

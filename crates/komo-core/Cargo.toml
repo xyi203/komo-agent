@@ -16,6 +16,9 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 # Cron-expression parsing for `domain::cron`'s next-occurrence math.
 croner = "3"
+# Glob matching for `domain::cron`'s `FileChanged` trigger — the same matcher
+# `glob`/`grep` use, so one syntax holds across every surface that takes a glob.
+globset = "0.4.20"
 
 [dev-dependencies]
 # Test-only: the approval gate is async, so its tests need a runtime. A

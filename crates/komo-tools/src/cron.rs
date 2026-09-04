@@ -153,8 +153,10 @@ impl Tool for CronTool {
          action=\"list\" returns every job with its trigger, status, next run \
          and last outcome; \
          action=\"add\" creates one (requires `name` + `schedule` — a 5-field \
-         cron expression for recurring work, or `@at YYYY-MM-DD HH:MM` for a \
-         one-shot, both in the user's local timezone — plus either `prompt` for \
+         cron expression for recurring work, `@at YYYY-MM-DD HH:MM` for a \
+         one-shot, both in the user's local timezone, or an event: \
+         `@webhook <name>` / `@feishu <chat> keyword …` / `@file <dir> <glob>` \
+         — plus either `prompt` for \
          an agent job — an unattended agent turn with your full tool set, \
          optionally preloading `skills` — or `command` \
          (+ `args`/`workdir`/`timeout_secs`) for a fixed program); \
@@ -195,7 +197,7 @@ impl Tool for CronTool {
                 },
                 "schedule": {
                     "type": "string",
-                    "description": "When the job fires, in the user's local timezone (action=add). Recurring: a 5-field cron expression, e.g. \"0 8 * * *\" for 8 AM daily or \"0 14 * * 5\" for Friday 2 PM. One-shot: \"@at YYYY-MM-DD HH:MM\", e.g. \"@at 2026-08-12 08:30\" — fires once, then the job completes (a past time is rejected)."
+                    "description": "What makes the job fire (action=add). Clock triggers are in the user's local timezone. Recurring: a 5-field cron expression, e.g. \"0 8 * * *\" for 8 AM daily or \"0 14 * * 5\" for Friday 2 PM. One-shot: \"@at YYYY-MM-DD HH:MM\", e.g. \"@at 2026-08-12 08:30\" — fires once, then the job completes (a past time is rejected). Event triggers fire when something happens instead: \"@webhook <name>\" (an external system POSTs to /api/hooks/<name>), \"@feishu <chat_id> mention\" / \"@feishu <chat_id> keyword 值班,oncall\" / \"@feishu <chat_id> reaction THUMBSUP\" (something said or reacted to in that feishu chat — the routine runs on its own grants whoever set it off), \"@file <directory> <glob>\" e.g. \"@file /srv/notes **/*.md\" (the directory must already exist; a burst of writes fires it once). Combine with \" | \" for \"any of these\", e.g. \"0 8 * * * | @webhook ci-done\"."
                 },
                 "notify": {
                     "type": "string",

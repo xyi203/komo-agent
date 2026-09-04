@@ -23,6 +23,7 @@ use komo_agent::interaction::GatewayDispatcher;
 use komo_agent::pairing::{PairingGuard, Principal};
 use komo_core::domain::inbox::InboundOrigin;
 use komo_core::domain::session::{ChannelPeer, InboundPeer};
+use komo_core::domain::trigger::{ExternalEvent, FeishuEvent};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -162,6 +163,62 @@ impl FeishuSender {
         Ok(response.bot.open_id)
     }
 
+    /// Which chat a message belongs to.
+    ///
+    /// Needed because `im.message.reaction.created_v1` carries the message id
+    /// and no chat id, while a `Trigger::Feishu` is written about a chat —
+    /// matching a reaction against a routine is impossible without this. Asked
+    /// only when a reaction-watching routine actually exists, so a busy group
+    /// with no such routine costs nothing.
+    async fn message_chat_id(&self, message_id: &str) -> anyhow::Result<String> {
+        #[derive(Deserialize)]
+        struct MessageResponse {
+            code: i64,
+            #[serde(default)]
+            msg: String,
+            #[serde(default)]
+            data: MessageData,
+        }
+
+        #[derive(Deserialize, Default)]
+        struct MessageData {
+            #[serde(default)]
+            items: Vec<MessageItem>,
+        }
+
+        #[derive(Deserialize)]
+        struct MessageItem {
+            #[serde(default)]
+            chat_id: String,
+        }
+
+        let token = self.tenant_access_token().await?;
+        let response: MessageResponse = self
+            .http
+            .get(format!(
+                "{FEISHU_BASE_URL}/open-apis/im/v1/messages/{message_id}"
+            ))
+            .bearer_auth(token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if response.code != 0 {
+            anyhow::bail!(
+                "feishu message lookup failed: code {} ({})",
+                response.code,
+                response.msg
+            );
+        }
+        response
+            .data
+            .items
+            .into_iter()
+            .map(|item| item.chat_id)
+            .find(|chat| !chat.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("feishu message {message_id} named no chat"))
+    }
+
     /// Send a plain text message into a chat (works for both p2p and group).
     pub async fn send_text(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
         #[derive(Deserialize)]
@@ -227,6 +284,21 @@ pub struct FeishuChannel {
     guard: PairingGuard,
 }
 
+/// One thing that arrived on the long connection.
+///
+/// A reaction is here for one reason: a `Trigger::Feishu { Reaction }` routine
+/// (docs/bot-runtime.md §5.13). It is never chat input — nobody is talking to
+/// komo by tapping an emoji — so it has no `Inbound` and never reaches the
+/// dispatcher's message path.
+enum Arrival {
+    Message(Inbound),
+    Reaction {
+        message_id: String,
+        sender_id: String,
+        emoji: String,
+    },
+}
+
 /// One inbound text message, reduced to what the agent needs.
 struct Inbound {
     message_id: String,
@@ -237,6 +309,16 @@ struct Inbound {
     /// §3.8): the operator's DM is their home conversation, a group is not.
     private: bool,
     text: String,
+    /// The message @s the bot itself.
+    mentions_bot: bool,
+    /// Whether the *chat* path takes it: a group message must address the bot
+    /// when `require_mention` is on.
+    ///
+    /// Kept as a flag instead of dropping the message, because a routine
+    /// trigger is not addressed to the bot and never had to be — a keyword in a
+    /// group nobody @s is exactly the case §5.13 exists for. The routine path
+    /// sees every message; only the conversation is gated.
+    admitted: bool,
 }
 
 impl FeishuChannel {
@@ -253,6 +335,54 @@ impl FeishuChannel {
             },
             guard: PairingGuard::new("feishu", config.allow_from.clone(), pairings),
         }
+    }
+
+    /// One reaction, on its way to a `Trigger::Feishu { Reaction }` routine.
+    ///
+    /// The chat is looked up rather than read off the event, which does not
+    /// carry one — and only when a routine is actually watching for a reaction,
+    /// because every emoji in every chat the bot can see arrives here and the
+    /// lookup is an API call. A gateway with no such routine spends nothing.
+    ///
+    /// Spawned for the same reason a message's triggers are: the consumer loop
+    /// has to keep consuming while a routine's turn runs.
+    fn on_reaction(
+        &self,
+        dispatcher: &Arc<GatewayDispatcher>,
+        message_id: String,
+        sender_id: String,
+        emoji: String,
+    ) {
+        let dispatcher = dispatcher.clone();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            if !dispatcher.wants_feishu_reactions().await {
+                return;
+            }
+            let chat = match sender.message_chat_id(&message_id).await {
+                Ok(chat) => chat,
+                Err(error) => {
+                    warn!(%error, message = %message_id, "could not resolve a reaction's chat");
+                    return;
+                }
+            };
+            let fired = dispatcher
+                .on_external_event(&ExternalEvent::Feishu(FeishuEvent {
+                    chat,
+                    sender: sender_id,
+                    text: String::new(),
+                    mention: false,
+                    reaction: Some(emoji.clone()),
+                }))
+                .await;
+            if fired.routines > 0 {
+                info!(
+                    %emoji,
+                    routines = fired.routines,
+                    "a reaction fired routines"
+                );
+            }
+        });
     }
 }
 
@@ -294,7 +424,7 @@ impl Channel for FeishuChannel {
             info!(bot = %policy.bot_open_id, "feishu bot identified");
         }
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<Inbound>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Arrival>();
 
         // The long connection runs on its own thread with a single-threaded
         // runtime, keeping its heartbeat/reconnect loop isolated from the
@@ -307,10 +437,45 @@ impl Channel for FeishuChannel {
             shutdown.clone(),
         );
 
-        // Consumer: one message at a time, in arrival order. The chat id keys
-        // the session, so a p2p chat is one continuous conversation.
+        // Consumer: one arrival at a time, in order. The chat id keys the
+        // session, so a p2p chat is one continuous conversation.
         let consume = async {
-            while let Some(msg) = rx.recv().await {
+            while let Some(arrival) = rx.recv().await {
+                let msg = match arrival {
+                    Arrival::Message(msg) => msg,
+                    Arrival::Reaction {
+                        message_id,
+                        sender_id,
+                        emoji,
+                    } => {
+                        self.on_reaction(&dispatcher, message_id, sender_id, emoji);
+                        continue;
+                    }
+                };
+                // Routine triggers first, and unconditionally: a routine is set
+                // off by *what was said in a chat*, not by who said it or by
+                // whether they addressed the bot (docs/bot-runtime.md §8,
+                // criterion 6). It opens its own turn on the routine's grants
+                // and never touches this conversation.
+                //
+                // Spawned, because a routine turn is an agent turn: awaiting it
+                // here would stop this loop consuming — including the
+                // `/approve` somebody is typing — for as long as it runs.
+                let triggered = ExternalEvent::Feishu(FeishuEvent {
+                    chat: msg.chat_id.clone(),
+                    sender: msg.sender_id.clone(),
+                    text: msg.text.clone(),
+                    mention: msg.mentions_bot,
+                    reaction: None,
+                });
+                let routines = dispatcher.clone();
+                tokio::spawn(async move { routines.on_external_event(&triggered).await });
+                // Everything below is the *conversation*, which keeps every
+                // gate it had: a group message that does not address the bot is
+                // not talking to it, and an unknown sender pairs first.
+                if !msg.admitted {
+                    continue;
+                }
                 // Pairing gate: unknown senders get a pairing code instead of
                 // the agent until `komo pair approve` runs on the host.
                 let sender = self.sender.clone();
@@ -366,7 +531,7 @@ fn spawn_ws_thread(
     app_id: String,
     app_secret: String,
     policy: AdmitPolicy,
-    events: mpsc::UnboundedSender<Inbound>,
+    events: mpsc::UnboundedSender<Arrival>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -388,12 +553,25 @@ fn spawn_ws_thread(
         );
         runtime.block_on(async move {
             // Every event is acked by the session regardless of registration,
-            // so subscribing to the one event we consume is enough — read
-            // receipts and the rest are acked without a handler.
-            let dispatcher = match EventDispatcherHandler::builder().register_raw(
-                "im.message.receive_v1",
-                ReceiveHandler { policy, events },
-            ) {
+            // so subscribing to the two events we consume is enough — read
+            // receipts and the rest are acked without a handler. Reactions are
+            // here for routine triggers only (docs/bot-runtime.md §5.13); a
+            // gateway with no reaction routine drops them a step later, having
+            // spent one parse.
+            let dispatcher = match EventDispatcherHandler::builder()
+                .register_raw(
+                    "im.message.receive_v1",
+                    ReceiveHandler {
+                        policy,
+                        events: events.clone(),
+                    },
+                )
+                .and_then(|builder| {
+                    builder.register_raw(
+                        "im.message.reaction.created_v1",
+                        ReactionHandler { events },
+                    )
+                }) {
                 Ok(builder) => builder.build(),
                 Err(error) => {
                     error!(%error, "failed to register feishu event handler");
@@ -447,7 +625,7 @@ fn spawn_ws_thread(
 /// schema would drop the whole message.
 struct ReceiveHandler {
     policy: AdmitPolicy,
-    events: mpsc::UnboundedSender<Inbound>,
+    events: mpsc::UnboundedSender<Arrival>,
 }
 
 impl EventHandler for ReceiveHandler {
@@ -455,7 +633,7 @@ impl EventHandler for ReceiveHandler {
         match serde_json::from_slice::<ReceiveEvent>(payload) {
             Ok(event) => {
                 if let Some(msg) = admit(event, &self.policy) {
-                    let _ = self.events.send(msg);
+                    let _ = self.events.send(Arrival::Message(msg));
                 }
             }
             // Ack anyway: redelivery cannot fix a payload we cannot parse.
@@ -513,9 +691,75 @@ struct EventMention {
     id: Option<SenderId>,
 }
 
-/// Reduce a raw receive event to an `Inbound`, or `None` when the agent
-/// should ignore it (policy rejection, non-text, non-user sender, empty
-/// after mention strip).
+/// Forwards `im.message.reaction.created_v1` — the ingress a
+/// `Trigger::Feishu { Reaction }` routine listens on (docs/bot-runtime.md
+/// §5.13). Reactions are not chat input, so they take no policy: whether one
+/// means anything is entirely up to whether a routine is watching for it.
+struct ReactionHandler {
+    events: mpsc::UnboundedSender<Arrival>,
+}
+
+impl EventHandler for ReactionHandler {
+    fn handle(&self, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match serde_json::from_slice::<ReactionEvent>(payload) {
+            Ok(event) => {
+                if let Some(arrival) = reaction(event) {
+                    let _ = self.events.send(arrival);
+                }
+            }
+            Err(error) => warn!(%error, "feishu reaction payload failed to parse"),
+        }
+        Ok(())
+    }
+}
+
+/// The `im.message.reaction.created_v1` payload. It names the message, never
+/// the chat — resolving that is `message_chat_id`'s job.
+#[derive(Deserialize)]
+struct ReactionEvent {
+    event: ReactionBody,
+}
+
+#[derive(Deserialize)]
+struct ReactionBody {
+    #[serde(default)]
+    message_id: String,
+    #[serde(default)]
+    reaction_type: ReactionType,
+    #[serde(default)]
+    operator_type: String,
+    #[serde(default)]
+    user_id: Option<SenderId>,
+}
+
+#[derive(Deserialize, Default)]
+struct ReactionType {
+    #[serde(default)]
+    emoji_type: String,
+}
+
+fn reaction(event: ReactionEvent) -> Option<Arrival> {
+    let body = event.event;
+    // A bot reacting to its own output must not set a routine off.
+    if body.operator_type != "user" {
+        return None;
+    }
+    if body.message_id.is_empty() || body.reaction_type.emoji_type.is_empty() {
+        return None;
+    }
+    Some(Arrival::Reaction {
+        message_id: body.message_id,
+        sender_id: body.user_id.and_then(|id| id.open_id).unwrap_or_default(),
+        emoji: body.reaction_type.emoji_type,
+    })
+}
+
+/// Reduce a raw receive event to an `Inbound`, or `None` when nothing at all
+/// can be done with it (non-text, non-user sender, empty after mention strip).
+///
+/// The group mention rule is recorded on the message (`admitted`) rather than
+/// applied here: it decides whether the *conversation* takes the message, and a
+/// routine trigger is a separate question with a separate answer.
 fn admit(event: ReceiveEvent, policy: &AdmitPolicy) -> Option<Inbound> {
     let sender = event.event.sender;
     if sender.sender_type != "user" {
@@ -532,16 +776,12 @@ fn admit(event: ReceiveEvent, policy: &AdmitPolicy) -> Option<Inbound> {
     // that @s a colleague is delivered to us all the same (the app may hold
     // `im:message` rather than only `im:message.group_at_msg`), and answering
     // it talks over the conversation. An unresolved own open_id fails closed.
-    if message.chat_type == "group" && policy.require_mention {
-        let mentions_bot = !policy.bot_open_id.is_empty()
-            && message.mentions.iter().flatten().any(|mention| {
-                mention.id.as_ref().and_then(|id| id.open_id.as_deref())
-                    == Some(policy.bot_open_id.as_str())
-            });
-        if !mentions_bot {
-            return None;
-        }
-    }
+    let mentions_bot = !policy.bot_open_id.is_empty()
+        && message.mentions.iter().flatten().any(|mention| {
+            mention.id.as_ref().and_then(|id| id.open_id.as_deref())
+                == Some(policy.bot_open_id.as_str())
+        });
+    let admitted = message.chat_type != "group" || !policy.require_mention || mentions_bot;
     let text = strip_mentions(&extract_text(&message.content)?);
     if text.is_empty() {
         return None;
@@ -552,6 +792,8 @@ fn admit(event: ReceiveEvent, policy: &AdmitPolicy) -> Option<Inbound> {
         private: message.chat_type == "p2p",
         chat_id: message.chat_id,
         text,
+        mentions_bot,
+        admitted,
     })
 }
 
@@ -698,14 +940,20 @@ mod tests {
         let unmentioned_group = event(json!({
             "event": { "message": { "chat_type": "group" } }
         }));
-        assert!(admit(unmentioned_group, &policy).is_none());
+        // Still parsed — a routine keyword can match it (docs/bot-runtime.md
+        // §5.13) — but the *conversation* does not take it.
+        let overheard = admit(unmentioned_group, &policy).expect("overheard, not dropped");
+        assert!(!overheard.admitted);
+        assert!(!overheard.mentions_bot);
 
         let msg =
             admit(group_mentioning(json!(BOT)), &policy).expect("mentioned group message admitted");
         assert_eq!(msg.text, "hi");
+        assert!(msg.admitted);
+        assert!(msg.mentions_bot);
 
         // DMs bypass the mention gate entirely.
-        assert!(admit(event(json!({})), &policy).is_some());
+        assert!(admit(event(json!({})), &policy).expect("a dm").admitted);
     }
 
     #[test]
@@ -716,9 +964,42 @@ mod tests {
         };
         // A colleague @s another colleague: delivered to us, not addressed to
         // us. Answering it talks over the conversation.
-        assert!(admit(group_mentioning(json!("ou_colleague")), &policy).is_none());
-        // A mention Feishu could not resolve is not the bot either.
-        assert!(admit(group_mentioning(json!(null)), &policy).is_none());
+        for open_id in [json!("ou_colleague"), json!(null)] {
+            let msg = admit(group_mentioning(open_id), &policy).expect("overheard, not dropped");
+            assert!(!msg.admitted);
+            assert!(!msg.mentions_bot);
+        }
+    }
+
+    /// A reaction is a routine trigger and nothing else: it never becomes chat
+    /// input, and a bot's own reaction is not somebody asking for anything.
+    #[test]
+    fn a_users_reaction_becomes_an_arrival_and_a_bots_does_not() {
+        let payload = |operator: &str| ReactionEvent {
+            event: ReactionBody {
+                message_id: "om_1".into(),
+                reaction_type: ReactionType {
+                    emoji_type: "THUMBSUP".into(),
+                },
+                operator_type: operator.into(),
+                user_id: Some(SenderId {
+                    open_id: Some("ou_stranger".into()),
+                }),
+            },
+        };
+        let Some(Arrival::Reaction {
+            message_id,
+            sender_id,
+            emoji,
+        }) = reaction(payload("user"))
+        else {
+            panic!("a user's reaction arrives");
+        };
+        assert_eq!(
+            (message_id.as_str(), sender_id.as_str(), emoji.as_str()),
+            ("om_1", "ou_stranger", "THUMBSUP")
+        );
+        assert!(reaction(payload("app")).is_none());
     }
 
     #[test]

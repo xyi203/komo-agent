@@ -23,10 +23,12 @@ use komo_services::tool_execution::{
     SessionContext, SessionOrigin, current_session, with_job_grants, with_session,
 };
 use komo_services::triggers::TriggerMatcher;
+
+use crate::daemon::{EventFanout, RoutineEventSource};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -50,6 +52,7 @@ use komo_core::domain::{
         Wakeup, WakeupCause, WakeupFiredEvent,
     },
     todo::SessionTodoRepository,
+    trigger::ExternalEvent,
     wakeup::{WAIT_ID_PREFIX, WakeupDispatch, WakeupRegistration, WakeupRepository, is_suspended},
 };
 
@@ -694,6 +697,16 @@ pub struct GatewayDispatcher {
     /// the person who just wrote (docs/bot-runtime.md §3.7). `None` = nothing
     /// listens, which is what the test fixtures and the local TUI have.
     triggers: Option<Arc<TriggerMatcher>>,
+    /// Where an ingress hands an event that is **not** a chat message — a
+    /// webhook body, a group reaction, a changed file (docs/bot-runtime.md
+    /// §5.12–5.14). Held here because the dispatcher is the one thing every
+    /// channel is given, and those three arrive on channels that were built
+    /// before the routine machinery existed.
+    ///
+    /// Attached after construction, like `TriggerMatcher`'s own dispatch and
+    /// for the same reason: a routine's turn is woken through this dispatcher,
+    /// so the source cannot exist before it. Absent ⇒ no routine ingress.
+    routines: RwLock<Option<Arc<RoutineEventSource>>>,
     /// Per-session turn state. A session key is present iff a turn is in flight;
     /// its queue holds up to [`QUEUE_CAP`] messages that arrived mid-turn, drained
     /// FIFO as each turn finishes (so a quick follow-up is answered, not dropped).
@@ -863,6 +876,7 @@ impl GatewayDispatcher {
             inbox,
             waits: None,
             triggers: None,
+            routines: RwLock::new(None),
             inflight: Mutex::new(HashMap::new()),
             idle: Notify::new(),
         }
@@ -981,6 +995,37 @@ impl GatewayDispatcher {
     pub fn with_triggers(mut self, triggers: Arc<TriggerMatcher>) -> Self {
         self.triggers = Some(triggers);
         self
+    }
+
+    /// Let ingresses hand over events that are not chat messages. Called once,
+    /// during gateway wiring, after the waker the source fires through exists.
+    pub fn attach_routines(&self, routines: Arc<RoutineEventSource>) {
+        *self.routines.write().unwrap() = Some(routines);
+    }
+
+    /// One external event, from whichever ingress saw it: the routines it
+    /// starts and the standing waits it ends (docs/bot-runtime.md §4.4).
+    ///
+    /// Every ingress goes through here rather than holding the source itself,
+    /// because the dispatcher is what a `Channel` is handed — and because a
+    /// gateway wired without routines must answer "nothing happened" rather
+    /// than force each ingress to know whether the machinery exists.
+    pub async fn on_external_event(&self, event: &ExternalEvent) -> EventFanout {
+        let routines = self.routines.read().unwrap().clone();
+        match routines {
+            Some(routines) => routines.on_event(event).await,
+            None => EventFanout::default(),
+        }
+    }
+
+    /// Whether turning a chat reaction into an event is worth an ingress's
+    /// trouble — see [`RoutineEventSource::wants_feishu_reactions`].
+    pub async fn wants_feishu_reactions(&self) -> bool {
+        let routines = self.routines.read().unwrap().clone();
+        match routines {
+            Some(routines) => routines.wants_feishu_reactions().await,
+            None => false,
+        }
     }
 
     /// Bring a suspended turn back.

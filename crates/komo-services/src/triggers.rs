@@ -1,10 +1,16 @@
-//! Inbound message → standing wakes it fires (docs/bot-runtime.md §3.7).
+//! An arrival → the standing wakes it fires (docs/bot-runtime.md §3.7, §5.12).
 //!
 //! The thin shell around [`komo_core::domain::trigger`]: that decides whether a
-//! filter is about the message, this reads the registrations, claims each hit
-//! and wakes what it points at. Split that way because the deciding is pure and
-//! the rest is three stores — and because §5.13's chat-triggered routine is the
-//! same shell over the same matcher, differing only in what a hit turns into.
+//! filter is about the thing that arrived, this reads the registrations, claims
+//! each hit and wakes what it points at. Split that way because the deciding is
+//! pure and the rest is three stores — and because the routine side of an event
+//! (`RoutineEventSource`) is the same shell over the same matcher, differing
+//! only in what a hit turns into.
+//!
+//! Two ingresses reach it: every channel's inbound message, through
+//! `GatewayDispatcher::handle`, and a named webhook, through the routine event
+//! source. A feishu message deliberately arrives only by the first — routing it
+//! by both would answer one commitment twice.
 //!
 //! **The message keeps its own route.** A trigger never redirects it: whoever
 //! wrote is talking to komo on their own conversation, and that turn happens as
@@ -59,18 +65,28 @@ impl TriggerMatcher {
     /// Best-effort throughout: a trigger store that cannot be read must never
     /// keep the message itself from being answered.
     pub async fn on_inbound(&self, peer: &ChannelPeer, text: &str) -> usize {
+        self.on_event(&InboundEvent::Message { peer, text }, text)
+            .await
+    }
+
+    /// The same shell over anything a filter can be written about — a chat
+    /// message, or (§5.12) a named webhook. `payload` is what a woken turn is
+    /// handed: the message itself, or the event's account of what happened.
+    ///
+    /// Best-effort throughout: a trigger store that cannot be read must never
+    /// keep the arrival itself from being answered.
+    pub async fn on_event(&self, event: &InboundEvent<'_>, payload: &str) -> usize {
         let Some(dispatch) = self.dispatch.read().unwrap().clone() else {
             return 0;
         };
         let rows = match self.wakeups.list().await {
             Ok(rows) => rows,
             Err(error) => {
-                warn!(%error, "could not read standing wakes for an inbound message");
+                warn!(%error, "could not read standing wakes for an inbound event");
                 return 0;
             }
         };
-        let event = InboundEvent { peer, text };
-        let hits: Vec<WakeupRegistration> = matching(&rows, &event).into_iter().cloned().collect();
+        let hits: Vec<WakeupRegistration> = matching(&rows, event).into_iter().cloned().collect();
 
         let mut fired = 0;
         for registration in hits {
@@ -84,7 +100,7 @@ impl TriggerMatcher {
                     continue;
                 }
             }
-            let payload = self.payload_for(&registration, text).await;
+            let payload = self.payload_for(&registration, payload).await;
             match dispatch
                 .fire(&registration, WakeupCause::Event, &payload)
                 .await
@@ -94,7 +110,7 @@ impl TriggerMatcher {
                     info!(
                         wake = %registration.id,
                         session = %registration.session_id,
-                        "a message woke a standing wait"
+                        "an event woke a standing wait"
                     );
                 }
                 Err(error) => warn!(%error, wake = %registration.id, "failed to fire a wake"),

@@ -1,4 +1,4 @@
-use komo_agent::daemon::{Schedule, WakeupWiring};
+use komo_agent::daemon::{RoutineEventSource, Schedule, WakeupWiring};
 use komo_agent::gateway::Gateway;
 use komo_agent::interaction::{
     ApprovalState, ChatApprover, GatewayDispatcher, TurnWaker, WaitParts,
@@ -24,8 +24,9 @@ use crate::{
         todo::SessionTodoRepository,
         wakeup::{WakeupDispatch, WakeupRepository},
     },
-    infra::messaging::{
-        api::ApiChannel, home_notifier::HomeNotifier, macos_notifier::MacosNotifier,
+    infra::{
+        file_watcher::FileWatcher,
+        messaging::{api::ApiChannel, home_notifier::HomeNotifier, macos_notifier::MacosNotifier},
     },
     plugins::{self, ChannelCx, ChannelRegistry, SweepCx, SweepRegistry},
     services::operator_control::actions::OperatorActions,
@@ -192,6 +193,27 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // Same late binding, same reason: a triggered wake continues (or opens) a
     // turn exactly as a sweep's does.
     triggers.attach_dispatch(waker.clone());
+    // Everything a routine firing needs, built once and shared by all four of
+    // its ingresses: the every-minute sweep (clock), `POST /api/hooks/{name}`,
+    // the feishu channel, and the file watcher below. One instance, so a
+    // routine cannot run one way from a slot and another way from an event.
+    let routines = Arc::new(RoutineEventSource {
+        jobs: cron_jobs.clone(),
+        notifier: notifier.clone(),
+        runtime: Some(wired.cron_runtime.clone()),
+        // Standing waits ride the sweep's tick (docs/bot-runtime.md §3.3):
+        // one scheduler for routines and for the turns waiting on an answer.
+        wakeups: Some(WakeupWiring {
+            registrations: db.clone(),
+            events: db.clone(),
+            dispatch: waker.clone(),
+        }),
+        // …and an arriving webhook also ends the waits that named it.
+        triggers: Some(triggers.clone()),
+    });
+    // Late-bound in the other direction: every ingress reaches the source
+    // through the dispatcher, which is the one thing a `Channel` is handed.
+    dispatcher.attach_routines(routines.clone());
     // The third crash-residue check, after the interrupted runs and the
     // suspended turns: a task the dead process was still running. Settled
     // `uncertain` and never re-run — the process group is gone and whether the
@@ -214,23 +236,17 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         config,
         db: db.clone(),
         kanban: kanban.clone(),
-        cron_jobs: cron_jobs.clone(),
         notifier: notifier.clone(),
         review: wired.review.clone(),
         memories: wired.memories.clone(),
         skill_store: wired.skills.clone(),
         aux_llm: wired.aux_llm.clone(),
         briefing_runtime: wired.briefing_runtime.clone(),
-        cron_runtime: wired.cron_runtime.clone(),
         maintenance_schedule: review_schedule,
         briefing_schedule,
         briefing_expr: briefing_expr.clone(),
         dream_schedule,
-        wakeups: WakeupWiring {
-            registrations: db.clone(),
-            events: db.clone(),
-            dispatch: waker,
-        },
+        routines: routines.clone(),
     };
     plugins::run_sweep_phase(&roster, &gate, &mut sweep_reg, &sweep_cx).await?;
 
@@ -246,6 +262,13 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     for channel in channel_reg.into_channels() {
         gateway = gateway.add_channel(channel);
     }
+
+    // The file ingress for `FileChanged` routines (docs/bot-runtime.md §5.14).
+    // Host-mounted like the api channel rather than a plugin: it is the other
+    // half of a routine trigger, so it lives and dies with the routine store,
+    // not with a `[plugins]` toggle of its own. Idle unless a routine watches a
+    // directory.
+    gateway = gateway.add_channel(Box::new(FileWatcher::new(routines.clone())));
 
     // For the startup banner.
     let cron_job_count = cron_jobs.list().await.map(|j| j.len()).unwrap_or(0);

@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use croner::Cron;
 
 use crate::domain::policy::{Rule, RuleSpec};
+use crate::domain::trigger::{ExternalEvent, FeishuEvent};
 
 /// Default wall-clock budget for a job command — hermes' cron-job budget
 /// (15 min), generous enough for a script that clones a repo and pushes an MR.
@@ -109,9 +110,10 @@ pub fn parse_cron_job_status(s: &str) -> CronJobStatus {
 ///
 /// Two variants are **schedule-shaped** — `Cron` and `At` name a moment the
 /// sweep computes in advance, which is what `next_run_at` holds. The
-/// event-shaped ones (`Feishu`, `Webhook`, `FileChanged`) are defined here and
-/// fired by 5.12–5.14; until then they have no occurrence, so a job triggered
-/// only by them never becomes due and the sweep passes over it.
+/// event-shaped ones (`Feishu`, `Webhook`, `FileChanged`) name no moment at
+/// all, so a job triggered only by them never becomes *due* and the sweep
+/// passes over it: it fires from its own ingress instead, through
+/// [`Trigger::matched_by`] (docs/bot-runtime.md §5.12–5.14).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Trigger {
@@ -160,11 +162,63 @@ impl FeishuMatch {
             Self::Reaction { emoji } => format!("reaction {emoji}"),
         }
     }
+
+    /// Whether this is the message (or reaction) the routine is watching for.
+    ///
+    /// A reaction and a message are different arrivals: an emoji carries no
+    /// text, so a keyword rule must never read one as an empty message that
+    /// happens not to match, and a `Reaction` rule must never fire on a message
+    /// quoting the emoji.
+    pub fn matches(&self, event: &FeishuEvent) -> bool {
+        match (self, &event.reaction) {
+            (Self::Mention, None) => event.mention,
+            (Self::Keyword { keywords }, None) => {
+                let text = event.text.to_lowercase();
+                keywords.iter().any(|keyword| {
+                    let keyword = keyword.trim().to_lowercase();
+                    !keyword.is_empty() && text.contains(&keyword)
+                })
+            }
+            (Self::Reaction { emoji }, Some(arrived)) => arrived.eq_ignore_ascii_case(emoji),
+            _ => false,
+        }
+    }
 }
 
 /// How many listeners one `Any` may hold — the set is re-read on every sweep
 /// tick, and a routine nobody can read is not a routine.
 pub const MAX_ANY_TRIGGERS: usize = 8;
+
+/// Compile a `FileChanged` glob, or say why it cannot be one. The same matcher
+/// the `glob` and `grep` tools use, so one syntax holds everywhere a glob is
+/// typed. An empty pattern means "anything under the root".
+pub fn compile_glob(glob: &str) -> anyhow::Result<globset::GlobMatcher> {
+    let pattern = match glob.trim() {
+        "" => "**",
+        pattern => pattern,
+    };
+    Ok(globset::Glob::new(pattern)?.compile_matcher())
+}
+
+/// Whether a changed path is one this trigger watches: under its root, and
+/// matched by its glob **relative to that root** — a glob is written about the
+/// tree, not about where the tree happens to live.
+///
+/// A pattern that no longer compiles matches nothing rather than everything:
+/// glob validity is proven where a routine is created, so the only way here is
+/// a hand-edited row, and the safe reading of one is silence.
+fn path_matches(root: &std::path::Path, glob: &str, path: &std::path::Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    match compile_glob(glob) {
+        Ok(matcher) => matcher.is_match(relative),
+        Err(error) => {
+            tracing::warn!(%error, glob, "unparseable routine glob matches nothing");
+            false
+        }
+    }
+}
 
 impl Trigger {
     pub fn cron(expr: &str) -> Self {
@@ -230,6 +284,51 @@ impl Trigger {
             Self::Any { triggers } => triggers.iter().find_map(|m| m.owner_of(slot)),
             _ => None,
         }
+    }
+
+    /// Which member this external event fires, if any (docs/bot-runtime.md
+    /// §5.12–5.14).
+    ///
+    /// At most one: an `Any` whose members both match one arrival answers the
+    /// first, because one thing happening is one [`RoutineRun`] — and the run
+    /// has to name *a* member, or "why did that fire?" has no answer (§8,
+    /// criterion 5).
+    pub fn matched_by(&self, event: &ExternalEvent) -> Option<&Trigger> {
+        match (self, event) {
+            (Self::Webhook { name }, ExternalEvent::Webhook { name: arrived, .. }) => {
+                (name == arrived).then_some(self)
+            }
+            (Self::Feishu { chat, matcher }, ExternalEvent::Feishu(arrived)) => {
+                (chat == &arrived.chat && matcher.matches(arrived)).then_some(self)
+            }
+            (Self::FileChanged { root, glob }, ExternalEvent::FileChanged { paths }) => paths
+                .iter()
+                .any(|path| path_matches(root, glob, path))
+                .then_some(self),
+            (Self::Any { triggers }, _) => triggers.iter().find_map(|m| m.matched_by(event)),
+            _ => None,
+        }
+    }
+
+    /// Whether anything here listens for a chat reaction.
+    ///
+    /// Asked by the feishu ingress before it resolves a reaction's chat: that
+    /// costs an API call per emoji in every chat the bot can see, and is worth
+    /// paying only when some routine could possibly care.
+    pub fn watches_reactions(&self) -> bool {
+        match self {
+            Self::Feishu { matcher, .. } => matches!(matcher, FeishuMatch::Reaction { .. }),
+            Self::Any { triggers } => triggers.iter().any(Self::watches_reactions),
+            _ => false,
+        }
+    }
+
+    /// The one-line account of an event-driven firing: which member matched,
+    /// and what arrived. The counterpart of [`Trigger::slot_event`] for the
+    /// triggers that have no slot.
+    pub fn event_line(&self, event: &ExternalEvent) -> String {
+        let owner = self.matched_by(event).unwrap_or(self);
+        format!("{} · {}", owner.describe(), event.summary())
     }
 
     /// One line naming this trigger, for listings and approval prompts.
@@ -878,6 +977,209 @@ mod trigger_tests {
             .next_slot(0)
             .is_err()
         );
+    }
+
+    fn feishu(chat: &str, matcher: FeishuMatch) -> Trigger {
+        Trigger::Feishu {
+            chat: chat.into(),
+            matcher,
+        }
+    }
+
+    fn message(chat: &str, text: &str) -> ExternalEvent {
+        ExternalEvent::Feishu(FeishuEvent {
+            chat: chat.into(),
+            sender: "ou_stranger".into(),
+            text: text.into(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_webhook_trigger_answers_to_its_own_name_only() {
+        let trigger = Trigger::Webhook { name: "ci".into() };
+        let fired = ExternalEvent::Webhook {
+            name: "ci".into(),
+            body: "ok".into(),
+        };
+        assert_eq!(trigger.matched_by(&fired), Some(&trigger));
+        assert!(
+            trigger
+                .matched_by(&ExternalEvent::Webhook {
+                    name: "deploy".into(),
+                    body: String::new()
+                })
+                .is_none()
+        );
+        // A chat message is not a hook, whatever it says.
+        assert!(trigger.matched_by(&message("oc_x", "ci")).is_none());
+    }
+
+    /// A keyword rule reads the message text; the chat is part of the address,
+    /// so the same words in another group are another conversation.
+    #[test]
+    fn a_feishu_keyword_matches_its_own_chat() {
+        let trigger = feishu(
+            "oc_x",
+            FeishuMatch::Keyword {
+                keywords: vec!["值班".into(), "Oncall".into()],
+            },
+        );
+        assert!(
+            trigger
+                .matched_by(&message("oc_x", "今天谁值班？"))
+                .is_some()
+        );
+        // Case-insensitive, so a keyword typed in either case still works.
+        assert!(
+            trigger
+                .matched_by(&message("oc_x", "who is oncall"))
+                .is_some()
+        );
+        assert!(trigger.matched_by(&message("oc_x", "早")).is_none());
+        assert!(
+            trigger
+                .matched_by(&message("oc_y", "今天谁值班？"))
+                .is_none()
+        );
+    }
+
+    /// A reaction and a message are different arrivals: an emoji has no text
+    /// for a keyword rule to read, and a message quoting the emoji name is not
+    /// somebody reacting.
+    #[test]
+    fn a_reaction_and_a_message_never_stand_in_for_each_other() {
+        let reaction_rule = feishu(
+            "oc_x",
+            FeishuMatch::Reaction {
+                emoji: "THUMBSUP".into(),
+            },
+        );
+        let keyword_rule = feishu(
+            "oc_x",
+            FeishuMatch::Keyword {
+                keywords: vec!["THUMBSUP".into()],
+            },
+        );
+        let mention_rule = feishu("oc_x", FeishuMatch::Mention);
+        let reacted = ExternalEvent::Feishu(FeishuEvent {
+            chat: "oc_x".into(),
+            sender: "ou_stranger".into(),
+            reaction: Some("THUMBSUP".into()),
+            ..Default::default()
+        });
+        assert!(reaction_rule.matched_by(&reacted).is_some());
+        assert!(keyword_rule.matched_by(&reacted).is_none());
+        assert!(mention_rule.matched_by(&reacted).is_none());
+        assert!(
+            reaction_rule
+                .matched_by(&message("oc_x", "THUMBSUP"))
+                .is_none()
+        );
+
+        let mentioned = ExternalEvent::Feishu(FeishuEvent {
+            chat: "oc_x".into(),
+            mention: true,
+            text: "帮我看看".into(),
+            ..Default::default()
+        });
+        assert!(mention_rule.matched_by(&mentioned).is_some());
+        assert!(
+            mention_rule
+                .matched_by(&message("oc_x", "帮我看看"))
+                .is_none()
+        );
+    }
+
+    /// The glob is written about the tree, not about where the tree lives: it
+    /// is matched against the path *relative* to the root, and a path outside
+    /// the root is not this routine's business at all.
+    #[test]
+    fn a_file_trigger_matches_its_glob_under_its_root() {
+        let trigger = Trigger::FileChanged {
+            root: "/srv/notes".into(),
+            glob: "**/*.md".into(),
+        };
+        let changed = |paths: &[&str]| ExternalEvent::FileChanged {
+            paths: paths.iter().map(std::path::PathBuf::from).collect(),
+        };
+        assert!(
+            trigger
+                .matched_by(&changed(&["/srv/notes/a/b.md"]))
+                .is_some()
+        );
+        assert!(
+            trigger
+                .matched_by(&changed(&["/srv/notes/a.png"]))
+                .is_none()
+        );
+        assert!(trigger.matched_by(&changed(&["/srv/other/a.md"])).is_none());
+        // One matching path in a batch is enough — the batch is one event.
+        assert!(
+            trigger
+                .matched_by(&changed(&["/srv/notes/a.png", "/srv/notes/b.md"]))
+                .is_some()
+        );
+        // An empty glob is "anything under the root".
+        let anything = Trigger::FileChanged {
+            root: "/srv/notes".into(),
+            glob: String::new(),
+        };
+        assert!(
+            anything
+                .matched_by(&changed(&["/srv/notes/a.png"]))
+                .is_some()
+        );
+    }
+
+    /// Criterion 5, on the event side: an `Any` whose members both match one
+    /// arrival fires once, and the line names the member that owns it.
+    #[test]
+    fn an_any_matched_twice_by_one_event_names_one_member() {
+        let keyword = feishu(
+            "oc_x",
+            FeishuMatch::Keyword {
+                keywords: vec!["部署".into()],
+            },
+        );
+        let any = Trigger::Any {
+            triggers: vec![keyword.clone(), feishu("oc_x", FeishuMatch::Mention)],
+        };
+        let both = ExternalEvent::Feishu(FeishuEvent {
+            chat: "oc_x".into(),
+            sender: "张三".into(),
+            text: "该部署了".into(),
+            mention: true,
+            ..Default::default()
+        });
+        assert_eq!(any.matched_by(&both), Some(&keyword));
+        let line = any.event_line(&both);
+        assert!(line.contains("keyword 部署"), "{line}");
+        assert!(!line.contains("any("), "the line names the member: {line}");
+        assert!(line.contains("该部署了"), "and what arrived: {line}");
+
+        // And a member that did not match is never the one named.
+        let webhook_any = Trigger::Any {
+            triggers: vec![keyword, Trigger::Webhook { name: "ci".into() }],
+        };
+        let hook = ExternalEvent::Webhook {
+            name: "ci".into(),
+            body: "build 12 ok".into(),
+        };
+        let line = webhook_any.event_line(&hook);
+        assert!(line.starts_with("webhook `ci`"), "{line}");
+    }
+
+    /// A clock-shaped trigger has nothing to say about an event, and an
+    /// event-shaped one nothing to say about a slot.
+    #[test]
+    fn a_schedule_is_never_matched_by_an_event() {
+        let hook = ExternalEvent::Webhook {
+            name: "ci".into(),
+            body: String::new(),
+        };
+        assert!(Trigger::cron("0 8 * * *").matched_by(&hook).is_none());
+        assert!(Trigger::At { at: 42 }.matched_by(&hook).is_none());
     }
 
     #[test]
