@@ -921,7 +921,9 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   `the_artifacts_directory_reaches_the_model_after_the_user_message`、
   `a_runtime_without_an_artifacts_grant_says_nothing_about_it`（agent）、
   `nothing_is_created_by_naming_a_directory`（services）。
-- **5.17 文档**：AGENTS.md 模块地图更新（cron → routine + wakeup；approval 一节改写；task 一节加唤醒）。
+- **5.17 文档** —— **已完成**：AGENTS.md 随每一项落地逐段更新（cron → routine + wakeup、approval
+  一节的挂起路径、task 一节的唤醒、存储表格的 `wakeup_records` / `artifacts`），最后一次统一收口
+  把本文 §5.2 / §5.3 的过时措辞、§7 的两个待拍板、§1 现状表的快照性质一并对齐。
 
 ---
 
