@@ -35,5 +35,5 @@ _Avoid_: context window（那是模型的物理上限，不是 komo 的裁剪策
 ### 执行控制
 
 **Cancel**:
-对进行中 turn 的终止：loop 的每个 await 都与取消信号竞速，被取消的 turn 记为 Failed 且不可恢复。聊天渠道的入口是 `/stop` 命令。
+对进行中 turn 的终止：loop 的每个 await 都与取消信号竞速，被取消的 turn 记为 Failed 且不可恢复。入口是 TUI 的 Esc 和 GUI / HTTP 的 `POST /api/interactions/{session}/cancel`；聊天渠道没有取消命令。
 _Avoid_: interrupt, abort（不要暗示可恢复或可续跑）

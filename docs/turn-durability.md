@@ -1,5 +1,7 @@
 # Session 权威事件日志：一次 turn 的持久化
 
+> 存储说明：本文写作时 komo 还有 `state.db` / `kanban.db` / `memory.db` / `cron.db` 四个库文件。ADR 0004 之后它们合并为一个 `~/.komo/komo.db`，文中的库名指的是其中对应的表，disposable / durable 是表的属性，不是文件的属性；除此之外结论不变。
+
 范围：session 内发生什么、一次 turn 如何持久化、崩溃后怎么恢复、读模型如何重建、什么时候删除。
 不含：provider wire format、policy 梯子、channel 协议、长期 memory 本身的存储。
 

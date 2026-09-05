@@ -52,13 +52,15 @@ komo model set anthropic        # switch provider (persists to config.toml)
 Everything boots without a key — the gateway starts and channels serve — but
 agent turns reply with a "key not set" pointer until one is configured.
 
-Inside chat, `/new` (or `/clear` / `/reset`) starts a fresh session. History and
-the run ledger are stored in `~/.komo/state.db`.
+Inside chat, `/new` (or `/clear` / `/reset`) draws a conversation boundary: the
+model's replay starts fresh, nothing is deleted. Transcripts are append-only
+JSONL files under `~/.komo/sessions/`; session metadata and the run ledger are
+tables in `~/.komo/komo.db`.
 
 ```bash
 komo session list               # stored sessions with message counts
 komo session clean              # delete empty sessions
-komo cron list                  # pending reminders and next fire times
+komo cron list                  # routines (cron / @at / event-triggered) and next fire times
 komo task list                  # open durable tasks
 komo memory list                # memory candidates/active items
 komo run list                   # recent agent turns (⟲ marks interrupted, resumable ones)
@@ -95,18 +97,25 @@ The agent can call these during a chat turn:
 
 | Tool | What it does |
 |---|---|
-| `shell` | Run shell commands — safe commands auto-approved, dangerous ones blocked, the rest prompt for approval (session-scoped) |
-| `file` | Read/write files in the workspace |
+| `shell` | Run shell commands — safe commands auto-approved, dangerous ones blocked, the rest prompt for approval; `background: true` returns a task id |
+| `read` / `write` / `edit` / `apply_patch` | File tools confined to the workspace roots plus `~/.komo/artifacts` |
+| `grep` / `glob` | ripgrep in-process; policy runs over paths before content is read |
 | `web_fetch` / `web_search` | Fetch pages and search the web |
 | `reminder` | Schedule one-shot and recurring reminders |
-| `task` | Capture/list/update/complete durable cross-session tasks |
-| `todo` | Maintain the current session's working focus list |
-| `memory` | Govern long-term memories in `~/.komo/memory.db` |
+| `cron` | Routines: command or agent jobs fired by a cron slot, `@at`, a webhook, a Feishu message/reaction, or a file change |
+| `task` | Durable cross-session tasks; a `waiting` task that names a peer wakes when they write |
+| `todo` | The current conversation's working focus list (the one thing `/new` clears) |
+| `memory` | Govern long-term memories (candidates, pins, search) |
+| `session` | Search komo's own past conversations (episodic memory) |
+| `wiki_search` / `wiki_read` / `wiki_index` | Semantic search over a note vault when `[wiki]` is configured |
+| `ask_user` / `wait` | Suspend the turn until an answer, an event, a time, or a background task |
+| `delegate` | Run a sub-agent turn on the aux model; `detach: true` runs it in the background |
+| `run_code` | Run a Python program that calls the other tools through the same gates |
 | `homeassistant` | Read and control Home Assistant entities when configured |
-| `session` | Look up past conversations |
-| `delegate` | Hand a sub-task to a cheaper auxiliary model |
-| `skill` | Load skills: workspace dirs + governed `~/.komo/skills` + shared `~/.agents/skills` |
+| `skill` | Load skills: governed `~/.komo/skills` + shared `~/.agents/skills` |
+| `logs` | Tail komo's own tracing log |
 | `time` | Current time (RFC 3339 UTC) |
+| `mcp__<server>__<tool>` | Tools mounted from `[mcp.servers.*]`; every call is approval-gated |
 
 ## Data Layout
 
@@ -116,18 +125,23 @@ and `SHION_HOME` / `SHION_*` overrides remain compatibility fallbacks; any
 `komo`-named path or variable takes precedence. `komo gateway start/restart`
 also unloads the former launchd job before installing `com.komo.gateway`.
 
-| File | Purpose |
-|---|---|
-| `state.db` | disposable session state: messages, todos, pairings, settings, reminders, run ledger |
-| `kanban.db` | durable cross-session tasks |
-| `memory.db` | durable long-term memories |
-| `skills/` | durable governed skills (`SKILL.md` files; reviewer proposals in `skills/.candidates/`) |
-| `config.toml` | provider/model/channel behavior |
-| `.env` | API keys and channel credentials |
-| `SOUL.md` | agent persona (edit freely; picked up without a restart) |
+| Path | Purpose | Durability |
+|---|---|---|
+| `komo.db` | one Turso database: sessions, run ledger, reminders, pairings, settings (disposable by row); tasks, memories, routines, wakeups (durable, additive schema only) | per table |
+| `sessions/` | transcripts, one append-only `.jsonl` per session | disposable |
+| `artifacts/<session>/` | what a turn produced: reports, scripts, downloads | durable |
+| `skills/` | governed skills (`SKILL.md`; proposals in `.candidates/`, retired in `.archive/`) | durable |
+| `permissions.json` | saved approval grants | durable |
+| `plugins/` | Python plugins served by `komo-pyhost` | durable |
+| `checkpoints/` · `tool-output/` · `session-index/` | file pre-images, over-limit tool results, episodic search index (7-day retention / rebuilt on search) | disposable |
+| `logs/` | daily-rotated gateway log (`komo logs`) | disposable |
+| `config.toml` | provider/model/channel behavior | — |
+| `.env` | API keys and channel credentials | — |
+| `SOUL.md` · `USER.md` · `AGENTS.md` | persona, operator profile, machine-wide instructions (re-read on change) | — |
 
-Delete `state.db` freely to reset development state. Do not delete `kanban.db`,
-`memory.db`, or `skills/` unless you intend to wipe durable personal data.
+There is no database file to delete for a reset: disposable state is pruned by
+row (`komo run prune`, `komo session clean`), and durable tables only ever change
+additively. See `docs/adr/0004-single-database.md`.
 
 ## Configuration
 
@@ -137,14 +151,27 @@ only in `~/.komo/.env`, never in `config.toml`.
 `~/.komo/config.toml`:
 
 ```toml
-provider = "deepseek"        # deepseek | openai | anthropic | openrouter
-model = "deepseek-chat"      # optional; defaults per provider
+provider = "deepseek"        # deepseek | openai | anthropic | openrouter | codex
+# model = "..."             # optional; defaults per provider. DeepSeek entries must name a v4-or-later model
+models = ["anthropic:claude-sonnet-5", "openai:gpt-5.5"]   # optional: what a session may switch to
 base_url = "https://..."     # optional override for OpenAI-compatible endpoints
 aux_model = "..."            # optional cheaper model for delegated sub-tasks
 schedule = "0 * * * *"       # gateway maintenance cron (5-field, default hourly)
 briefing_schedule = "0 8 * * *"      # optional daily briefing
 briefing_workdays_only = true        # optional Chinese workday gate
+dream_schedule = "0 3 * * *"          # nightly memory/skill governance sweep ("off" disables)
 max_turns = 30               # max tool-calling round-trips per user turn
+
+[memory]
+embedding_model = "bge-m3"   # optional Ollama model; enables cross-language recall and episodic search
+
+[wiki]
+vault = "~/notes"            # optional note vault behind wiki_search / wiki_read / wiki_index
+
+[mcp.servers.github]
+url = "https://..."
+token_env = "GITHUB_MCP_TOKEN"        # names the .env var, never the token
+tools = ["search_issues"]             # required allowlist (or all_tools = true)
 
 [channels.telegram]
 enabled = true
@@ -204,6 +231,7 @@ specific sensitive paths (for example `.ssh` or credential directories).
 | `openai` | `OPENAI_API_KEY` |
 | `anthropic` | `ANTHROPIC_API_KEY` |
 | `openrouter` | `OPENROUTER_API_KEY` |
+| `codex` | none — reads the Codex CLI's OAuth file (`~/.codex/auth.json`) |
 
 Channel credentials live in `.env`, for example:
 
@@ -230,7 +258,7 @@ from an already-working chat channel.
 DDD-style layers with domain traits at the center:
 
 ```
-CLI/channel → AgentRuntime ─ run_agent_loop ─┬→ LlmClient::begin_turn → TurnDriver (one rig completion / round)
+CLI/channel → AgentRuntime ─ run_agent_loop ─┬→ LlmClient::begin_turn → TurnDriver (one provider completion / round)
                                              └→ ToolExecutor::execute_round → tools   (loop until Step::Final)
                           ↘ MessageRepository · RunRepository (ledger) → Response
 ```
@@ -242,41 +270,29 @@ traced, and recorded in the run ledger.
 
 ### Project layout
 
+A Cargo workspace; crates depend downward only.
+
 ```
-src/
-├── main.rs                # entry point + tracing setup
-├── domain/                # pure traits and value types — no I/O, no external crates
-│   ├── repository.rs · tool.rs · llm.rs      # the core trait seams
-│   ├── message.rs · session.rs · run.rs      # value types + run-ledger model
-│   ├── memory.rs · task.rs · todo.rs · skill.rs
-│   └── policy.rs · approval.rs · pairing.rs · gateway.rs · …
-├── agent/                 # application logic
-│   ├── runtime.rs         # AgentRuntime: the in-house tool loop (run_agent_loop)
-│   ├── gateway.rs · daemon.rs      # always-on gateway + scheduled sweeps
-│   ├── interaction.rs     # GatewayDispatcher + chat approval
-│   └── review_coordinator.rs · reviewer.rs · policy_approver.rs · system_prompt.rs
-├── services/              # cross-cutting services
-│   ├── tool_execution/    # ToolExecutor: retry / ledger / truncation pipeline
-│   ├── operator_control/  # CLI operator actions, gateway/direct dual backend
-│   ├── memory_enrichment.rs        # pinned + recall memory injection
-│   └── skill_registry.rs  # live runtime view over the skill dirs
-├── infra/                 # I/O implementations
-│   ├── llm.rs · codex.rs · rig_tool.rs       # rig backend + Codex OAuth provider
-│   ├── persistence/       # toasty/Turso: state.db + kanban.db
-│   ├── memory/            # memory.db (+ legacy markdown import)
-│   ├── messaging/         # feishu · telegram · wechat · api · notifiers
-│   └── skills.rs · skill_install.rs · gateway_client.rs · rendezvous.rs · workday.rs
-├── tools/                 # built-in tools (shell, file, web, task, memory, skill, …)
-├── cli/                   # subcommands; wiring.rs assembles the AgentRuntime
-├── config/                # one-shot resolution into ConfigSnapshot (sources → resolved → report)
-└── tui/                   # full-screen chat TUI (ratatui): app · ui · markdown · approver
+crates/
+├── komo-core        traits + value types (Tool, LlmClient, repositories, policy, run ledger); no I/O
+├── komo-config      config.toml + .env + KOMO_* → one ConfigSnapshot
+├── komo-provider    LLM wire formats (Responses / Messages) + HTTP/SSE transport
+├── komo-mcp         MCP client (Streamable HTTP)
+├── komo-pyhost      out-of-process Python plugin host behind run_code and ~/.komo/plugins
+├── komo-wiki        note-vault vector index (qdrant-edge in-process, or Qdrant server)
+├── komo-infra       persistence (Turso/toasty) · memory store · skills · logs · embedding · codex auth
+├── komo-services    tool execution · memory query/consolidation · skill registry · cron actions · background tasks
+├── komo-tools       every built-in tool
+└── komo-bot         runtime (run_agent_loop) · gateway · daemon sweeps · interaction · system prompt · policy approver · reviewer
+src/                 the binary: cli/ · tui/ · infra/messaging (channels) · infra/gateway_client · services/operator_control
+apps/                bun workspace: shared React renderer mounted by the Electron desktop app and the web SPA
 ```
 
 ## Development
 
 ```bash
 cargo check          # fast compile check
-cargo test           # run all tests
+cargo test --workspace   # bare `cargo test` skips the komo-core tests
 cargo fmt            # format
 cargo run -- chat    # run from source
 cargo run -- gateway # foreground gateway
@@ -285,13 +301,15 @@ cargo run -- gateway # foreground gateway
 Building requires `protoc` (`brew install protobuf`) because the Feishu websocket
 dependency compiles protobuf frames at build time.
 
-To reset after schema changes, delete the affected database file:
+Schema changes need no reset: new columns are added in place on connect
+(`ensure_columns`), new tables with `ensure_table`. Durable tables
+(tasks, memories, routines) only ever change additively — see `AGENTS.md`.
 
-- `TaskRecord` changes: `~/.komo/kanban.db`
-- `MemoryRecord` changes: `~/.komo/memory.db`
-- other toasty models: `~/.komo/state.db`
+## Docs
 
-## Roadmap
-
-The only long-form docs file kept in this repository is the current roadmap:
-[docs/personal-agent-roadmap.md](docs/personal-agent-roadmap.md).
+- [AGENTS.md](AGENTS.md) — the live architecture guide: commands, storage rules, module map, extension points.
+- [CONTEXT.md](CONTEXT.md) + [docs/adr/](docs/adr/) — glossary and architecture decision records.
+- [docs/personal-agent-roadmap.md](docs/personal-agent-roadmap.md) — capability gaps and what comes next.
+- [docs/bot-runtime.md](docs/bot-runtime.md) — suspended turns, wakeups, routines and their triggers.
+- [docs/turn-durability.md](docs/turn-durability.md) — the session event log and how a turn is persisted and recovered.
+- [docs/episode-learning-framework.md](docs/episode-learning-framework.md) — the post-run learning pass.

@@ -1,5 +1,7 @@
 # Episode 学习闭环设计
 
+> 存储说明：本文写作时 komo 还有 `state.db` / `kanban.db` / `memory.db` / `cron.db` 四个库文件。ADR 0004 之后它们合并为一个 `~/.komo/komo.db`，文中的库名指的是其中对应的表，disposable / durable 是表的属性，不是文件的属性；除此之外结论不变。
+
 > 状态：Phase 1、2、3 已实现（2026-08-25）。
 >
 > 范围：在现有 run ledger、reflective reviewer、Memory consolidation 和 Skill governance 之上，建立基于任务结果证据的学习闭环。

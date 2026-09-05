@@ -1,5 +1,7 @@
 # Bot 运行时：持久化等待、触发器与任务
 
+> 存储说明：本文写作时 komo 还有 `state.db` / `kanban.db` / `memory.db` / `cron.db` 四个库文件。ADR 0004 之后它们合并为一个 `~/.komo/komo.db`，文中的库名指的是其中对应的表，disposable / durable 是表的属性，不是文件的属性；除此之外结论不变。
+
 范围：komo 从「个人聊天 Agent」转到「7×24 常驻的个人 AI Bot 运行时」需要补的运行时原语——
 一个 turn 如何跨小时/跨天地等待并恢复、什么事件能唤醒它、routine 如何从 cron 泛化、Task 放在哪。
 不含：provider 层、memory 治理、skills、apps/ 客户端、多 Bot 编排。
